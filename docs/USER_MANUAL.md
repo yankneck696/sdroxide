@@ -9066,8 +9066,13 @@ configured in exactly the same way as one on your desk.
   PureSignal — and for the same reason the two cannot be used together: with
   PTT pins chosen the amplifier switch stays off and the connect note says why.
   Which pin a board uses is up to its maker; check the schematic, or try each
-  with a dummy load and the TX gain turned right down. The pin and the polarity
-  take effect on Apply.
+  with a dummy load and the TX gain turned right down. **Power the board from
+  both USB ports** (or its DC input) with the amplifier in: it draws enough
+  current that a single USB 2.0 port can sag and reboot the Pluto. The switch
+  is the same as typing `echo 1 > adi,gpo-manual-mode-enable` and then
+  `echo <pin> <0|1> > gpo_set` in the board's `/sys/kernel/debug/iio/iio:deviceN`
+  directory, so you can check a pin by hand the same way. It does not
+  reinitialise the radio. The pin and the polarity take effect on Apply.
 - **Buffer size** — how much the radio holds before each transfer, in complex
   samples, with the airtime and byte count it works out to shown beside it. The
   default of 32768 is about 16 ms at 2 Msps: long enough that the per-transfer

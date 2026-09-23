@@ -80,20 +80,21 @@ const ELNA_GPO: [&str; 2] =
     ["adi,elna-rx1-gpo0-control-enable", "adi,elna-rx2-gpo1-control-enable"];
 /// How many general-purpose output pins an AD9361 has.
 const GPO_PINS: u8 = 4;
-/// The device-tree property that hands all four GPO pins to manual control —
-/// set from the host rather than slaved to the enable-state machine. Like
-/// [`FDD_ENABLE`] it does nothing until [`INITIALIZE`] is written. It is one
-/// switch for all four pins (the part's `GPO_MANUAL_SELECT` bit), which is why
-/// the amplifier pin and the PTT pair cannot be used together.
+/// The device-tree property that lets the host drive the GPO pins by hand
+/// rather than have them slaved to the enable-state machine.
+///
+/// Unlike [`FDD_ENABLE`] this one needs no [`INITIALIZE`] to matter: the
+/// driver's debugfs write stores straight into the same `gpo_ctrl` field that
+/// [`GPO_SET`] checks, and `gpo_set` itself sets the part's
+/// `GPO_MANUAL_SELECT` bit. So the amplifier can be set up without resetting
+/// the front end. That bit is one switch for all four pins, which is why the
+/// amplifier pin and the PTT pair cannot be used together.
 const GPO_MANUAL_ENABLE: &str = "adi,gpo-manual-mode-enable";
-/// The levels the pins come up at when manual mode is initialised, bit `n` for
-/// GPO`n`. Written before [`INITIALIZE`] so the amplifier is never switched the
-/// wrong way for the length of an open.
-const GPO_MANUAL_MASK: &str = "adi,gpo-manual-mode-enable-mask";
 /// The driver's debugfs entry that sets one manual GPO live: `"<pin> <level>"`.
-/// Refused unless [`GPO_MANUAL_ENABLE`] was set at the last initialise. It
-/// takes effect at once, with no reinitialise, so flipping the amplifier costs
-/// one round trip and nothing on the receive side.
+/// Refused (`-EINVAL`) unless [`GPO_MANUAL_ENABLE`] is set. It takes effect at
+/// once, so flipping the amplifier costs one round trip and nothing on the
+/// receive side. The driver also records the level in its manual-mode mask,
+/// so a later `initialize` puts the pin back where it was left.
 const GPO_SET: &str = "gpo_set";
 /// The four slave bits this backend ever sets — one per pin, in the direction
 /// [`PlutoPtt`] gives it. Finding one of them set on a board that is not in FDD
@@ -991,11 +992,13 @@ impl Phy {
     /// and out from a GPO (issue #525). Answers whether [`Self::set_pa`] will
     /// work afterwards.
     ///
-    /// Runs after [`Self::setup_tr_switching`] and, like it, before the front
-    /// end is configured: this also ends in [`INITIALIZE`], which puts the
-    /// rate, the filter, the gains and the oscillators back to the board's
-    /// defaults. It is only paid when the pin is not already set up — a board
-    /// found in manual mode from an earlier session just has the level written.
+    /// Two writes, and no reinitialise: [`GPO_MANUAL_ENABLE`] takes effect as
+    /// soon as it is written, and [`GPO_SET`] then drives the pin. This is the
+    /// same sequence as running `echo 1 > adi,gpo-manual-mode-enable` and then
+    /// `echo <pin> <level> > gpo_set` in the board's debugfs, so if it works by
+    /// hand it works here. Leaving `initialize` out matters: that resets the
+    /// rate, the filter, the gains and both oscillators, and on a shared
+    /// connection it would pull the rug from under a sibling radio.
     ///
     /// Refused with a note, never with an error, alongside a PTT pair (the two
     /// want the same four pins in different modes) and on a firmware without
@@ -1027,7 +1030,7 @@ impl Phy {
             warnings.push(msg);
             return Ok((false, warnings));
         }
-        for attr in [GPO_MANUAL_ENABLE, GPO_MANUAL_MASK, INITIALIZE, GPO_SET] {
+        for attr in [GPO_MANUAL_ENABLE, GPO_SET] {
             if !self.has_debug_attr(attr) {
                 let msg = format!(
                     "PlutoSDR: this firmware publishes no {attr}, so {} cannot switch the \
@@ -1041,34 +1044,8 @@ impl Phy {
         }
         let already =
             conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1");
-        if !already {
-            // The pin's level first, so `initialize` brings it up already
-            // right; the other three pins keep whatever the mask had for them.
-            let mask = conn
-                .read_debug_attr(&self.phy_id, GPO_MANUAL_MASK)
-                .ok()
-                .and_then(|v| parse_int(v.trim()))
-                .unwrap_or(0);
-            let bit = 1u32 << pin;
-            let mask = if PlutoPaPin::level(on, active_low) { mask | bit } else { mask & !bit };
-            if !self.write_setup_attr(conn, GPO_MANUAL_MASK, &mask.to_string(), &mut warnings)? {
-                return Ok((false, warnings));
-            }
-            if pin <= 1 {
-                // An external-LNA claim on this pin would fight the switch.
-                let attr = ELNA_GPO[usize::from(pin)];
-                if self.has_debug_attr(attr) {
-                    self.write_setup_attr(conn, attr, "0", &mut warnings)?;
-                }
-            }
-            if !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)?
-                || !self.write_setup_attr(conn, INITIALIZE, "1", &mut warnings)?
-            {
-                return Ok((false, warnings));
-            }
-            // `initialize` leaves an FDD part's state machine where the
-            // driver's setup puts it; `ensure_receiving` at the end of the open
-            // checks it, as it does after `setup_tr_switching`.
+        if !already && !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)? {
+            return Ok((false, warnings));
         }
         match self.set_pa(conn, pin, on, active_low) {
             Ok(()) => {
@@ -1410,15 +1387,6 @@ fn usable_ports(
 ///
 /// The brackets are part of the value, and the fields are in that order — not
 /// min/max/step, which is the natural reading and the wrong one.
-/// A debug attribute's integer, which the driver prints in decimal but a
-/// firmware may equally print as `0x…`.
-fn parse_int(text: &str) -> Option<u32> {
-    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-        None => text.parse().ok(),
-    }
-}
-
 fn parse_range(text: &str) -> Option<(f64, f64, f64)> {
     let inner = text.trim().trim_start_matches('[').trim_end_matches(']');
     let mut it = inner.split_whitespace();

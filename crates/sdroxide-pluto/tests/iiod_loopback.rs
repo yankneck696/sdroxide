@@ -2291,10 +2291,11 @@ fn a_borrowed_second_chain_is_read_in_step_with_the_first() {
     rig.release();
 }
 
-/// Issue #525: an amplifier switched in and out from a GPO pin. The pin is put
-/// in manual mode *at the level asked for* before the commit, so the amplifier
-/// is never switched the wrong way for the length of an open, and flipping it
-/// afterwards is one `gpo_set` — no reinitialise, so nothing is retuned.
+/// Issue #525: an amplifier switched in and out from a GPO pin. Manual mode
+/// takes effect as soon as it is written, so the whole setup is that write
+/// and one `gpo_set` — the same two commands that work from the board's own
+/// shell — with no `initialize`, which would reset the front end. Flipping it
+/// afterwards is one more `gpo_set`.
 #[test]
 fn a_gpo_pin_switches_the_amplifier_in_fdd() {
     let fake = Fake::start();
@@ -2311,17 +2312,14 @@ fn a_gpo_pin_switches_the_amplifier_in_fdd() {
         let g = fake.state.lock().expect("lock");
         let debug = |attr: &str| g.get(&format!("ad9361-phy/DEBUG/{attr}")).map(str::to_string);
         assert_eq!(debug("adi,gpo-manual-mode-enable").as_deref(), Some("1"));
-        assert_eq!(debug("adi,gpo-manual-mode-enable-mask").as_deref(), Some("4"));
         assert_eq!(debug("gpo_set").as_deref(), Some("2 1"));
         // Still FDD: this is not the PTT pair, and full duplex survives it.
         assert_eq!(debug("adi,frequency-division-duplex-mode-enable"), None);
+        assert_eq!(debug("initialize"), None, "the switch must not reset the front end");
         let at = |key: &str| g.attrs.iter().position(|(k, _)| k == key).expect(key);
         assert!(
-            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable-mask")
-                < at("ad9361-phy/DEBUG/initialize")
-                && at("ad9361-phy/DEBUG/initialize")
-                    < at("ad9361-phy/INPUT/voltage0/sampling_frequency"),
-            "level, then commit, then the front end the commit would undo"
+            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable") < at("ad9361-phy/DEBUG/gpo_set"),
+            "gpo_set is refused until manual mode is on"
         );
     }
     assert!(r0.pa_available());
@@ -2330,7 +2328,7 @@ fn a_gpo_pin_switches_the_amplifier_in_fdd() {
         fake.state.lock().unwrap().get("ad9361-phy/DEBUG/gpo_set") == Some("2 0")
     });
     let inits = fake.state.lock().unwrap().writes_of("ad9361-phy/DEBUG/initialize").len();
-    assert_eq!(inits, 1, "flipping the switch must not reinitialise the part");
+    assert_eq!(inits, 0, "flipping the switch must not reinitialise the part");
     drop(r0);
     rig.release();
 }

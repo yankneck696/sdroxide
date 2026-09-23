@@ -3460,7 +3460,9 @@ pub(in crate::app) fn settings_pluto_tab(
                     .on_hover_text(
                         "On: the amplifier is in the transmit path. Off: it is bypassed. \
                          Applies immediately, and is remembered for the next start. Turn \
-                         the TX gain down before switching it in the first time.",
+                         the TX gain down before switching it in the first time, and power \
+                         the board from both USB ports (or its DC input): the amplifier \
+                         draws enough that one USB 2.0 port can sag and reboot the Pluto.",
                     )
                     .changed()
                 {
