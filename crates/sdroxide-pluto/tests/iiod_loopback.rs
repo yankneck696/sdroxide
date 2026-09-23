@@ -74,6 +74,9 @@ const CONTEXT_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
     <debug-attribute name="adi,gpo3-slave-tx-enable" />
     <debug-attribute name="adi,elna-rx1-gpo0-control-enable" />
     <debug-attribute name="adi,elna-rx2-gpo1-control-enable" />
+    <debug-attribute name="adi,gpo-manual-mode-enable" />
+    <debug-attribute name="adi,gpo-manual-mode-enable-mask" />
+    <debug-attribute name="gpo_set" />
     <debug-attribute name="initialize" />
   </device>
   <device id="iio:device3" name="cf-ad9361-lpc">
@@ -2219,4 +2222,139 @@ fn a_chain_found_in_the_wrong_mode_is_put_right_and_the_gain_retried() {
         g.get("ad9361-phy/INPUT/voltage1/gain_control_mode") == Some("manual")
             && g.get("ad9361-phy/INPUT/voltage1/hardwaregain").is_some_and(|v| v.starts_with("11"))
     });
+}
+
+/// Issue #525: RX2 borrowed by the RX1 radio as its own second aerial. What
+/// has to hold is that the two chains come out of the rings *paired* — each
+/// read hands over chain 0's and chain 1's samples of the same instants — and
+/// that chain 0's history from before the attach still comes through, only
+/// unpaired, rather than being thrown away or mistaken for pairs.
+#[test]
+fn a_borrowed_second_chain_is_read_in_step_with_the_first() {
+    use sdroxide_pluto::PlutoRig;
+
+    let fake = Fake::start_pluto_plus();
+    let rig = PlutoRig::open(&fake.address(), &config(), 435_000_000.0).expect("open");
+    let mut r0 = rig.rx(0).expect("attach chain 0");
+    // Let chain 0 queue some history of its own first.
+    let mut buf = vec![0f32; 4096];
+    wait_for("chain 0 samples", || r0.rx_read(&mut buf) > 0);
+    std::thread::sleep(Duration::from_millis(50));
+
+    let mut aux = rig.aux_rx().expect("borrow chain 1");
+    // Not a second radio's to take while it is borrowed.
+    assert!(rig.rx(1).is_err());
+    wait_for("a dual-pair open", || {
+        fake.state.lock().expect("lock").rx_open_masks.last().map(String::as_str)
+            == Some("0000000f")
+    });
+
+    let mut side = vec![0f32; 4096];
+    let mut unpaired_seen = 0usize;
+    let mut paired_reads = 0usize;
+    wait_for("paired reads", || {
+        let (n, paired) = r0.rx_read_paired(&mut aux, &mut buf, &mut side);
+        if n == 0 {
+            return false;
+        }
+        assert!((buf[0] - (SAMPLE_I as f32 / 2048.0)).abs() < 1e-6, "chain 0 is chain 0's");
+        if paired == 0 {
+            // History from before the pair began — only ever *before* it.
+            assert_eq!(paired_reads, 0, "an unpaired block after pairing began");
+            unpaired_seen += n;
+            return false;
+        }
+        assert_eq!(paired, n, "a block is paired whole or not at all");
+        assert!(
+            (side[0] - (SAMPLE2_I as f32 / 2048.0)).abs() < 1e-6
+                && (side[1] - (SAMPLE2_Q as f32 / 2048.0)).abs() < 1e-6,
+            "the second chain's half is chain 1's"
+        );
+        paired_reads += 1;
+        paired_reads >= 5
+    });
+    let _ = unpaired_seen;
+
+    // Discarding keeps the pair: the next read is still whole.
+    r0.discard_pending_paired(&mut aux);
+    wait_for("a paired read after a discard", || {
+        let (n, paired) = r0.rx_read_paired(&mut aux, &mut buf, &mut side);
+        assert!(n == 0 || paired == n, "the discard broke the pairing");
+        n > 0
+    });
+
+    // Giving it back frees RX2 for a radio of its own.
+    drop(aux);
+    let r1 = rig.rx(1).expect("RX2 is free again");
+    drop(r1);
+    drop(r0);
+    rig.release();
+}
+
+/// Issue #525: an amplifier switched in and out from a GPO pin. The pin is put
+/// in manual mode *at the level asked for* before the commit, so the amplifier
+/// is never switched the wrong way for the length of an open, and flipping it
+/// afterwards is one `gpo_set` — no reinitialise, so nothing is retuned.
+#[test]
+fn a_gpo_pin_switches_the_amplifier_in_fdd() {
+    let fake = Fake::start();
+    let cfg = PlutoConfig {
+        pa_gpo: sdroxide_types::PlutoPaPin::Gpo2,
+        pa_on: true,
+        full_duplex: true,
+        ..config()
+    };
+    let rig = sdroxide_pluto::PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
+    let r0 = rig.rx(0).expect("attach chain 0");
+    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
+    {
+        let g = fake.state.lock().expect("lock");
+        let debug = |attr: &str| g.get(&format!("ad9361-phy/DEBUG/{attr}")).map(str::to_string);
+        assert_eq!(debug("adi,gpo-manual-mode-enable").as_deref(), Some("1"));
+        assert_eq!(debug("adi,gpo-manual-mode-enable-mask").as_deref(), Some("4"));
+        assert_eq!(debug("gpo_set").as_deref(), Some("2 1"));
+        // Still FDD: this is not the PTT pair, and full duplex survives it.
+        assert_eq!(debug("adi,frequency-division-duplex-mode-enable"), None);
+        let at = |key: &str| g.attrs.iter().position(|(k, _)| k == key).expect(key);
+        assert!(
+            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable-mask")
+                < at("ad9361-phy/DEBUG/initialize")
+                && at("ad9361-phy/DEBUG/initialize")
+                    < at("ad9361-phy/INPUT/voltage0/sampling_frequency"),
+            "level, then commit, then the front end the commit would undo"
+        );
+    }
+    assert!(r0.pa_available());
+    r0.set_pa(false);
+    wait_for("the bypass", || {
+        fake.state.lock().unwrap().get("ad9361-phy/DEBUG/gpo_set") == Some("2 0")
+    });
+    let inits = fake.state.lock().unwrap().writes_of("ad9361-phy/DEBUG/initialize").len();
+    assert_eq!(inits, 1, "flipping the switch must not reinitialise the part");
+    drop(r0);
+    rig.release();
+}
+
+/// The amplifier pin and the PTT pair want the same four pins in different
+/// modes, so asking for both keeps the PTT pair and says why the switch is off.
+#[test]
+fn an_amplifier_pin_beside_a_ptt_pair_is_refused_and_says_so() {
+    let fake = Fake::start();
+    let cfg = PlutoConfig {
+        pa_gpo: sdroxide_types::PlutoPaPin::Gpo0,
+        ptt_gpo: sdroxide_types::PlutoPtt::Gpo23,
+        ..config()
+    };
+    let rig = sdroxide_pluto::PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
+    let r0 = rig.rx(0).expect("attach chain 0");
+    let status = rig.open_status().unwrap_or_default();
+    assert!(status.contains("amplifier switch"), "{status}");
+    {
+        let g = fake.state.lock().expect("lock");
+        assert_eq!(g.get("ad9361-phy/DEBUG/gpo_set"), None);
+        assert_ne!(g.get("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable"), Some("1"));
+    }
+    assert!(!r0.pa_available());
+    drop(r0);
+    rig.release();
 }

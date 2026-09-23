@@ -27,7 +27,7 @@
 //! different things — receive `hardwaregain` is gain in dB, transmit
 //! `hardwaregain` is *attenuation* expressed as negative dB.
 
-use sdroxide_types::{PlutoDuplex, PlutoPtt};
+use sdroxide_types::{PlutoDuplex, PlutoPaPin, PlutoPtt};
 
 use crate::context::{Context, Device, ScanFormat};
 use crate::error::{Error, Result};
@@ -80,6 +80,21 @@ const ELNA_GPO: [&str; 2] =
     ["adi,elna-rx1-gpo0-control-enable", "adi,elna-rx2-gpo1-control-enable"];
 /// How many general-purpose output pins an AD9361 has.
 const GPO_PINS: u8 = 4;
+/// The device-tree property that hands all four GPO pins to manual control —
+/// set from the host rather than slaved to the enable-state machine. Like
+/// [`FDD_ENABLE`] it does nothing until [`INITIALIZE`] is written. It is one
+/// switch for all four pins (the part's `GPO_MANUAL_SELECT` bit), which is why
+/// the amplifier pin and the PTT pair cannot be used together.
+const GPO_MANUAL_ENABLE: &str = "adi,gpo-manual-mode-enable";
+/// The levels the pins come up at when manual mode is initialised, bit `n` for
+/// GPO`n`. Written before [`INITIALIZE`] so the amplifier is never switched the
+/// wrong way for the length of an open.
+const GPO_MANUAL_MASK: &str = "adi,gpo-manual-mode-enable-mask";
+/// The driver's debugfs entry that sets one manual GPO live: `"<pin> <level>"`.
+/// Refused unless [`GPO_MANUAL_ENABLE`] was set at the last initialise. It
+/// takes effect at once, with no reinitialise, so flipping the amplifier costs
+/// one round trip and nothing on the receive side.
+const GPO_SET: &str = "gpo_set";
 /// The four slave bits this backend ever sets — one per pin, in the direction
 /// [`PlutoPtt`] gives it. Finding one of them set on a board that is not in FDD
 /// is how a session's own leftovers are told apart from a board somebody put in
@@ -893,6 +908,19 @@ impl Phy {
                 self.write_setup_attr(conn, &attr, value, &mut out.warnings)?;
             }
         }
+        if pins.is_some()
+            && self.has_debug_attr(GPO_MANUAL_ENABLE)
+            && conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1")
+        {
+            // Left by an amplifier switch in an earlier session (or chosen
+            // alongside this pair — `setup_pa_switch` refuses that). Manual
+            // mode overrides the slaved pins, so the PTT pair would never move.
+            tracing::info!(
+                "PlutoSDR: taking the GPO pins out of manual mode — the PTT pair needs them \
+                 slaved to the radio"
+            );
+            self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "0", &mut out.warnings)?;
+        }
         if pins == Some((0, 1)) {
             // Analog Devices' own note puts an external LNA on these two, so a
             // board wired that way has them claimed. PTT wins here because the
@@ -956,6 +984,121 @@ impl Phy {
             None => tracing::info!("PlutoSDR: TDD, with no GPO pin slaved to the radio"),
         }
         Ok(out)
+    }
+
+    /// Put GPO `pa`'s pin in the AD9361's manual GPO mode, driven to the level
+    /// that has the amplifier `on`, for a board whose amplifier is switched in
+    /// and out from a GPO (issue #525). Answers whether [`Self::set_pa`] will
+    /// work afterwards.
+    ///
+    /// Runs after [`Self::setup_tr_switching`] and, like it, before the front
+    /// end is configured: this also ends in [`INITIALIZE`], which puts the
+    /// rate, the filter, the gains and the oscillators back to the board's
+    /// defaults. It is only paid when the pin is not already set up — a board
+    /// found in manual mode from an earlier session just has the level written.
+    ///
+    /// Refused with a note, never with an error, alongside a PTT pair (the two
+    /// want the same four pins in different modes) and on a firmware without
+    /// the properties: an amplifier switch that cannot be set up must not cost
+    /// the operator their receiver.
+    ///
+    /// Choosing no pin leaves every GPO alone, including a board that an
+    /// earlier session left in manual mode: those pins then stay where they
+    /// were, which is the amplifier as it was last switched, and the PTT pair
+    /// takes manual mode back off if it is ever chosen.
+    pub fn setup_pa_switch(
+        &self,
+        conn: &mut Connection,
+        pa: PlutoPaPin,
+        ptt: PlutoPtt,
+        on: bool,
+        active_low: bool,
+    ) -> Result<(bool, Vec<String>)> {
+        let mut warnings = Vec::new();
+        let Some(pin) = pa.pin() else { return Ok((false, warnings)) };
+        if ptt != PlutoPtt::Off {
+            let msg = format!(
+                "PlutoSDR: the amplifier switch on {} is off — the AD9361 hands its GPO \
+                 pins either to the PTT pair or to manual control, not both. Set the PTT \
+                 pins to Off to use it",
+                pa.label()
+            );
+            tracing::warn!("{msg}");
+            warnings.push(msg);
+            return Ok((false, warnings));
+        }
+        for attr in [GPO_MANUAL_ENABLE, GPO_MANUAL_MASK, INITIALIZE, GPO_SET] {
+            if !self.has_debug_attr(attr) {
+                let msg = format!(
+                    "PlutoSDR: this firmware publishes no {attr}, so {} cannot switch the \
+                     amplifier — the GPO pins are left alone",
+                    pa.label()
+                );
+                tracing::warn!("{msg}");
+                warnings.push(msg);
+                return Ok((false, warnings));
+            }
+        }
+        let already =
+            conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1");
+        if !already {
+            // The pin's level first, so `initialize` brings it up already
+            // right; the other three pins keep whatever the mask had for them.
+            let mask = conn
+                .read_debug_attr(&self.phy_id, GPO_MANUAL_MASK)
+                .ok()
+                .and_then(|v| parse_int(v.trim()))
+                .unwrap_or(0);
+            let bit = 1u32 << pin;
+            let mask = if PlutoPaPin::level(on, active_low) { mask | bit } else { mask & !bit };
+            if !self.write_setup_attr(conn, GPO_MANUAL_MASK, &mask.to_string(), &mut warnings)? {
+                return Ok((false, warnings));
+            }
+            if pin <= 1 {
+                // An external-LNA claim on this pin would fight the switch.
+                let attr = ELNA_GPO[usize::from(pin)];
+                if self.has_debug_attr(attr) {
+                    self.write_setup_attr(conn, attr, "0", &mut warnings)?;
+                }
+            }
+            if !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)?
+                || !self.write_setup_attr(conn, INITIALIZE, "1", &mut warnings)?
+            {
+                return Ok((false, warnings));
+            }
+            // `initialize` leaves an FDD part's state machine where the
+            // driver's setup puts it; `ensure_receiving` at the end of the open
+            // checks it, as it does after `setup_tr_switching`.
+        }
+        match self.set_pa(conn, pin, on, active_low) {
+            Ok(()) => {
+                tracing::info!(
+                    "PlutoSDR: {} switches the amplifier (active {}), which is {}",
+                    pa.label(),
+                    if active_low { "low" } else { "high" },
+                    if on { "in" } else { "bypassed" }
+                );
+                Ok((true, warnings))
+            }
+            Err(e @ (Error::Remote { .. } | Error::Unsupported(_))) => {
+                let msg = format!(
+                    "PlutoSDR: the radio would not set {} ({e}) — the amplifier switch is off",
+                    pa.label()
+                );
+                tracing::warn!("{msg}");
+                warnings.push(msg);
+                Ok((false, warnings))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Drive manual GPO `pin` to switch the amplifier in (`on`) or out. Live —
+    /// no reinitialise — once [`Self::setup_pa_switch`] has put the pins in
+    /// manual mode.
+    pub fn set_pa(&self, conn: &mut Connection, pin: u8, on: bool, active_low: bool) -> Result<()> {
+        let level = u8::from(PlutoPaPin::level(on, active_low));
+        conn.write_debug_attr(&self.phy_id, GPO_SET, &format!("{pin} {level}"))
     }
 
     /// Write one setup attribute, answering whether it landed. A device that
@@ -1267,6 +1410,15 @@ fn usable_ports(
 ///
 /// The brackets are part of the value, and the fields are in that order — not
 /// min/max/step, which is the natural reading and the wrong one.
+/// A debug attribute's integer, which the driver prints in decimal but a
+/// firmware may equally print as `0x…`.
+fn parse_int(text: &str) -> Option<u32> {
+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => text.parse().ok(),
+    }
+}
+
 fn parse_range(text: &str) -> Option<(f64, f64, f64)> {
     let inner = text.trim().trim_start_matches('[').trim_end_matches(']');
     let mut it = inner.split_whitespace();

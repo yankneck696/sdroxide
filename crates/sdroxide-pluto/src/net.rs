@@ -50,6 +50,9 @@ pub use crate::phy::PlutoLimits;
 use crate::stream;
 use crate::trace::Trace;
 
+/// [`Shared::pair_origin`] before any lockstep pair has been pushed.
+pub(crate) const NO_PAIR: u64 = u64::MAX;
+
 /// How long the TCP handshake may take before the address counts as wrong.
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -142,6 +145,9 @@ pub(crate) enum Ctrl {
     Ppm(f64),
     TxOn(f64),
     TxOff,
+    /// Switch the amplifier in (`true`) or out, on the GPO pin
+    /// [`Shared::pa`] names. See `sdroxide_types::PlutoPaPin`.
+    Pa(bool),
     Shutdown,
 }
 
@@ -207,6 +213,25 @@ pub(crate) struct Shared {
     pub rx_pairs: AtomicUsize,
     /// The second chain's ring feed, installed while its stream is attached.
     pub ring1: Mutex<Option<Producer<f32>>>,
+    /// The second chain is this connection's *own* auxiliary receiver — a
+    /// second aerial or a PureSignal coupler for chain 0's radio — rather than
+    /// a radio of its own, so the two rings must stay sample-for-sample in
+    /// step. See [`PlutoRx::rx_read_paired`] for what that buys and how.
+    pub lockstep: AtomicBool,
+    /// Floats ever committed to chain 0's ring, and ever taken out of it.
+    /// Only the difference between the two and [`Self::pair_origin`] matters;
+    /// they are what lets the reader tell which of the chain-0 samples it is
+    /// holding have a chain-1 twin.
+    pub pushed0: AtomicU64,
+    pub popped0: AtomicU64,
+    /// The value [`Self::pushed0`] had when the first lockstep buffer was
+    /// pushed — chain 1's first float is chain 0's float number
+    /// `pair_origin`. [`NO_PAIR`] until then, and again after the auxiliary
+    /// stream detaches.
+    pub pair_origin: AtomicU64,
+    /// The GPO pin switching an amplifier, and whether its control is
+    /// active-low, when [`Phy::setup_pa_switch`] got it working.
+    pub pa: Option<(u8, bool)>,
     /// Per-chain LO-move subscribers: `(chain, notify)`. The control thread
     /// tells every chain but the one that asked when the shared LO moves.
     pub lo_watch: Mutex<Vec<(u8, Sender<f64>)>>,
@@ -430,6 +455,17 @@ impl PlutoRig {
         // land on the far side of that.
         let tr = phy.setup_tr_switching(&mut control, cfg.duplex, cfg.ptt_gpo)?;
         warnings.extend(tr.warnings);
+        // The amplifier switch, for the same reason and in the same place: it
+        // may end in a reinitialise of its own (issue #525).
+        let (pa_ok, pa_warnings) = phy.setup_pa_switch(
+            &mut control,
+            cfg.pa_gpo,
+            cfg.ptt_gpo,
+            cfg.pa_on,
+            cfg.pa_active_low,
+        )?;
+        warnings.extend(pa_warnings);
+        let pa = cfg.pa_gpo.pin().filter(|_| pa_ok).map(|pin| (pin, cfg.pa_active_low));
         // TDD is one direction at a time in the silicon, so the link is no
         // longer what decides this — the part is.
         let full_duplex = if tr.tdd && cfg.full_duplex {
@@ -644,6 +680,11 @@ impl PlutoRig {
             tx_buffer_samples: tx_buffer_samples(tx_rate),
             rx_pairs: AtomicUsize::new(1),
             ring1: Mutex::new(None),
+            lockstep: AtomicBool::new(false),
+            pushed0: AtomicU64::new(0),
+            popped0: AtomicU64::new(0),
+            pair_origin: AtomicU64::new(NO_PAIR),
+            pa,
             lo_watch: Mutex::new(Vec::new()),
             trace: trace.clone(),
         });
@@ -838,7 +879,11 @@ impl PlutoRig {
                     // held it (chain 0's producer lives in the thread); drain
                     // the backlog so a re-attached stream starts live rather
                     // than replaying half a second of the past.
-                    while r.pop().is_ok() {}
+                    let mut drained = 0u64;
+                    while r.pop().is_ok() {
+                        drained += 1;
+                    }
+                    inner.shared.popped0.fetch_add(drained, Ordering::SeqCst);
                     (r, tx)
                 }
                 None => {
@@ -872,6 +917,28 @@ impl PlutoRig {
             rx_port: if chain == 0 { inner.rx_port0.clone() } else { String::new() },
             tx_port: inner.tx_port0.clone(),
         })
+    }
+}
+
+impl PlutoRig {
+    /// Attach receive chain 1 as chain 0's own auxiliary receiver — a second
+    /// aerial or a transmit coupler — rather than as a radio of its own
+    /// (issue #525).
+    ///
+    /// The stream is an ordinary [`PlutoRx`] for its gain, AGC and lifetime;
+    /// what differs is that the receive thread now keeps its ring and chain
+    /// 0's in step — both buffers' worth or neither — so that
+    /// [`PlutoRx::rx_read_paired`] can hand over the two chains' samples of
+    /// the same instants. Dropping it lets the rings run independently again.
+    pub fn aux_rx(&self) -> Result<PlutoRx> {
+        let shared = &self.inner.shared;
+        shared.pair_origin.store(NO_PAIR, Ordering::SeqCst);
+        shared.lockstep.store(true, Ordering::SeqCst);
+        let rx = self.rx(1);
+        if rx.is_err() {
+            shared.lockstep.store(false, Ordering::SeqCst);
+        }
+        rx
     }
 }
 
@@ -924,7 +991,12 @@ impl Drop for PlutoRx {
         } else {
             // The receive thread narrows its buffer back to one pair.
             self.rig.shared.rx_pairs.store(1, Ordering::Relaxed);
-            *self.rig.shared.ring1.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // Under the ring's lock, so the receive thread never sees
+            // lockstep with the ring gone or the ring with lockstep half-off.
+            let mut slot = self.rig.shared.ring1.lock().unwrap_or_else(|e| e.into_inner());
+            *slot = None;
+            self.rig.shared.lockstep.store(false, Ordering::SeqCst);
+            self.rig.shared.pair_origin.store(NO_PAIR, Ordering::SeqCst);
         }
     }
 }
@@ -1107,19 +1179,92 @@ impl PlutoRx {
     /// Drain interleaved I,Q floats from the RX ring into `out`. Always returns
     /// an even count, so the stream stays aligned. 0 means nothing yet.
     pub fn rx_read(&mut self, out: &mut [f32]) -> usize {
-        let Some(ring) = self.ring.as_mut() else { return 0 };
-        let take = ring.slots().min(out.len()) & !1;
-        let mut n = 0;
-        while n < take {
-            match ring.pop() {
-                Ok(v) => {
-                    out[n] = v;
-                    n += 1;
-                }
-                Err(_) => break,
-            }
+        let n = pop_into(self.ring.as_mut(), out);
+        if self.chain == 0 {
+            self.rig.shared.popped0.fetch_add(n as u64, Ordering::SeqCst);
         }
         n
+    }
+
+    /// Drain chain 0 (`self`) and the auxiliary chain `aux` together, keeping
+    /// the two sample-for-sample aligned.
+    ///
+    /// Returns `(n, paired)`, both in floats: `out[..n]` is chain 0's next
+    /// samples, and when `paired == n` then `aux_out[..n]` holds chain 1's
+    /// samples of *the same instants*. A block the auxiliary chain has no
+    /// twin for — the samples queued before it attached, or ones whose twins
+    /// have not been committed yet — comes back with `paired == 0` and is
+    /// still the main receiver's audio, uncombined.
+    ///
+    /// # Why the two can be trusted to line up
+    ///
+    /// Both chains arrive in one device buffer, interleaved, so the hardware
+    /// hands them over already aligned; the only way to lose that is on this
+    /// side. So in lockstep the receive thread commits a buffer to both rings
+    /// or to neither (an overrun drops the pair), chain 1's first float is
+    /// recorded against chain 0's running count ([`Shared::pair_origin`]), and
+    /// this reader only ever takes equal amounts from the two past that point.
+    /// Every other chain-0 read — the plain one, a discard — is counted, which
+    /// is what keeps "how far past the origin" true.
+    pub fn rx_read_paired(
+        &mut self,
+        aux: &mut PlutoRx,
+        out: &mut [f32],
+        aux_out: &mut [f32],
+    ) -> (usize, usize) {
+        let shared = &self.rig.shared;
+        let origin = shared.pair_origin.load(Ordering::SeqCst);
+        let popped = shared.popped0.load(Ordering::SeqCst);
+        if self.chain != 0 || origin == NO_PAIR || popped < origin {
+            // Nothing paired yet, or unpaired history still to hand over —
+            // but never read past the origin, or the twins would be skipped.
+            let room = if origin == NO_PAIR || self.chain != 0 {
+                out.len()
+            } else {
+                usize::try_from(origin - popped).unwrap_or(usize::MAX).min(out.len())
+            };
+            let n = self.rx_read(&mut out[..room & !1]);
+            return (n, 0);
+        }
+        let (Some(main), Some(side)) = (self.ring.as_ref(), aux.ring.as_ref()) else {
+            return (self.rx_read(out), 0);
+        };
+        // Chain 0 is committed first, so chain 1 is the one that may lag by a
+        // buffer: take no more than both have.
+        let take = main.slots().min(side.slots()).min(out.len()).min(aux_out.len()) & !1;
+        let n = pop_into(self.ring.as_mut(), &mut out[..take]);
+        let m = pop_into(aux.ring.as_mut(), &mut aux_out[..n]);
+        shared.popped0.fetch_add(n as u64, Ordering::SeqCst);
+        debug_assert_eq!(n, m, "the rings were measured before either was read");
+        (n, if m == n { n } else { 0 })
+    }
+
+    /// Throw away everything queued on chain 0 and on `aux`, keeping the pair
+    /// aligned — [`Self::discard_pending_rx`] for a radio running an
+    /// auxiliary chain.
+    pub fn discard_pending_paired(&mut self, aux: &mut PlutoRx) {
+        let mut a = vec![0.0f32; 8192];
+        let mut b = vec![0.0f32; 8192];
+        loop {
+            let (n, _) = self.rx_read_paired(aux, &mut a, &mut b);
+            if n == 0 {
+                break;
+            }
+        }
+    }
+
+    /// Whether a GPO pin is set up to switch an amplifier on this connection.
+    pub fn pa_available(&self) -> bool {
+        self.rig.shared.pa.is_some()
+    }
+
+    /// Switch the amplifier in or out. The connection's, so only chain 0's
+    /// radio — the one with the transmitter — does this; a no-op elsewhere
+    /// and on a connection with no amplifier pin.
+    pub fn set_pa(&self, on: bool) {
+        if self.chain == 0 && self.rig.shared.pa.is_some() {
+            let _ = self.rig.ctrl.send(Ctrl::Pa(on));
+        }
     }
 
     /// Drop whatever the receive thread queued. Receive is torn down for the
@@ -1128,7 +1273,13 @@ impl PlutoRx {
     /// front of the first live sample.
     pub fn discard_pending_rx(&mut self) {
         if let Some(ring) = self.ring.as_mut() {
-            while ring.pop().is_ok() {}
+            let mut n = 0u64;
+            while ring.pop().is_ok() {
+                n += 1;
+            }
+            if self.chain == 0 {
+                self.rig.shared.popped0.fetch_add(n, Ordering::SeqCst);
+            }
         }
     }
 
@@ -1156,6 +1307,24 @@ impl PlutoRx {
         let last = Duration::from_millis(clock.load(Ordering::Relaxed));
         since_open.saturating_sub(last)
     }
+}
+
+/// Pop up to `out.len()` floats — always an even number, so I and Q stay
+/// paired — and say how many.
+fn pop_into(ring: Option<&mut Consumer<f32>>, out: &mut [f32]) -> usize {
+    let Some(ring) = ring else { return 0 };
+    let take = ring.slots().min(out.len()) & !1;
+    let mut n = 0;
+    while n < take {
+        match ring.pop() {
+            Ok(v) => {
+                out[n] = v;
+                n += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    n
 }
 
 /// The single-stream view of a Pluto: chain 0 of a [`PlutoRig`] of its own.
@@ -1414,6 +1583,10 @@ fn control_thread(
                 }
                 Ctrl::TxOn(hz) => key_up(&mut conn, &shared, *hz, ppm, &mut tx_lo),
                 Ctrl::TxOff => key_down(&mut conn, &shared, rx_hz, ppm),
+                Ctrl::Pa(on) => match shared.pa {
+                    Some((pin, active_low)) => phy.set_pa(&mut conn, pin, *on, active_low),
+                    None => Ok(()),
+                },
                 Ctrl::Shutdown => break 'ctrl,
             };
             // A refusal means the board answered — the link is fine and the
