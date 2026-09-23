@@ -3171,7 +3171,10 @@ pub(in crate::app) fn settings_pluto_tab(
     can_probe: bool,
     cmds: &mut Vec<Command>,
 ) {
-    use sdroxide_types::{PlutoAgc, PlutoConfig, PlutoDuplex, PlutoPtt};
+    use sdroxide_types::{
+        DiversityMode, LimeAuxRole, PlutoAgc, PlutoAuxConfig, PlutoConfig, PlutoDuplex, PlutoPaPin,
+        PlutoPtt,
+    };
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
         return;
@@ -3433,6 +3436,57 @@ pub(in crate::app) fn settings_pluto_tab(
         cfg.pluto.ptt_gpo = ptt;
         ui.end_row();
 
+        // The amplifier switch (issue #525). The pin and its polarity are part
+        // of how the connection is set up, so they wait for Apply; the switch
+        // itself is one register write and goes at once.
+        ui.label("Amplifier pin").on_hover_text(
+            "For a board whose amplifier can be switched in or bypassed from one of \
+             the AD9361's GPO pins — the PlutoSky R2 \"with PA\" is one. Pick the pin \
+             the board wires to the amplifier's enable (the schematic says which; failing \
+             that, try each with a dummy load on the output).\n\nThis puts the GPO pins \
+             in manual mode, so it cannot be used together with the PTT pins above — \
+             but unlike them it works in FDD, alongside Full duplex and PureSignal.\n\n\
+             Takes effect on Apply.",
+        );
+        let mut pa = cfg.pluto.pa_gpo;
+        enum_combo(ui, "pluto_pa_pin", &mut pa, &PlutoPaPin::ALL, PlutoPaPin::label);
+        cfg.pluto.pa_gpo = pa;
+        ui.end_row();
+
+        if cfg.pluto.pa_gpo != PlutoPaPin::Off {
+            ui.label("Amplifier");
+            ui.horizontal(|ui| {
+                if crate::chrome::checkbox(ui, &mut cfg.pluto.pa_on, "Switched in (PA on)")
+                    .on_hover_text(
+                        "On: the amplifier is in the transmit path. Off: it is bypassed. \
+                         Applies immediately, and is remembered for the next start. Turn \
+                         the TX gain down before switching it in the first time.",
+                    )
+                    .changed()
+                {
+                    push_gain(cmds, PlutoConfig::PA_ELEMENT, f64::from(u8::from(cfg.pluto.pa_on)));
+                }
+                crate::chrome::checkbox(ui, &mut cfg.pluto.pa_active_low, "Active low")
+                    .on_hover_text(
+                        "Tick if the board switches its amplifier in when the pin is \
+                         driven LOW. If \"Switched in\" does the opposite of what it \
+                         says, this is the setting to change. Takes effect on Apply.",
+                    );
+            });
+            ui.end_row();
+            if cfg.pluto.ptt_gpo != PlutoPtt::Off {
+                ui.label("");
+                ui.label(
+                    RichText::new(
+                        "The PTT pins are on, and they take the GPO pins away from manual \
+                         control — set them to Off to use the amplifier switch.",
+                    )
+                    .color(crate::theme::YELLOW()),
+                );
+                ui.end_row();
+            }
+        }
+
         // Next to Full duplex because it belongs to the same subject: both are
         // about what the link between here and the board can carry, not about
         // what the AD9361 can do. This one used to be reachable only by hand-
@@ -3531,6 +3585,224 @@ pub(in crate::app) fn settings_pluto_tab(
     });
 
     test_result_line(ui, test_result);
+
+    // ---- RX2 as this radio's own second chain (issue #525) -----------------
+    if cfg.pluto.rx == 0 {
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label(RichText::new("Second receive chain (RX2)").strong());
+        ui.label(
+            RichText::new(
+                "On a 2R2T board (Pluto+, PlutoSky R2 with 2R2T firmware) this radio can \
+                 keep RX2 for itself: as a second aerial, or as a sample of your own \
+                 transmitter for PureSignal. RX2 shares the oscillator and the clock with \
+                 RX1, so it hears the same span at the same instant. While it is used here \
+                 it is not free for a second radio tab. Changing what it is used for takes \
+                 effect on Apply.",
+            )
+            .weak(),
+        );
+        egui::Grid::new("pluto-aux-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+            ui.label("Used for");
+            let mut role = cfg.pluto.aux.role;
+            enum_combo(ui, "pluto-aux-role", &mut role, &LimeAuxRole::ALL, LimeAuxRole::label);
+            cfg.pluto.aux.role = role;
+            ui.end_row();
+
+            if cfg.pluto.aux.role != LimeAuxRole::Off {
+                ui.label("RX2 gain");
+                if crate::chrome::slider(
+                    ui,
+                    Slider::new(&mut cfg.pluto.aux.gain_db, 0.0..=71.0).step_by(1.0).suffix(" dB"),
+                )
+                .on_hover_text(if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
+                    "Set this LOW. The coupled sample of your own transmitter is a strong \
+                     signal, and a feedback chain driven into compression teaches the \
+                     correction its own distortion. Start at the bottom and use the \
+                     coupler's attenuator. RX2 runs at this fixed gain, AGC off."
+                } else {
+                    "Set so both aerials show about the same noise floor. Combining weights \
+                     the two by their noise, and a chain driven into compression hands the \
+                     filter a distorted copy of the interference, which cannot be subtracted \
+                     from an undistorted one. RX2 runs at this fixed gain, AGC off."
+                })
+                .changed()
+                {
+                    push_gain(cmds, PlutoConfig::AUX_GAIN_ELEMENT, cfg.pluto.aux.gain_db);
+                }
+                ui.end_row();
+            }
+
+            if cfg.pluto.aux.role == LimeAuxRole::Diversity {
+                ui.label("What to do with it");
+                let before = cfg.pluto.aux.mode;
+                let mut mode = before;
+                enum_combo(
+                    ui,
+                    "pluto-div-mode",
+                    &mut mode,
+                    &DiversityMode::ALL,
+                    DiversityMode::label,
+                );
+                if mode != before {
+                    cfg.pluto.aux.mode = mode;
+                    push_gain(
+                        cmds,
+                        PlutoConfig::DIV_MODE_ELEMENT,
+                        f64::from(u8::from(mode == DiversityMode::Combine)),
+                    );
+                }
+                ui.end_row();
+
+                ui.label("Filter length");
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            DragValue::new(&mut cfg.pluto.aux.taps)
+                                .speed(1.0)
+                                .range(1..=PlutoAuxConfig::MAX_TAPS)
+                                .suffix(" taps"),
+                        )
+                        .on_hover_text(
+                            "One tap is a gain and a phase — a null at one frequency. Each \
+                             further tap lets the filter equalise one more sample period of \
+                             path difference between the aerials, widening the null.",
+                        )
+                        .changed()
+                    {
+                        push_gain(
+                            cmds,
+                            PlutoConfig::DIV_TAPS_ELEMENT,
+                            f64::from(cfg.pluto.aux.taps),
+                        );
+                    }
+                    ui.label(
+                        RichText::new(PlutoAuxConfig::cost_note(
+                            cfg.pluto.aux.taps,
+                            cfg.pluto.sample_rate_hz,
+                        ))
+                        .weak(),
+                    );
+                });
+                ui.end_row();
+
+                ui.label("Adaptation");
+                ui.horizontal(|ui| {
+                    if crate::chrome::slider(
+                        ui,
+                        Slider::new(&mut cfg.pluto.aux.rate, 0.0..=1.0).show_value(false),
+                    )
+                    .on_hover_text(
+                        "Slow and steady at the left, fast and visibly hunting at the right. \
+                         Start fast to find the null, then hold it.",
+                    )
+                    .changed()
+                    {
+                        push_gain(
+                            cmds,
+                            PlutoConfig::DIV_RATE_ELEMENT,
+                            f64::from(cfg.pluto.aux.rate),
+                        );
+                    }
+                    if crate::chrome::checkbox(ui, &mut cfg.pluto.aux.frozen, "Hold")
+                        .on_hover_text("Stop the filter moving once a null has appeared.")
+                        .changed()
+                    {
+                        push_gain(
+                            cmds,
+                            PlutoConfig::DIV_FREEZE_ELEMENT,
+                            f64::from(u8::from(cfg.pluto.aux.frozen)),
+                        );
+                    }
+                    if ui
+                        .button("Restart")
+                        .on_hover_text("Zero the filter and start again.")
+                        .clicked()
+                    {
+                        push_gain(cmds, PlutoConfig::DIV_RESET_ELEMENT, 1.0);
+                    }
+                });
+                ui.end_row();
+            }
+
+            if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
+                ui.label("Table steps");
+                if ui
+                    .add(
+                        DragValue::new(&mut cfg.pluto.aux.ps_bins)
+                            .speed(1.0)
+                            .range(PlutoAuxConfig::PS_MIN_BINS..=PlutoAuxConfig::PS_MAX_BINS),
+                    )
+                    .on_hover_text(
+                        "How finely the correction follows the amplifier's curve. Thirty-two \
+                         suits the smooth curve of a typical amplifier. Changing it starts the \
+                         correction again.",
+                    )
+                    .changed()
+                {
+                    push_gain(cmds, PlutoConfig::PS_BINS_ELEMENT, f64::from(cfg.pluto.aux.ps_bins));
+                }
+                ui.end_row();
+
+                ui.label("Adaptation");
+                ui.horizontal(|ui| {
+                    if crate::chrome::slider(
+                        ui,
+                        Slider::new(&mut cfg.pluto.aux.ps_rate, 0.0..=1.0).show_value(false),
+                    )
+                    .on_hover_text("How hard each block of feedback moves the correction.")
+                    .changed()
+                    {
+                        push_gain(
+                            cmds,
+                            PlutoConfig::PS_RATE_ELEMENT,
+                            f64::from(cfg.pluto.aux.ps_rate),
+                        );
+                    }
+                    if crate::chrome::checkbox(ui, &mut cfg.pluto.aux.ps_frozen, "Hold")
+                        .on_hover_text("Keep the correction as it is.")
+                        .changed()
+                    {
+                        push_gain(
+                            cmds,
+                            PlutoConfig::PS_FREEZE_ELEMENT,
+                            f64::from(u8::from(cfg.pluto.aux.ps_frozen)),
+                        );
+                    }
+                    if ui
+                        .button("Restart")
+                        .on_hover_text("Forget the correction and learn it again.")
+                        .clicked()
+                    {
+                        push_gain(cmds, PlutoConfig::PS_RESET_ELEMENT, 1.0);
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
+            ui.label(
+                RichText::new(
+                    "Connect a directional coupler (with enough attenuation) from the \
+                     amplifier's output to RX2. The transmitter compares what comes back with \
+                     what it meant to send and pre-bends the signal so the amplifier's output \
+                     comes out straight. The correction stays at unity until the feedback \
+                     lines up, and can never ask for more than full scale. Progress goes to \
+                     the log and the PS meter while you transmit.",
+                )
+                .weak(),
+            );
+            if !cfg.pluto.full_duplex || cfg.pluto.ptt_gpo != PlutoPtt::Off {
+                ui.label(
+                    RichText::new(
+                        "PureSignal needs Full duplex on and the PTT pins off: the coupler is \
+                         only heard while receive keeps running through the over.",
+                    )
+                    .color(crate::theme::YELLOW()),
+                );
+            }
+        }
+    }
 
     ui.add_space(6.0);
     ui.label(

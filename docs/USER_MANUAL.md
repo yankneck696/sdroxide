@@ -9054,6 +9054,20 @@ configured in exactly the same way as one on your desk.
   no host software in the loop. **Off**, **GPO0 = RX, GPO1 = TX**, or **GPO2 =
   RX, GPO3 = TX**. Picking a pair puts the radio in TDD whatever *Duplex* says.
   See *Keying an external amplifier*, below. Takes effect on Apply.
+- **Amplifier pin**, **Amplifier** — for a board whose amplifier can be
+  switched in or bypassed from one of the AD9361's GPO pins, such as the
+  PlutoSky R2 "with PA" (issue #525). Choose the pin the board wires to the
+  amplifier's enable, then use **Switched in (PA on)** to put the amplifier in
+  the transmit path or bypass it — that checkbox applies at once and is
+  remembered for the next start. Tick **Active low** if the board switches the
+  amplifier in when the pin is driven low (if the switch does the opposite of
+  what it says, this is the setting). The pin is put in the AD9361's *manual*
+  GPO mode, so unlike the PTT pins it works in FDD, beside Full duplex and
+  PureSignal — and for the same reason the two cannot be used together: with
+  PTT pins chosen the amplifier switch stays off and the connect note says why.
+  Which pin a board uses is up to its maker; check the schematic, or try each
+  with a dummy load and the TX gain turned right down. The pin and the polarity
+  take effect on Apply.
 - **Buffer size** — how much the radio holds before each transfer, in complex
   samples, with the airtime and byte count it works out to shown beside it. The
   default of 32768 is about 16 ms at 2 Msps: long enough that the per-transfer
@@ -9072,6 +9086,30 @@ configured in exactly the same way as one on your desk.
   one of its attack modes the main window's **Gain** slider is greyed out, since
   the AD9361 ignores a gain written then; set the AGC to *Manual* to use it
   (issue #417).
+
+**Second receive chain (RX2).** On a 2R2T board the RX1 radio can keep RX2 for
+itself rather than leaving it to a second tab (issue #525). **Used for** offers:
+
+- **A second aerial (diversity / QRM suppression)** — RX2's aerial is combined
+  with RX1's by the same adaptive filter the LimeSDR and RSPduo use: *Cancel*
+  nulls a local noise source the second aerial hears, *Combine* adds the two
+  for diversity reception. The filter's controls also appear on the main
+  window's **DIV** strip. Because both chains arrive in the same device buffer,
+  their samples are paired exactly.
+- **Transmit feedback (PureSignal predistortion)** — a directional coupler on
+  the amplifier's output (with enough attenuation) goes into RX2, and the
+  transmitter learns the amplifier's curve from it and pre-bends the signal so
+  what comes out is straight. It needs **Full duplex** on and the **PTT pins**
+  off, because the coupler is only heard while receive keeps running through
+  the over; the correction shows on the PS meter and in the log while you
+  transmit, and stays at unity until the feedback lines up.
+
+**RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
+so both aerials show about the same noise floor; for PureSignal, start at the
+bottom and keep the coupled signal well out of compression. While RX2 is used
+here it cannot be a second radio tab. Changing what it is used for takes effect
+on Apply; the other controls apply immediately. **Not yet verified against
+hardware** — reports with the diagnostic report attached are welcome.
 
 **AD9363 or AD9364.** A stock Pluto is an AD9363 and covers **325 MHz–3.8 GHz**;
 a great many have had the well-known firmware change applied, which turns them
