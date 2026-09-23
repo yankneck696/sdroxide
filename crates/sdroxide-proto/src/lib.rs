@@ -1516,7 +1516,16 @@ use sdroxide_types::{
 /// `DigiStatus` whole, so a v172 peer reads the extra byte as the start of the
 /// next field and fails to decode every config — the same break as v172's
 /// appended message buttons.
-pub const PROTO_VERSION: u16 = 173;
+///
+/// v174: the PlutoSDR's second receive chain can serve the RX1 radio as a
+/// second aerial or as PureSignal feedback, and a GPO pin can switch an
+/// amplifier in and out (issue #525). `PlutoConfig` gains `aux`
+/// (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses),
+/// `pa_gpo` (`PlutoPaPin`), `pa_on` and `pa_active_low` on its tail, and the
+/// radio configuration rides whole in both a command and an event, so a v173
+/// peer reads the extra bytes as the start of the next field and fails to
+/// decode either.
+pub const PROTO_VERSION: u16 = 174;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

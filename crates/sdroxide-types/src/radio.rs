@@ -5309,6 +5309,79 @@ impl PlutoPtt {
     }
 }
 
+/// Which GPO pin, if any, holds an amplifier on or bypassed — a static switch
+/// the operator flips, not a PTT line (issue #525).
+///
+/// Boards built around a Pluto with an amplifier on them — the PlutoSky R2 "with
+/// PA" is the one this was asked for — can bring the amplifier's enable or
+/// bypass control out to one of the AD9361's GPO pins. Unlike [`PlutoPtt`] the
+/// pin does not follow the enable-state machine: it is put in the part's
+/// *manual* GPO mode and set from here, high or low, and stays there across
+/// overs. That is also why it works in FDD, and so beside full duplex and
+/// PureSignal, which the TDD-only PTT pair rules out.
+///
+/// The two cannot share the pins: the AD9361 has one switch that hands all four
+/// GPOs either to the state machine or to manual control, so choosing a pin
+/// here while [`PlutoPtt`] is on is refused with a note on connect.
+///
+/// Which pin a given board uses is the board maker's choice and is not
+/// published anywhere this backend can read — try each with the amplifier's
+/// output into a dummy load, or check the schematic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PlutoPaPin {
+    /// Leave every GPO alone.
+    #[default]
+    Off,
+    Gpo0,
+    Gpo1,
+    Gpo2,
+    Gpo3,
+}
+
+impl PlutoPaPin {
+    pub const ALL: [PlutoPaPin; 5] =
+        [PlutoPaPin::Off, PlutoPaPin::Gpo0, PlutoPaPin::Gpo1, PlutoPaPin::Gpo2, PlutoPaPin::Gpo3];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlutoPaPin::Off => "Not used",
+            PlutoPaPin::Gpo0 => "GPO0",
+            PlutoPaPin::Gpo1 => "GPO1",
+            PlutoPaPin::Gpo2 => "GPO2",
+            PlutoPaPin::Gpo3 => "GPO3",
+        }
+    }
+
+    /// The pin number, or `None` when this is off.
+    pub fn pin(self) -> Option<u8> {
+        match self {
+            PlutoPaPin::Off => None,
+            PlutoPaPin::Gpo0 => Some(0),
+            PlutoPaPin::Gpo1 => Some(1),
+            PlutoPaPin::Gpo2 => Some(2),
+            PlutoPaPin::Gpo3 => Some(3),
+        }
+    }
+
+    /// The level the pin is driven to for an amplifier that should be `on`,
+    /// given whether the board's control is active-low.
+    pub fn level(on: bool, active_low: bool) -> bool {
+        on != active_low
+    }
+}
+
+/// The Pluto's second receive chain, and what is done with it.
+///
+/// The same block a LimeSDR's second chain uses ([`LimeAuxConfig`]), because it
+/// is the same idea on the same kind of part: two receive chains on one
+/// synthesiser and one clock, so the second hears the same span at the same
+/// instant as the first. The DSP behind it — the adaptive combiner and the
+/// predistortion loop — is shared too, and so are its controls.
+///
+/// [`LimeAuxConfig::antenna`] is not used on a Pluto: the AD9361 selects one
+/// receive port for both chains.
+pub type PlutoAuxConfig = LimeAuxConfig;
+
 /// ADALM-Pluto (PlutoSDR) backend configuration.
 ///
 /// The device is reached over the network — which the USB cable already
@@ -5387,6 +5460,28 @@ pub struct PlutoConfig {
     /// whole time in FDD, so nothing would ever toggle.
     #[serde(default)]
     pub ptt_gpo: PlutoPtt,
+    /// The second receive chain on a 2R2T firmware, used by this radio as a
+    /// second aerial (diversity) or as transmit feedback (PureSignal) rather
+    /// than by a radio tab of its own (issue #525).
+    ///
+    /// Only honoured on the RX1 radio — it owns the transmitter and the chain
+    /// being borrowed is RX2. While it is on, RX2 is not free for another tab.
+    /// PureSignal also needs [`Self::full_duplex`]: the coupler is only heard
+    /// if receive keeps running through the over.
+    #[serde(default)]
+    pub aux: PlutoAuxConfig,
+    /// Which GPO pin switches an on-board or external amplifier in and out —
+    /// see [`PlutoPaPin`].
+    #[serde(default)]
+    pub pa_gpo: PlutoPaPin,
+    /// Whether the amplifier is switched in. Applies immediately, and is
+    /// remembered so the board comes up the way it was left.
+    #[serde(default)]
+    pub pa_on: bool,
+    /// The board's amplifier control is active-low: the pin is driven low to
+    /// switch the amplifier in.
+    #[serde(default)]
+    pub pa_active_low: bool,
 }
 
 impl Default for PlutoConfig {
@@ -5410,6 +5505,13 @@ impl Default for PlutoConfig {
             full_duplex: false,
             duplex: PlutoDuplex::default(),
             ptt_gpo: PlutoPtt::default(),
+            aux: PlutoAuxConfig::default(),
+            pa_gpo: PlutoPaPin::default(),
+            // Bypassed until the operator says otherwise: an amplifier that
+            // comes up switched in on a board somebody has only just plugged
+            // in is ten decibels nobody asked for.
+            pa_on: false,
+            pa_active_low: false,
         }
     }
 }
@@ -5431,6 +5533,22 @@ impl PlutoConfig {
     /// renders them as sliders — the Pluto settings panel drives them directly.
     pub const AGC_ELEMENT: &'static str = "AGC";
     pub const PPM_ELEMENT: &'static str = "PPM";
+    /// The amplifier switch: at or above 0.5 switches it in. See
+    /// [`PlutoPaPin`].
+    pub const PA_ELEMENT: &'static str = "PA";
+    /// The second chain and what it feeds — the same names a LimeSDR's use, so
+    /// the main window's diversity strip drives either without knowing which
+    /// board is behind it.
+    pub const AUX_GAIN_ELEMENT: &'static str = LimeConfig::AUX_GAIN_ELEMENT;
+    pub const DIV_MODE_ELEMENT: &'static str = DIV_MODE_ELEMENT;
+    pub const DIV_RATE_ELEMENT: &'static str = DIV_RATE_ELEMENT;
+    pub const DIV_TAPS_ELEMENT: &'static str = DIV_TAPS_ELEMENT;
+    pub const DIV_FREEZE_ELEMENT: &'static str = DIV_FREEZE_ELEMENT;
+    pub const DIV_RESET_ELEMENT: &'static str = DIV_RESET_ELEMENT;
+    pub const PS_BINS_ELEMENT: &'static str = LimeConfig::PS_BINS_ELEMENT;
+    pub const PS_RATE_ELEMENT: &'static str = LimeConfig::PS_RATE_ELEMENT;
+    pub const PS_FREEZE_ELEMENT: &'static str = LimeConfig::PS_FREEZE_ELEMENT;
+    pub const PS_RESET_ELEMENT: &'static str = LimeConfig::PS_RESET_ELEMENT;
 
     /// Sample rates offered in the UI.
     ///
