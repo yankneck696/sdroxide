@@ -1309,17 +1309,21 @@ impl SdroxideApp {
             // PTT is on the strip already; TUNE rides with the levels it is
             // set up with.
             self.tx_controls(ui, cmds, true);
-            if crate::chrome::chip_accent(
-                ui,
-                self.state.tx.tune,
-                RichText::new(" TUNE ").size(15.0),
-                crate::theme::YELLOW(),
-                crate::theme::INK_ON_CYAN(),
-            )
-            .clicked()
-            {
-                cmds.push(Command::SetTune(!self.state.tx.tune));
-            }
+            ui.horizontal(|ui| {
+                let tx = self.state.tx;
+                if crate::chrome::chip_accent(
+                    ui,
+                    tx.tune && !tx.two_tone,
+                    RichText::new(" TUNE ").size(15.0),
+                    crate::theme::YELLOW(),
+                    crate::theme::INK_ON_CYAN(),
+                )
+                .clicked()
+                {
+                    tune_clicked(tx, false, cmds);
+                }
+                self.tx_two_tone_chip(ui, cmds);
+            });
         });
     }
 
@@ -4226,7 +4230,7 @@ impl SdroxideApp {
         let tx = self.state.tx;
         if crate::chrome::chip_accent_sized(
             ui,
-            tx.tune,
+            tx.tune && !tx.two_tone,
             RichText::new(" TUNE ").size(15.0),
             crate::theme::YELLOW(),
             crate::theme::INK_ON_CYAN(),
@@ -4234,7 +4238,34 @@ impl SdroxideApp {
         )
         .clicked()
         {
-            cmds.push(Command::SetTune(!tx.tune));
+            tune_clicked(tx, false, cmds);
+        }
+        self.tx_two_tone_chip(ui, cmds);
+    }
+
+    /// The two-tone chip beside TUNE (issue #525): one click keys the
+    /// two-tone test signal at the tune level, another unkeys it — what other
+    /// SDR programs call their "Tone" button. Lit only while that is what is
+    /// on the air, so it and TUNE never both read as keyed.
+    fn tx_two_tone_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let tx = self.state.tx;
+        if crate::chrome::chip_accent(
+            ui,
+            tx.tune && tx.two_tone,
+            RichText::new(TWO_TONE_CHIP).size(15.0),
+            crate::theme::YELLOW(),
+            crate::theme::INK_ON_CYAN(),
+        )
+        .on_hover_text(
+            "Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, \
+             until clicked again. Its envelope swings from nothing to full, so it \
+             shows an amplifier's splatter plainly on a second receiver, and it is \
+             the signal PureSignal learns from fastest — a steady carrier only \
+             teaches it one point. Use a dummy load.",
+        )
+        .clicked()
+        {
+            tune_clicked(tx, true, cmds);
         }
     }
 
@@ -5717,6 +5748,22 @@ pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WID
 /// draw site.
 const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
 
+/// The two-tone chip's label, shared by its draw sites and the width sums.
+const TWO_TONE_CHIP: &str = " 2T ";
+
+/// What a click on TUNE (`two_tone` false) or on the two-tone chip (`true`)
+/// sends. Clicking the one that is lit unkeys; clicking the other keys with
+/// that waveform — switching over without unkeying if TUNE was already down,
+/// since the waveform is all that differs.
+fn tune_clicked(tx: sdroxide_types::TxState, two_tone: bool, cmds: &mut Vec<Command>) {
+    if tx.tune && tx.two_tone == two_tone {
+        cmds.push(Command::SetTune(false));
+    } else {
+        cmds.push(Command::SetTuneTwoTone(two_tone));
+        cmds.push(Command::SetTune(true));
+    }
+}
+
 /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
 /// labels, so the chips match and the level blocks beside them start on the
 /// same column.
@@ -5741,7 +5788,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
         |s: &str| crate::chrome::text_width(ui, s, egui::TextStyle::Body.resolve(ui.style()));
     let keyer_w = if keyer { crate::chrome::chip_width(ui, " ▶ ", Some(15.0)) + g } else { 0.0 };
     let row1 = key_w + g + keyer_w + label("Drive") + g + g + TX_SLIDER_VALUE_W;
-    let row2 = key_w + g + label("Tune") + g + g + TX_SLIDER_VALUE_W;
+    let two_tone_w = crate::chrome::chip_width(ui, TWO_TONE_CHIP, Some(15.0)) + g;
+    let row2 = key_w + g + two_tone_w + label("Tune") + g + g + TX_SLIDER_VALUE_W;
     (row1, row2)
 }
 
@@ -7673,6 +7721,13 @@ mod tests {
                             crate::theme::YELLOW(),
                             crate::theme::INK_ON_CYAN(),
                             size,
+                        );
+                        crate::chrome::chip_accent(
+                            ui,
+                            false,
+                            RichText::new(TWO_TONE_CHIP).size(15.0),
+                            crate::theme::YELLOW(),
+                            crate::theme::INK_ON_CYAN(),
                         );
                         ui.label("Tune");
                         crate::chrome::slider_readout(

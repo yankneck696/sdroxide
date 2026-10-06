@@ -1146,4 +1146,8 @@ pub enum Command {
     ResetModeDefaults {
         mode: Option<Mode>,
     },
+    /// Make TUNE send the two-tone test signal (`true`) or a steady carrier
+    /// (`false`) — see [`crate::TxState::two_tone`]. Does not key anything by
+    /// itself: [`Command::SetTune`] does that. Appended for the usual reason.
+    SetTuneTwoTone(bool),
 }

@@ -9107,7 +9107,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
   what comes out is straight. It needs **Full duplex** on and the **PTT pins**
   off, because the coupler is only heard while receive keeps running through
   the over; the correction shows on the PS meter and in the log while you
-  transmit, and stays at unity until the feedback lines up.
+  transmit, and stays at unity until the feedback lines up. The **2T** chip
+  beside **TUNE** is the easiest thing to learn from: it transmits the classic
+  two-tone test signal (700 Hz and 1900 Hz together) at the Tune level until
+  clicked again. A steady carrier has only one amplitude, so it teaches
+  PureSignal nothing, and a silent microphone teaches it less.
 
 **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
 so both aerials show about the same noise floor; for PureSignal, start at the
