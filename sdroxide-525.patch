@@ -1,7 +1,7 @@
-From 13938c4f29feee417e3e14d86c3c7a55b6208538 Mon Sep 17 00:00:00 2001
+From 49b3919a7f32a88650f05e18a0d4d10e92432eaa Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 1/5] Give the PlutoSDR configuration a second-chain role and
+Subject: [PATCH 1/6] Give the PlutoSDR configuration a second-chain role and
  an amplifier switch (#525)
 
 PlutoConfig gains aux (the block a LimeSDR's second chain already uses, as
@@ -218,10 +218,10 @@ index 401e12e7..6417fcc8 100644
 2.43.0
 
 
-From 83b3a8da0b4ef6b7fe4c8bbab405cd3d175dc3b1 Mon Sep 17 00:00:00 2001
+From 1d798bc00b03ec81fd4997b5083b4de658edd50a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 2/5] Keep a borrowed second Pluto chain in step with the
+Subject: [PATCH 2/6] Keep a borrowed second Pluto chain in step with the
  first, and switch an amplifier from a GPO pin (#525)
 
 The receive thread can now commit a 2R2T buffer to both chains' rings or to
@@ -1020,10 +1020,10 @@ index 774e38ab..e0eba48a 100644
 2.43.0
 
 
-From d7540ee0f1348aa0471f6dc20ca028a641d65e9d Mon Sep 17 00:00:00 2001
+From 6df63b8d77dbb1051202659fa034b2ebf5637baf Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 3/5] PlutoSDR: RX2 as diversity or PureSignal feedback for the
+Subject: [PATCH 3/6] PlutoSDR: RX2 as diversity or PureSignal feedback for the
  RX1 radio, and a PA bypass switch in the settings (#525)
 
 The RX1 radio can borrow RX2 as a second aerial, combined by the shared
@@ -1946,10 +1946,10 @@ index f668487b..c1ff9a59 100644
 2.43.0
 
 
-From c5fe42da421025db43e5de93a07a3ac8b2656afd Mon Sep 17 00:00:00 2001
+From d22e61022fcab8794b1286fd9ace224532fdc905 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 13:50:35 -0400
-Subject: [PATCH 4/5] PlutoSDR: switch the amplifier without reinitialising the
+Subject: [PATCH 4/6] PlutoSDR: switch the amplifier without reinitialising the
  AD9361 (#525)
 
 adi,gpo-manual-mode-enable is stored straight into the driver's gpo_ctrl,
@@ -2173,10 +2173,10 @@ index 4859508e..78b744d7 100644
 2.43.0
 
 
-From 13f29e46abe843d8ece1728772505800b0db12e4 Mon Sep 17 00:00:00 2001
+From 538c1410746250c5a6c3485e0112fbde90b6050d Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@gmail.com>
 Date: Tue, 6 Oct 2026 15:32:43 -0400
-Subject: [PATCH 5/5] PlutoSDR PureSignal: look back a second for the feedback,
+Subject: [PATCH 5/6] PlutoSDR PureSignal: look back a second for the feedback,
  and find the delay afresh each over (#525)
 
 On a PlutoSky R2 over Ethernet PureSignal never locked: the transmission
@@ -2381,6 +2381,453 @@ index c1ff9a59..433b0aba 100644
          match self.rx.as_ref() {
              Some(rx) => Ok(rx.tx_begin(center_hz)),
              None => Ok(0.0),
+-- 
+2.43.0
+
+
+From 2d97ffe5ca9f37010a27e07434e06a394b7f7246 Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@gmail.com>
+Date: Tue, 6 Oct 2026 17:14:24 -0400
+Subject: [PATCH 6/6] Two-tone test signal on TUNE, and keep up with fast
+ receivers through a full-duplex over (#525)
+
+A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
+level until clicked again, like the Tone button other SDR programs have:
+the signal amplifier linearity is judged with, and the one PureSignal learns
+from, since a steady carrier has a single amplitude. TxState gains two_tone
+and Command gains SetTuneTwoTone; wire protocol v175. Keying and level are
+TUNE's own, so every guard on TUNE applies.
+
+During a full-duplex over the engine read one 16384-sample block per 10 ms
+tick, a 1.64 Msps ceiling: a 2.083 Msps PlutoSDR dropped a fifth of its
+receive, which is also PureSignal's feedback. It now takes up to four blocks
+a tick when that many are already waiting, still never waiting for more.
+---
+ crates/sdroxide-proto/src/lib.rs      |   7 +-
+ crates/sdroxide-radio/src/engine.rs   | 146 ++++++++++++++++++++++++--
+ crates/sdroxide-types/src/command.rs  |   4 +
+ crates/sdroxide-types/src/state.rs    |  12 +++
+ crates/sdroxide-ui/src/app/top_bar.rs |  83 ++++++++++++---
+ docs/USER_MANUAL.md                   |   6 +-
+ 6 files changed, 233 insertions(+), 25 deletions(-)
+
+diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
+index 198d67a0..a07cd4b8 100644
+--- a/crates/sdroxide-proto/src/lib.rs
++++ b/crates/sdroxide-proto/src/lib.rs
+@@ -1525,7 +1525,12 @@ use sdroxide_types::{
+ /// radio configuration rides whole in both a command and an event, so a v173
+ /// peer reads the extra bytes as the start of the next field and fails to
+ /// decode either.
+-pub const PROTO_VERSION: u16 = 174;
++///
++/// v175: TUNE can send a two-tone test signal (issue #525). `TxState` gains
++/// `two_tone` on its tail and `Command` gains a trailing `SetTuneTwoTone`;
++/// `TxState` rides whole inside `RadioState`, so a v174 peer reads the extra
++/// byte as the start of the next field and fails to decode every state.
++pub const PROTO_VERSION: u16 = 175;
+ const VERSION_BYTE: u8 = 0x12;
+ 
+ #[derive(Debug, thiserror::Error)]
+diff --git a/crates/sdroxide-radio/src/engine.rs b/crates/sdroxide-radio/src/engine.rs
+index 916375bd..3d35ac95 100644
+--- a/crates/sdroxide-radio/src/engine.rs
++++ b/crates/sdroxide-radio/src/engine.rs
+@@ -1695,6 +1695,11 @@ const SILENT_MIC_PEAK: f32 = 0.001;
+ /// It is also the transmit latency: the over runs this far behind the client's
+ /// own waveform, and `Engine::end_tci_tx` plays the remainder out rather than
+ /// dropping it, so the tail of a timed burst is not cut off.
++/// How many receive blocks a full-duplex over may take per transmit tick,
++/// when that many are already waiting. Four blocks of 16384 every 10 ms is
++/// 6.5 Msps — past anything a networked radio streams through an over.
++const FULL_DUPLEX_READS_PER_TICK: usize = 4;
++
+ const TCI_TX_LEAD: usize = TX_AUDIO_BLOCK * 24;
+ /// Blocks (500 ms) of complete silence from a keyed TCI client before what it
+ /// was asked for is written off and asked for again.
+@@ -1807,6 +1812,48 @@ const TCI_IQ_DEFAULT_HZ: f64 = 192_000.0;
+ const TCI_TX_FIFO_CAP: usize = 24_000;
+ /// Sample rate of the TX baseband/audio fed to the TX-monitor analyzer.
+ const TX_MONITOR_RATE: f64 = 48_000.0;
++
++/// The classic two-tone test signal: 700 Hz and 1900 Hz, equal amplitude.
++///
++/// Neither tone is a harmonic of the other and both sit well inside a voice
++/// passband, so the third- and fifth-order products (at 1200 Hz spacing from
++/// each tone) land where a panadapter shows them plainly. Each tone is half
++/// scale, so the sum peaks at exactly the level it is multiplied by — the
++/// TUNE level — and its envelope swings to zero 1200 times a second, which is
++/// what visits every point of an amplifier's curve (issue #525).
++#[derive(Debug, Default, Clone, Copy)]
++struct TwoTone {
++    ph: [f32; 2],
++}
++
++impl TwoTone {
++    const HZ: [f32; 2] = [700.0, 1900.0];
++
++    fn step(&mut self) -> [f32; 2] {
++        let now = self.ph;
++        for (p, hz) in self.ph.iter_mut().zip(Self::HZ) {
++            *p += std::f32::consts::TAU * hz / TX_MONITOR_RATE as f32;
++            if *p > std::f32::consts::TAU {
++                *p -= std::f32::consts::TAU;
++            }
++        }
++        now
++    }
++
++    /// The next complex baseband sample, peak 1.0, in the upper sideband or —
++    /// `lower` — the lower one.
++    fn next_iq(&mut self, lower: bool) -> Complex32 {
++        let [a, b] = self.step();
++        let sign = if lower { -1.0 } else { 1.0 };
++        Complex32::from_polar(0.5, sign * a) + Complex32::from_polar(0.5, sign * b)
++    }
++
++    /// The next audio sample, peak 1.0, for a rig that modulates itself.
++    fn next_audio(&mut self) -> f32 {
++        let [a, b] = self.step();
++        0.5 * (a.cos() + b.cos())
++    }
++}
+ /// The TX monitor's baseband/IQ runs near digital full scale (~0 dBFS), far
+ /// hotter than any received signal, so on the shared floor/ceil it would clamp
+ /// the waterfall to maximum. Dim it so the strongest TX lands this many dB below
+@@ -2483,6 +2530,9 @@ struct Engine {
+     /// Phase accumulator for the TUNE tone on audio-modulated rigs (CAT/TCI),
+     /// which need an audio carrier to key up.
+     tune_phase: f32,
++    /// The two-tone test signal's two phase accumulators — see
++    /// [`TwoTone`] and `TxState::two_tone`.
++    two_tone: TwoTone,
+     /// The CTCSS tone or DCS stream going out under the voice, built from
+     /// [`RadioState::repeater`] and rebuilt whenever that changes. `None` with
+     /// the tone off, which is also what every non-FM mode gets: sub-audible
+@@ -4043,6 +4093,7 @@ fn engine_thread(
+         tx_analyzer: SpectrumAnalyzer::new(cfg.fft_size as usize, TX_MONITOR_RATE, cfg.avg_tc),
+         tx_mon_buf: Vec::new(),
+         tune_phase: 0.0,
++        two_tone: TwoTone::default(),
+         sub_tone: None,
+         burst: None,
+         burst_unkeys: false,
+@@ -4549,13 +4600,26 @@ fn engine_thread(
+             // spends that budget: the transmit ring empties, and hardware that
+             // answers an underrun by skipping ahead (SoapySX does) puts the
+             // over on the air as chirps. See `IqSource::read_available`.
++            //
++            // More than one block when more than one is waiting. One block a
++            // tick is 16384 samples every 10 ms — 1.64 Msps — so a radio
++            // streaming faster than that through an over fell further behind
++            // with every tick and dropped the rest at its own ring: a fifth of
++            // a 2.083 Msps PlutoSDR's receive, which is also the PureSignal
++            // feedback that has to arrive unbroken (issue #525). Still only
++            // what has already arrived, and bounded, so the transmitter's
++            // budget is never spent waiting.
+             if engine.caps.full_duplex && !engine.audio_mode {
+-                if let Ok(n @ 1..) = engine.source.read_available(&mut buf) {
++                for _ in 0..FULL_DUPLEX_READS_PER_TICK {
++                    let Ok(n @ 1..) = engine.source.read_available(&mut buf) else { break };
+                     engine.samples_read += n as u64;
+                     engine.last_block = n as u64;
+                     engine.adc.observe(&buf[..n]);
+                     let iq = decimate(engine.decim.as_mut(), &buf[..n], &mut dbuf);
+                     engine.run_audio(iq);
++                    if n < buf.len() {
++                        break; // drained
++                    }
+                 }
+             }
+         } else {
+@@ -8298,6 +8362,14 @@ impl Engine {
+                     self.source.set_tx_drive(self.tx_power_level() as f64);
+                 }
+             }
++            SetTuneTwoTone(on) => {
++                // Only the waveform: TUNE keys and levels it as it always has,
++                // so the drive guards, the T/R switch and the time limit all
++                // apply unchanged.
++                self.state.tx.two_tone = on;
++                self.two_tone = TwoTone::default();
++                self.emit_state();
++            }
+             SetSwrGuard { enabled, limit } => {
+                 // Clamped, not trusted. Below about 1.1:1 no real antenna ever
+                 // sits, so a low value would refuse every transmission and look
+@@ -16573,9 +16645,17 @@ impl Engine {
+         tx.mod_buf.clear();
+         let mut burst_done = false;
+         if self.state.tx.tune || tx.modulator.is_none() {
+-            // Steady carrier at the tune level (also CW until the keyer exists).
++            // Steady carrier at the tune level (also CW until the keyer exists)
++            // — or, with two-tone on, the test signal at the same peak level.
+             let level = tune_level;
+-            tx.mod_buf.resize(TX_AUDIO_BLOCK, Complex32::new(level, 0.0));
++            if self.state.tx.tune && self.state.tx.two_tone {
++                let lower = self.state.rx[0].mode.is_lower_sideband();
++                for _ in 0..TX_AUDIO_BLOCK {
++                    tx.mod_buf.push(self.two_tone.next_iq(lower) * level);
++                }
++            } else {
++                tx.mod_buf.resize(TX_AUDIO_BLOCK, Complex32::new(level, 0.0));
++            }
+             self.mic_fifo.clear();
+             // The recording tap has no other source of TX audio during tune —
+             // without this the tap goes quiet for the tune's duration and
+@@ -16830,12 +16910,20 @@ impl Engine {
+             } else {
+                 self.state.tx.tune_drive.clamp(0.05, 1.0)
+             };
+-            let inc = std::f32::consts::TAU * 1000.0 / TX_MONITOR_RATE as f32;
+-            for a in &mut audio {
+-                *a = self.tune_phase.cos() * amp;
+-                self.tune_phase += inc;
+-                if self.tune_phase > std::f32::consts::TAU {
+-                    self.tune_phase -= std::f32::consts::TAU;
++            if self.state.tx.two_tone {
++                // The rig's own SSB modulator puts the audio in the sideband,
++                // so the real sum of the two tones is all it needs.
++                for a in &mut audio {
++                    *a = self.two_tone.next_audio() * amp;
++                }
++            } else {
++                let inc = std::f32::consts::TAU * 1000.0 / TX_MONITOR_RATE as f32;
++                for a in &mut audio {
++                    *a = self.tune_phase.cos() * amp;
++                    self.tune_phase += inc;
++                    if self.tune_phase > std::f32::consts::TAU {
++                        self.tune_phase -= std::f32::consts::TAU;
++                    }
+                 }
+             }
+         } else if self.burst.is_some() && self.state.rx[0].mode == Mode::Nfm {
+@@ -19543,3 +19631,43 @@ mod cw_monitor_tests {
+         assert_eq!(*ready.back().unwrap(), (400 * 480 - 1) as f32, "the newest is kept");
+     }
+ }
++
++#[cfg(test)]
++mod two_tone_tests {
++    use super::*;
++
++    /// Peaks at the level it is scaled by and no higher, so TUNE's level is
++    /// still the most the transmitter is asked for; and the envelope really
++    /// does swing to (near) zero, which is the point of the signal.
++    #[test]
++    fn the_two_tone_signal_peaks_at_full_scale_and_beats_to_zero() {
++        let mut t = TwoTone::default();
++        let (mut peak, mut floor) = (0.0f32, f32::MAX);
++        for _ in 0..48_000 {
++            let m = t.next_iq(false).norm();
++            peak = peak.max(m);
++            floor = floor.min(m);
++        }
++        assert!(peak <= 1.0 + 1e-4 && peak > 0.99, "peak {peak}");
++        assert!(floor < 0.02, "the envelope never beat down: floor {floor}");
++    }
++
++    /// The tones land in the sideband asked for: positive frequencies for
++    /// upper, negative for lower — measured as the phase advance per sample.
++    #[test]
++    fn the_two_tone_signal_follows_the_sideband() {
++        let rotation = |lower: bool| {
++            let mut t = TwoTone::default();
++            let mut prev = t.next_iq(lower);
++            let mut turn = 0.0f32;
++            for _ in 0..4800 {
++                let z = t.next_iq(lower);
++                turn += (z * prev.conj()).arg();
++                prev = z;
++            }
++            turn
++        };
++        assert!(rotation(false) > 0.0, "upper sideband should turn positive");
++        assert!(rotation(true) < 0.0, "lower sideband should turn negative");
++    }
++}
+diff --git a/crates/sdroxide-types/src/command.rs b/crates/sdroxide-types/src/command.rs
+index 5ee6ec2c..198a8e76 100644
+--- a/crates/sdroxide-types/src/command.rs
++++ b/crates/sdroxide-types/src/command.rs
+@@ -1146,4 +1146,8 @@ pub enum Command {
+     ResetModeDefaults {
+         mode: Option<Mode>,
+     },
++    /// Make TUNE send the two-tone test signal (`true`) or a steady carrier
++    /// (`false`) — see [`crate::TxState::two_tone`]. Does not key anything by
++    /// itself: [`Command::SetTune`] does that. Appended for the usual reason.
++    SetTuneTwoTone(bool),
+ }
+diff --git a/crates/sdroxide-types/src/state.rs b/crates/sdroxide-types/src/state.rs
+index 93d161a1..6a39fd4d 100644
+--- a/crates/sdroxide-types/src/state.rs
++++ b/crates/sdroxide-types/src/state.rs
+@@ -182,6 +182,18 @@ pub struct TxState {
+     /// sends a wild figure gets a sane one back.
+     #[serde(default)]
+     pub cessb_db: f32,
++    /// TUNE sends the classic two-tone test signal — 700 Hz and 1900 Hz of
++    /// equal amplitude in the sideband the dial is on — instead of a steady
++    /// carrier (issue #525).
++    ///
++    /// The signal amplifier linearity is judged with: its envelope swings from
++    /// zero to full every beat, so every point on the amplifier's curve is
++    /// visited, and the intermodulation products land at known spacings either
++    /// side. It is also what PureSignal needs to learn from — a steady carrier
++    /// has one amplitude and so teaches it one point. Keyed and levelled
++    /// exactly as TUNE is; this only chooses the waveform.
++    #[serde(default)]
++    pub two_tone: bool,
+ }
+ 
+ /// The most controlled-envelope compression the control offers, in decibels.
+diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
+index 7545f52a..1ab11ba2 100644
+--- a/crates/sdroxide-ui/src/app/top_bar.rs
++++ b/crates/sdroxide-ui/src/app/top_bar.rs
+@@ -1309,17 +1309,21 @@ impl SdroxideApp {
+             // PTT is on the strip already; TUNE rides with the levels it is
+             // set up with.
+             self.tx_controls(ui, cmds, true);
+-            if crate::chrome::chip_accent(
+-                ui,
+-                self.state.tx.tune,
+-                RichText::new(" TUNE ").size(15.0),
+-                crate::theme::YELLOW(),
+-                crate::theme::INK_ON_CYAN(),
+-            )
+-            .clicked()
+-            {
+-                cmds.push(Command::SetTune(!self.state.tx.tune));
+-            }
++            ui.horizontal(|ui| {
++                let tx = self.state.tx;
++                if crate::chrome::chip_accent(
++                    ui,
++                    tx.tune && !tx.two_tone,
++                    RichText::new(" TUNE ").size(15.0),
++                    crate::theme::YELLOW(),
++                    crate::theme::INK_ON_CYAN(),
++                )
++                .clicked()
++                {
++                    tune_clicked(tx, false, cmds);
++                }
++                self.tx_two_tone_chip(ui, cmds);
++            });
+         });
+     }
+ 
+@@ -4226,7 +4230,7 @@ impl SdroxideApp {
+         let tx = self.state.tx;
+         if crate::chrome::chip_accent_sized(
+             ui,
+-            tx.tune,
++            tx.tune && !tx.two_tone,
+             RichText::new(" TUNE ").size(15.0),
+             crate::theme::YELLOW(),
+             crate::theme::INK_ON_CYAN(),
+@@ -4234,7 +4238,34 @@ impl SdroxideApp {
+         )
+         .clicked()
+         {
+-            cmds.push(Command::SetTune(!tx.tune));
++            tune_clicked(tx, false, cmds);
++        }
++        self.tx_two_tone_chip(ui, cmds);
++    }
++
++    /// The two-tone chip beside TUNE (issue #525): one click keys the
++    /// two-tone test signal at the tune level, another unkeys it — what other
++    /// SDR programs call their "Tone" button. Lit only while that is what is
++    /// on the air, so it and TUNE never both read as keyed.
++    fn tx_two_tone_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
++        let tx = self.state.tx;
++        if crate::chrome::chip_accent(
++            ui,
++            tx.tune && tx.two_tone,
++            RichText::new(TWO_TONE_CHIP).size(15.0),
++            crate::theme::YELLOW(),
++            crate::theme::INK_ON_CYAN(),
++        )
++        .on_hover_text(
++            "Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, \
++             until clicked again. Its envelope swings from nothing to full, so it \
++             shows an amplifier's splatter plainly on a second receiver, and it is \
++             the signal PureSignal learns from fastest — a steady carrier only \
++             teaches it one point. Use a dummy load.",
++        )
++        .clicked()
++        {
++            tune_clicked(tx, true, cmds);
+         }
+     }
+ 
+@@ -5717,6 +5748,22 @@ pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WID
+ /// draw site.
+ const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
+ 
++/// The two-tone chip's label, shared by its draw sites and the width sums.
++const TWO_TONE_CHIP: &str = " 2T ";
++
++/// What a click on TUNE (`two_tone` false) or on the two-tone chip (`true`)
++/// sends. Clicking the one that is lit unkeys; clicking the other keys with
++/// that waveform — switching over without unkeying if TUNE was already down,
++/// since the waveform is all that differs.
++fn tune_clicked(tx: sdroxide_types::TxState, two_tone: bool, cmds: &mut Vec<Command>) {
++    if tx.tune && tx.two_tone == two_tone {
++        cmds.push(Command::SetTune(false));
++    } else {
++        cmds.push(Command::SetTuneTwoTone(two_tone));
++        cmds.push(Command::SetTune(true));
++    }
++}
++
+ /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
+ /// labels, so the chips match and the level blocks beside them start on the
+ /// same column.
+@@ -5741,7 +5788,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
+         |s: &str| crate::chrome::text_width(ui, s, egui::TextStyle::Body.resolve(ui.style()));
+     let keyer_w = if keyer { crate::chrome::chip_width(ui, " ▶ ", Some(15.0)) + g } else { 0.0 };
+     let row1 = key_w + g + keyer_w + label("Drive") + g + g + TX_SLIDER_VALUE_W;
+-    let row2 = key_w + g + label("Tune") + g + g + TX_SLIDER_VALUE_W;
++    let two_tone_w = crate::chrome::chip_width(ui, TWO_TONE_CHIP, Some(15.0)) + g;
++    let row2 = key_w + g + two_tone_w + label("Tune") + g + g + TX_SLIDER_VALUE_W;
+     (row1, row2)
+ }
+ 
+@@ -7674,6 +7722,13 @@ mod tests {
+                             crate::theme::INK_ON_CYAN(),
+                             size,
+                         );
++                        crate::chrome::chip_accent(
++                            ui,
++                            false,
++                            RichText::new(TWO_TONE_CHIP).size(15.0),
++                            crate::theme::YELLOW(),
++                            crate::theme::INK_ON_CYAN(),
++                        );
+                         ui.label("Tune");
+                         crate::chrome::slider_readout(
+                             ui,
+diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
+index 78b744d7..7f6b9529 100644
+--- a/docs/USER_MANUAL.md
++++ b/docs/USER_MANUAL.md
+@@ -9107,7 +9107,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
+   what comes out is straight. It needs **Full duplex** on and the **PTT pins**
+   off, because the coupler is only heard while receive keeps running through
+   the over; the correction shows on the PS meter and in the log while you
+-  transmit, and stays at unity until the feedback lines up.
++  transmit, and stays at unity until the feedback lines up. The **2T** chip
++  beside **TUNE** is the easiest thing to learn from: it transmits the classic
++  two-tone test signal (700 Hz and 1900 Hz together) at the Tune level until
++  clicked again. A steady carrier has only one amplitude, so it teaches
++  PureSignal nothing, and a silent microphone teaches it less.
+ 
+ **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
+ so both aerials show about the same noise floor; for PureSignal, start at the
 -- 
 2.43.0
 
