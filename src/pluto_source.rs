@@ -77,6 +77,17 @@ const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(10);
 /// state, reaches the log — the same cadence the LimeSDR backend keeps.
 const AUX_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
+/// How far back PureSignal may look for the transmission in RX2's samples.
+///
+/// The LimeSDR's tenth of a second is far too short here, and that is what a
+/// first test on a PlutoSky R2 showed as `PS --` on every over: between the
+/// predistorter and the coupler's samples coming back lie the host's transmit
+/// ring, the board's DMA buffers in both directions, the network twice, and
+/// the receive ring — easily a few hundred milliseconds. One second covers it
+/// with room to spare; the search is throttled so the longer history costs
+/// nothing while unlocked.
+const PS_HISTORY_S: f64 = 1.0;
+
 /// The second receive chain, borrowed by the RX1 radio (issue #525).
 struct Aux {
     rx: PlutoRx,
@@ -237,7 +248,12 @@ impl PlutoSource {
             Diversity::new(div_mode(cfg.aux.mode), usize::from(cfg.aux.taps), cfg.aux.rate)
         });
         let puresignal = (role == LimeAuxRole::PureSignal).then(|| {
-            let mut ps = PureSignal::new(usize::from(cfg.aux.ps_bins), cfg.aux.ps_rate, rate);
+            let mut ps = PureSignal::with_history(
+                usize::from(cfg.aux.ps_bins),
+                cfg.aux.ps_rate,
+                rate,
+                PS_HISTORY_S,
+            );
             ps.set_frozen(cfg.aux.ps_frozen);
             ps
         });
@@ -501,7 +517,12 @@ impl PlutoSource {
                 aux.cfg.ps_bins = bins;
                 if aux.puresignal.is_some() {
                     // A new table means learning it again.
-                    let mut ps = PureSignal::new(usize::from(bins), aux.cfg.ps_rate, self.rate);
+                    let mut ps = PureSignal::with_history(
+                        usize::from(bins),
+                        aux.cfg.ps_rate,
+                        self.rate,
+                        PS_HISTORY_S,
+                    );
                     ps.set_frozen(aux.cfg.ps_frozen);
                     aux.puresignal = Some(ps);
                 }
@@ -652,6 +673,13 @@ impl IqSource for PlutoSource {
     fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {
         self.tx_hz = center_hz;
         self.transmitting = true;
+        // A new over: the table (the amplifier's curve) carries over, but the
+        // two sample counts the alignment is measured between restart here,
+        // so the delay is found afresh rather than inherited from an over
+        // whose tail never reached the coupler.
+        if let Some(ps) = self.aux.as_mut().and_then(|a| a.puresignal.as_mut()) {
+            ps.unlock();
+        }
         match self.rx.as_ref() {
             Some(rx) => Ok(rx.tx_begin(center_hz)),
             None => Ok(0.0),
