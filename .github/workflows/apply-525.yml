@@ -1,0 +1,36 @@
+name: Apply PlutoSDR patch 525 and build MSI
+
+# Helper for testing issue #525. When sdroxide-525.patch is uploaded to main,
+# this puts the patch on its own branch (without these helper files) and
+# starts the existing "Windows MSI" workflow on that branch.
+on:
+  push:
+    branches: [main]
+    paths: ['sdroxide-525.patch']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply the patch on a clean branch
+        run: |
+          git config user.name "yankneck696"
+          git config user.email "yankneck696@users.noreply.github.com"
+          cp sdroxide-525.patch "$RUNNER_TEMP/p.patch"
+          # Start from just before this helper workflow was added.
+          WF=$(git log --format=%H --diff-filter=A -1 -- .github/workflows/apply-525.yml)
+          git checkout -B pluto-puresignal-diversity-pa "$WF^"
+          git am "$RUNNER_TEMP/p.patch"
+          git push -f origin pluto-puresignal-diversity-pa
+      - name: Start the Windows MSI build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run windows-msi.yml --ref pluto-puresignal-diversity-pa
