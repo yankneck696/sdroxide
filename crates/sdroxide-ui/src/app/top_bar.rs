@@ -848,7 +848,7 @@ impl SdroxideApp {
                 _ => false,
             }),
             MenuChip::Sub => true,
-            MenuChip::Tx => self.state.tx.tune,
+            MenuChip::Tx => self.state.tx.tune || self.show_tx_window,
             // Nothing here reads back: the socket is a name rather than an
             // on/off, and a radio that is switched off answers nothing at all.
             MenuChip::Rig | MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
@@ -1048,8 +1048,9 @@ impl SdroxideApp {
                 let cell2 = egui::vec2(plan.cell2_w, chip_h);
                 ui.horizontal(|ui| {
                     if tx_capable {
-                        let btn = crate::chrome::chip_sized(ui, self.state.tx.tune, "TX", cell2);
-                        self.tx_menu(ui, btn, cmds);
+                        let lit = self.state.tx.tune || self.show_tx_window;
+                        let btn = crate::chrome::chip_sized(ui, lit, "TX", cell2);
+                        self.tx_menu(btn);
                     }
                     let btn = crate::chrome::chip_sized(ui, false, "DISP", cell2);
                     self.disp_menu(ui, btn, cmds);
@@ -1215,7 +1216,7 @@ impl SdroxideApp {
                 MenuChip::Div => self.div_menu(ui, btn, cmds),
                 MenuChip::Sub => self.sub_menu(ui, btn, cmds),
                 MenuChip::Rig => self.rig_menu(ui, btn, cmds),
-                MenuChip::Tx => self.tx_menu(ui, btn, cmds),
+                MenuChip::Tx => self.tx_menu(btn),
                 MenuChip::Disp => self.disp_menu(ui, btn, cmds),
                 MenuChip::Sys => self.sys_menu(ui, btn, cmds),
             }
@@ -1301,30 +1302,61 @@ impl SdroxideApp {
         });
     }
 
-    /// The TX menu: tune, the voice keyer, and the drive and mic levels.
-    fn tx_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
-        let btn = btn.on_hover_text("Tune, the voice keyer, and the drive and mic levels");
-        crate::chrome::menu_popup(ui, &btn, |ui| {
-            crate::chrome::menu_caption(ui, "Transmit");
-            // PTT is on the strip already; TUNE rides with the levels it is
-            // set up with.
-            self.tx_controls(ui, cmds, true);
-            ui.horizontal(|ui| {
-                let tx = self.state.tx;
-                if crate::chrome::chip_accent(
-                    ui,
-                    tx.tune && !tx.two_tone,
-                    RichText::new(" TUNE ").size(15.0),
-                    crate::theme::YELLOW(),
-                    crate::theme::INK_ON_CYAN(),
-                )
-                .clicked()
-                {
-                    tune_clicked(tx, false, cmds);
-                }
-                self.tx_two_tone_chip(ui, cmds);
+    /// The TX chip: opens and closes the TRANSMIT window — tune, the voice
+    /// keyer, and the drive and mic levels.
+    ///
+    /// A window rather than the drop-down the other menu chips open, because
+    /// the drop-down hangs from the chip straight over the S-meter, and the
+    /// S-meter is exactly what an operator is watching while they set drive
+    /// and tune (issue #525). A window can be dragged clear of it, and stays
+    /// open through an over instead of closing at the first click elsewhere.
+    fn tx_menu(&mut self, btn: egui::Response) {
+        let btn = btn.on_hover_text(
+            "Tune, the voice keyer, and the drive and mic levels — in a window you can \
+             drag anywhere, so it need not cover the S-meter",
+        );
+        if btn.clicked() {
+            self.show_tx_window = !self.show_tx_window;
+        }
+    }
+
+    /// The TRANSMIT window the TX chip opens. See [`Self::tx_menu`].
+    pub(in crate::app) fn tx_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
+        if !self.show_tx_window {
+            return;
+        }
+        let mut open = self.show_tx_window;
+        let resp = egui::Window::new("TRANSMIT")
+            .id(crate::layout::salted_id(ctx, "TRANSMIT"))
+            .open(&mut open)
+            .frame(crate::chrome::window_frame())
+            .resizable(false)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                crate::chrome::window_body_bg(ui);
+                // PTT is on the strip already; TUNE rides with the levels it
+                // is set up with.
+                self.tx_controls(ui, cmds, true);
+                ui.horizontal(|ui| {
+                    let tx = self.state.tx;
+                    if crate::chrome::chip_accent(
+                        ui,
+                        tx.tune && !tx.two_tone,
+                        RichText::new(" TUNE ").size(15.0),
+                        crate::theme::YELLOW(),
+                        crate::theme::INK_ON_CYAN(),
+                    )
+                    .clicked()
+                    {
+                        tune_clicked(tx, false, cmds);
+                    }
+                    self.tx_two_tone_chip(ui, cmds);
+                });
             });
-        });
+        if let Some(r) = &resp {
+            crate::chrome::paint_window_border(ctx, &r.response);
+        }
+        self.show_tx_window = open;
     }
 
     /// The DISP menu: waterfall, spectrum and skimmer controls.

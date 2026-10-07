@@ -36,8 +36,8 @@
 //!
 //! # The amplifier switch
 //!
-//! A board whose amplifier is switched in and out from a GPO pin (the
-//! PlutoSky R2 "with PA") gets that switch as a pseudo-gain element,
+//! A board whose amplifier is switched in and out from a GPO pin gets that
+//! switch as a pseudo-gain element,
 //! [`PlutoConfig::PA_ELEMENT`], set up on the connection by
 //! `Phy::setup_pa_switch`.
 

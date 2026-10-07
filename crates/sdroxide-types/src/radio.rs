@@ -5312,9 +5312,11 @@ impl PlutoPtt {
 /// Which GPO pin, if any, holds an amplifier on or bypassed — a static switch
 /// the operator flips, not a PTT line (issue #525).
 ///
-/// Boards built around a Pluto with an amplifier on them — the PlutoSky R2 "with
-/// PA" is the one this was asked for — can bring the amplifier's enable or
-/// bypass control out to one of the AD9361's GPO pins. Unlike [`PlutoPtt`] the
+/// A board built around a Pluto, or an external amplifier wired to one, can
+/// bring the amplifier's enable or bypass control out to one of the AD9361's
+/// GPO pins. (Not the PlutoSky R2 this was first asked for: tested on one, its
+/// PA turned out to be bypassed by re-soldering a capacitor, which its maker's
+/// own page says, and no pin controls it.) Unlike [`PlutoPtt`] the
 /// pin does not follow the enable-state machine: it is put in the part's
 /// *manual* GPO mode and set from here, high or low, and stays there across
 /// overs. That is also why it works in FDD, and so beside full duplex and

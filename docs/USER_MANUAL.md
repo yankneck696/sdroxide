@@ -9054,9 +9054,11 @@ configured in exactly the same way as one on your desk.
   no host software in the loop. **Off**, **GPO0 = RX, GPO1 = TX**, or **GPO2 =
   RX, GPO3 = TX**. Picking a pair puts the radio in TDD whatever *Duplex* says.
   See *Keying an external amplifier*, below. Takes effect on Apply.
-- **Amplifier pin**, **Amplifier** — for a board whose amplifier can be
-  switched in or bypassed from one of the AD9361's GPO pins, such as the
-  PlutoSky R2 "with PA" (issue #525). Choose the pin the board wires to the
+- **Amplifier pin**, **Amplifier** — for a board, or an external amplifier,
+  whose PA can be switched in or bypassed from one of the AD9361's GPO pins
+  (issue #525). **Not the PlutoSky R2:** its own PA is bypassed by moving a
+  capacitor on the board, as OpenSourceSDRLab's product page describes, and
+  no software can switch it. Choose the pin the board wires to the
   amplifier's enable, then use **Switched in (PA on)** to put the amplifier in
   the transmit path or bypass it — that checkbox applies at once and is
   remembered for the next start. Tick **Active low** if the board switches the
@@ -13967,7 +13969,7 @@ row of menu buttons:
 | **RX** | Volume, front-end gain, AGC, squelch, the filter width and edges, NB, ANC, NR, BIN |
 | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
 | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
-| **TX** | TUNE, the voice keyer, and the drive, tune and mic levels |
+| **TX** | TUNE, 2T (two-tone), the voice keyer, and the drive, tune and mic levels — in a **TRANSMIT** window you can drag clear of the S-meter, which stays open through an over until you close it or tap **TX** again |
 | **DISP** | ☀ 3D, WIDE, FIT, CTR, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
 | **SYS** | LOG, SPOTS, AWARDS, BANDS, SAT, ISM, PUBLIC SDR, MAIL, MEM, SCAN, SETTINGS, HELP |
 

@@ -3440,10 +3440,11 @@ pub(in crate::app) fn settings_pluto_tab(
         // of how the connection is set up, so they wait for Apply; the switch
         // itself is one register write and goes at once.
         ui.label("Amplifier pin").on_hover_text(
-            "For a board whose amplifier can be switched in or bypassed from one of \
-             the AD9361's GPO pins — the PlutoSky R2 \"with PA\" is one. Pick the pin \
-             the board wires to the amplifier's enable (the schematic says which; failing \
-             that, try each with a dummy load on the output).\n\nThis puts the GPO pins \
+            "For a board, or an external amplifier, whose PA is switched in or bypassed \
+             from one of the AD9361's GPO pins. Pick the pin it is wired to (the \
+             schematic says which; failing that, try each with a dummy load on the \
+             output).\n\nNot the PlutoSky R2: its own PA is bypassed by moving a \
+             capacitor on the board, not from software, so nothing here can switch it.\n\nThis puts the GPO pins \
              in manual mode, so it cannot be used together with the PTT pins above — \
              but unlike them it works in FDD, alongside Full duplex and PureSignal.\n\n\
              Takes effect on Apply.",
