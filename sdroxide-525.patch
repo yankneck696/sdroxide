@@ -1,7 +1,7 @@
 From 49b3919a7f32a88650f05e18a0d4d10e92432eaa Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 1/6] Give the PlutoSDR configuration a second-chain role and
+Subject: [PATCH 1/7] Give the PlutoSDR configuration a second-chain role and
  an amplifier switch (#525)
 
 PlutoConfig gains aux (the block a LimeSDR's second chain already uses, as
@@ -221,7 +221,7 @@ index 401e12e7..6417fcc8 100644
 From 1d798bc00b03ec81fd4997b5083b4de658edd50a Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 2/6] Keep a borrowed second Pluto chain in step with the
+Subject: [PATCH 2/7] Keep a borrowed second Pluto chain in step with the
  first, and switch an amplifier from a GPO pin (#525)
 
 The receive thread can now commit a 2R2T buffer to both chains' rings or to
@@ -1023,7 +1023,7 @@ index 774e38ab..e0eba48a 100644
 From 6df63b8d77dbb1051202659fa034b2ebf5637baf Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 3/6] PlutoSDR: RX2 as diversity or PureSignal feedback for the
+Subject: [PATCH 3/7] PlutoSDR: RX2 as diversity or PureSignal feedback for the
  RX1 radio, and a PA bypass switch in the settings (#525)
 
 The RX1 radio can borrow RX2 as a second aerial, combined by the shared
@@ -1949,7 +1949,7 @@ index f668487b..c1ff9a59 100644
 From d22e61022fcab8794b1286fd9ace224532fdc905 Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 23 Sep 2026 13:50:35 -0400
-Subject: [PATCH 4/6] PlutoSDR: switch the amplifier without reinitialising the
+Subject: [PATCH 4/7] PlutoSDR: switch the amplifier without reinitialising the
  AD9361 (#525)
 
 adi,gpo-manual-mode-enable is stored straight into the driver's gpo_ctrl,
@@ -2176,7 +2176,7 @@ index 4859508e..78b744d7 100644
 From 538c1410746250c5a6c3485e0112fbde90b6050d Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@gmail.com>
 Date: Tue, 6 Oct 2026 15:32:43 -0400
-Subject: [PATCH 5/6] PlutoSDR PureSignal: look back a second for the feedback,
+Subject: [PATCH 5/7] PlutoSDR PureSignal: look back a second for the feedback,
  and find the delay afresh each over (#525)
 
 On a PlutoSky R2 over Ethernet PureSignal never locked: the transmission
@@ -2388,7 +2388,7 @@ index c1ff9a59..433b0aba 100644
 From 2d97ffe5ca9f37010a27e07434e06a394b7f7246 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@gmail.com>
 Date: Tue, 6 Oct 2026 17:14:24 -0400
-Subject: [PATCH 6/6] Two-tone test signal on TUNE, and keep up with fast
+Subject: [PATCH 6/7] Two-tone test signal on TUNE, and keep up with fast
  receivers through a full-duplex over (#525)
 
 A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
@@ -2828,6 +2828,273 @@ index 78b744d7..7f6b9529 100644
  
  **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
  so both aerials show about the same noise floor; for PureSignal, start at the
+-- 
+2.43.0
+
+
+From 171f0e8064e99f534bc8b4116ac3bfde0c400eb8 Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@gmail.com>
+Date: Wed, 7 Oct 2026 06:36:23 -0400
+Subject: [PATCH 7/7] The TX chip opens a movable TRANSMIT window; the PlutoSky
+ R2's PA is not GPO-switched (#525)
+
+On the compact strip the TX chip's drop-down hung over the S-meter, which is
+what an operator watches while setting drive and tune. It now opens a
+TRANSMIT window instead: the same controls, draggable clear of the meter,
+and open through an over until closed.
+
+Tested on a PlutoSky R2 "with PA", no GPO pin switched its amplifier: its
+maker documents the bypass as a capacitor moved on the board, and the Tezuka
+device tree for the board drives no PA line. The amplifier-pin setting
+stays, for boards and external amplifiers that are wired to a GPO, but no
+longer names the PlutoSky R2 as one.
+---
+ crates/sdroxide-types/src/radio.rs           |  8 +-
+ crates/sdroxide-ui/src/app/frame.rs          |  1 +
+ crates/sdroxide-ui/src/app/mod.rs            |  6 ++
+ crates/sdroxide-ui/src/app/settings/radio.rs |  9 +-
+ crates/sdroxide-ui/src/app/top_bar.rs        | 86 ++++++++++++++------
+ docs/USER_MANUAL.md                          | 10 ++-
+ src/pluto_source.rs                          |  4 +-
+ 7 files changed, 84 insertions(+), 40 deletions(-)
+
+diff --git a/crates/sdroxide-types/src/radio.rs b/crates/sdroxide-types/src/radio.rs
+index 6417fcc8..d29c645e 100644
+--- a/crates/sdroxide-types/src/radio.rs
++++ b/crates/sdroxide-types/src/radio.rs
+@@ -5312,9 +5312,11 @@ impl PlutoPtt {
+ /// Which GPO pin, if any, holds an amplifier on or bypassed — a static switch
+ /// the operator flips, not a PTT line (issue #525).
+ ///
+-/// Boards built around a Pluto with an amplifier on them — the PlutoSky R2 "with
+-/// PA" is the one this was asked for — can bring the amplifier's enable or
+-/// bypass control out to one of the AD9361's GPO pins. Unlike [`PlutoPtt`] the
++/// A board built around a Pluto, or an external amplifier wired to one, can
++/// bring the amplifier's enable or bypass control out to one of the AD9361's
++/// GPO pins. (Not the PlutoSky R2 this was first asked for: tested on one, its
++/// PA turned out to be bypassed by re-soldering a capacitor, which its maker's
++/// own page says, and no pin controls it.) Unlike [`PlutoPtt`] the
+ /// pin does not follow the enable-state machine: it is put in the part's
+ /// *manual* GPO mode and set from here, high or low, and stays there across
+ /// overs. That is also why it works in FDD, and so beside full duplex and
+diff --git a/crates/sdroxide-ui/src/app/frame.rs b/crates/sdroxide-ui/src/app/frame.rs
+index f0253f56..3000710a 100644
+--- a/crates/sdroxide-ui/src/app/frame.rs
++++ b/crates/sdroxide-ui/src/app/frame.rs
+@@ -939,6 +939,7 @@ impl eframe::App for SdroxideApp {
+         self.drm_window(&ctx, &mut cmds);
+         self.hd_window(&ctx, &mut cmds);
+         self.voice_window(&ctx, &mut cmds);
++        self.tx_window(&ctx, &mut cmds);
+         self.settings_window(&ctx, &mut cmds);
+         self.digi_settings_window(&ctx, &mut cmds);
+         self.logbook_window(&ctx, &mut cmds);
+diff --git a/crates/sdroxide-ui/src/app/mod.rs b/crates/sdroxide-ui/src/app/mod.rs
+index e6f40bfa..6610d4c7 100644
+--- a/crates/sdroxide-ui/src/app/mod.rs
++++ b/crates/sdroxide-ui/src/app/mod.rs
+@@ -775,6 +775,11 @@ pub struct SdroxideApp {
+     daylight_at: f64,
+     /// The BANDS window.
+     show_bands: bool,
++    /// The TRANSMIT window — what the compact strip's TX chip opens. A window
++    /// rather than a drop-down so it can be dragged off whatever it would
++    /// otherwise cover (the S-meter, on most layouts) and left open through an
++    /// over (issue #525).
++    show_tx_window: bool,
+     /// The propagation field rendered to pixels, rebuilt only when it moves.
+     prop_heat: crate::prop_map::PropHeat,
+     /// The grey-line (night/twilight) overlay rendered to pixels, rebuilt at
+@@ -1517,6 +1522,7 @@ impl SdroxideApp {
+             daylight: true,
+             daylight_at: f64::NEG_INFINITY,
+             show_bands: false,
++            show_tx_window: false,
+             digi_stations: Default::default(),
+             prop: Default::default(),
+             prop_heat: Default::default(),
+diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
+index 8f04d91a..557f0632 100644
+--- a/crates/sdroxide-ui/src/app/settings/radio.rs
++++ b/crates/sdroxide-ui/src/app/settings/radio.rs
+@@ -3440,10 +3440,11 @@ pub(in crate::app) fn settings_pluto_tab(
+         // of how the connection is set up, so they wait for Apply; the switch
+         // itself is one register write and goes at once.
+         ui.label("Amplifier pin").on_hover_text(
+-            "For a board whose amplifier can be switched in or bypassed from one of \
+-             the AD9361's GPO pins — the PlutoSky R2 \"with PA\" is one. Pick the pin \
+-             the board wires to the amplifier's enable (the schematic says which; failing \
+-             that, try each with a dummy load on the output).\n\nThis puts the GPO pins \
++            "For a board, or an external amplifier, whose PA is switched in or bypassed \
++             from one of the AD9361's GPO pins. Pick the pin it is wired to (the \
++             schematic says which; failing that, try each with a dummy load on the \
++             output).\n\nNot the PlutoSky R2: its own PA is bypassed by moving a \
++             capacitor on the board, not from software, so nothing here can switch it.\n\nThis puts the GPO pins \
+              in manual mode, so it cannot be used together with the PTT pins above — \
+              but unlike them it works in FDD, alongside Full duplex and PureSignal.\n\n\
+              Takes effect on Apply.",
+diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
+index 1ab11ba2..ed5b569a 100644
+--- a/crates/sdroxide-ui/src/app/top_bar.rs
++++ b/crates/sdroxide-ui/src/app/top_bar.rs
+@@ -848,7 +848,7 @@ impl SdroxideApp {
+                 _ => false,
+             }),
+             MenuChip::Sub => true,
+-            MenuChip::Tx => self.state.tx.tune,
++            MenuChip::Tx => self.state.tx.tune || self.show_tx_window,
+             // Nothing here reads back: the socket is a name rather than an
+             // on/off, and a radio that is switched off answers nothing at all.
+             MenuChip::Rig | MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
+@@ -1048,8 +1048,9 @@ impl SdroxideApp {
+                 let cell2 = egui::vec2(plan.cell2_w, chip_h);
+                 ui.horizontal(|ui| {
+                     if tx_capable {
+-                        let btn = crate::chrome::chip_sized(ui, self.state.tx.tune, "TX", cell2);
+-                        self.tx_menu(ui, btn, cmds);
++                        let lit = self.state.tx.tune || self.show_tx_window;
++                        let btn = crate::chrome::chip_sized(ui, lit, "TX", cell2);
++                        self.tx_menu(btn);
+                     }
+                     let btn = crate::chrome::chip_sized(ui, false, "DISP", cell2);
+                     self.disp_menu(ui, btn, cmds);
+@@ -1215,7 +1216,7 @@ impl SdroxideApp {
+                 MenuChip::Div => self.div_menu(ui, btn, cmds),
+                 MenuChip::Sub => self.sub_menu(ui, btn, cmds),
+                 MenuChip::Rig => self.rig_menu(ui, btn, cmds),
+-                MenuChip::Tx => self.tx_menu(ui, btn, cmds),
++                MenuChip::Tx => self.tx_menu(btn),
+                 MenuChip::Disp => self.disp_menu(ui, btn, cmds),
+                 MenuChip::Sys => self.sys_menu(ui, btn, cmds),
+             }
+@@ -1301,30 +1302,61 @@ impl SdroxideApp {
+         });
+     }
+ 
+-    /// The TX menu: tune, the voice keyer, and the drive and mic levels.
+-    fn tx_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
+-        let btn = btn.on_hover_text("Tune, the voice keyer, and the drive and mic levels");
+-        crate::chrome::menu_popup(ui, &btn, |ui| {
+-            crate::chrome::menu_caption(ui, "Transmit");
+-            // PTT is on the strip already; TUNE rides with the levels it is
+-            // set up with.
+-            self.tx_controls(ui, cmds, true);
+-            ui.horizontal(|ui| {
+-                let tx = self.state.tx;
+-                if crate::chrome::chip_accent(
+-                    ui,
+-                    tx.tune && !tx.two_tone,
+-                    RichText::new(" TUNE ").size(15.0),
+-                    crate::theme::YELLOW(),
+-                    crate::theme::INK_ON_CYAN(),
+-                )
+-                .clicked()
+-                {
+-                    tune_clicked(tx, false, cmds);
+-                }
+-                self.tx_two_tone_chip(ui, cmds);
++    /// The TX chip: opens and closes the TRANSMIT window — tune, the voice
++    /// keyer, and the drive and mic levels.
++    ///
++    /// A window rather than the drop-down the other menu chips open, because
++    /// the drop-down hangs from the chip straight over the S-meter, and the
++    /// S-meter is exactly what an operator is watching while they set drive
++    /// and tune (issue #525). A window can be dragged clear of it, and stays
++    /// open through an over instead of closing at the first click elsewhere.
++    fn tx_menu(&mut self, btn: egui::Response) {
++        let btn = btn.on_hover_text(
++            "Tune, the voice keyer, and the drive and mic levels — in a window you can \
++             drag anywhere, so it need not cover the S-meter",
++        );
++        if btn.clicked() {
++            self.show_tx_window = !self.show_tx_window;
++        }
++    }
++
++    /// The TRANSMIT window the TX chip opens. See [`Self::tx_menu`].
++    pub(in crate::app) fn tx_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
++        if !self.show_tx_window {
++            return;
++        }
++        let mut open = self.show_tx_window;
++        let resp = egui::Window::new("TRANSMIT")
++            .id(crate::layout::salted_id(ctx, "TRANSMIT"))
++            .open(&mut open)
++            .frame(crate::chrome::window_frame())
++            .resizable(false)
++            .collapsible(true)
++            .show(ctx, |ui| {
++                crate::chrome::window_body_bg(ui);
++                // PTT is on the strip already; TUNE rides with the levels it
++                // is set up with.
++                self.tx_controls(ui, cmds, true);
++                ui.horizontal(|ui| {
++                    let tx = self.state.tx;
++                    if crate::chrome::chip_accent(
++                        ui,
++                        tx.tune && !tx.two_tone,
++                        RichText::new(" TUNE ").size(15.0),
++                        crate::theme::YELLOW(),
++                        crate::theme::INK_ON_CYAN(),
++                    )
++                    .clicked()
++                    {
++                        tune_clicked(tx, false, cmds);
++                    }
++                    self.tx_two_tone_chip(ui, cmds);
++                });
+             });
+-        });
++        if let Some(r) = &resp {
++            crate::chrome::paint_window_border(ctx, &r.response);
++        }
++        self.show_tx_window = open;
+     }
+ 
+     /// The DISP menu: waterfall, spectrum and skimmer controls.
+diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
+index 7f6b9529..1d96d886 100644
+--- a/docs/USER_MANUAL.md
++++ b/docs/USER_MANUAL.md
+@@ -9054,9 +9054,11 @@ configured in exactly the same way as one on your desk.
+   no host software in the loop. **Off**, **GPO0 = RX, GPO1 = TX**, or **GPO2 =
+   RX, GPO3 = TX**. Picking a pair puts the radio in TDD whatever *Duplex* says.
+   See *Keying an external amplifier*, below. Takes effect on Apply.
+-- **Amplifier pin**, **Amplifier** — for a board whose amplifier can be
+-  switched in or bypassed from one of the AD9361's GPO pins, such as the
+-  PlutoSky R2 "with PA" (issue #525). Choose the pin the board wires to the
++- **Amplifier pin**, **Amplifier** — for a board, or an external amplifier,
++  whose PA can be switched in or bypassed from one of the AD9361's GPO pins
++  (issue #525). **Not the PlutoSky R2:** its own PA is bypassed by moving a
++  capacitor on the board, as OpenSourceSDRLab's product page describes, and
++  no software can switch it. Choose the pin the board wires to the
+   amplifier's enable, then use **Switched in (PA on)** to put the amplifier in
+   the transmit path or bypass it — that checkbox applies at once and is
+   remembered for the next start. Tick **Active low** if the board switches the
+@@ -13967,7 +13969,7 @@ row of menu buttons:
+ | **RX** | Volume, front-end gain, AGC, squelch, the filter width and edges, NB, ANC, NR, BIN |
+ | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
+ | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
+-| **TX** | TUNE, the voice keyer, and the drive, tune and mic levels |
++| **TX** | TUNE, 2T (two-tone), the voice keyer, and the drive, tune and mic levels — in a **TRANSMIT** window you can drag clear of the S-meter, which stays open through an over until you close it or tap **TX** again |
+ | **DISP** | ☀ 3D, WIDE, FIT, CTR, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
+ | **SYS** | LOG, SPOTS, AWARDS, BANDS, SAT, ISM, PUBLIC SDR, MAIL, MEM, SCAN, SETTINGS, HELP |
+ 
+diff --git a/src/pluto_source.rs b/src/pluto_source.rs
+index 433b0aba..f6fa1e20 100644
+--- a/src/pluto_source.rs
++++ b/src/pluto_source.rs
+@@ -36,8 +36,8 @@
+ //!
+ //! # The amplifier switch
+ //!
+-//! A board whose amplifier is switched in and out from a GPO pin (the
+-//! PlutoSky R2 "with PA") gets that switch as a pseudo-gain element,
++//! A board whose amplifier is switched in and out from a GPO pin gets that
++//! switch as a pseudo-gain element,
+ //! [`PlutoConfig::PA_ELEMENT`], set up on the connection by
+ //! `Phy::setup_pa_switch`.
+ 
 -- 
 2.43.0
 
