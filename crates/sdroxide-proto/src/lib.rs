@@ -1609,7 +1609,14 @@ use sdroxide_types::{
 /// so a v185 peer reads the extra bytes as the start of the next field and
 /// fails to decode every digital status, the same break as every appended field
 /// before it.
-pub const PROTO_VERSION: u16 = 186;
+///
+/// v187: the PlutoSDR's second receive chain can serve the RX1 radio as a
+/// second aerial or as PureSignal feedback (issue #525). `PlutoConfig` gains
+/// `aux` (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses) on
+/// its tail, and the radio configuration rides whole in both a command and an
+/// event, so a v186 peer reads the extra bytes as the start of the next field
+/// and fails to decode either.
+pub const PROTO_VERSION: u16 = 187;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
