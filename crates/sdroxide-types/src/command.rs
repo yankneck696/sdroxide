@@ -1212,4 +1212,9 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     SetRigPowerStep(u8),
+
+    /// Make TUNE send the two-tone test signal (`true`) or a steady carrier
+    /// (`false`) — see [`crate::TxState::two_tone`]. Does not key anything by
+    /// itself: [`Command::SetTune`] does that. Appended for the usual reason.
+    SetTuneTwoTone(bool),
 }
