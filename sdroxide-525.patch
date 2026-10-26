@@ -1,248 +1,174 @@
-From 49b3919a7f32a88650f05e18a0d4d10e92432eaa Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 1/7] Give the PlutoSDR configuration a second-chain role and
- an amplifier switch (#525)
+From f597ae36806e5406d4763ee77132cb1be16f74fb Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 06:40:00 -0400
+Subject: [PATCH 1/2] PlutoSDR: RX2 as a second aerial or PureSignal feedback
+ for the RX1 radio (#525)
 
-PlutoConfig gains aux (the block a LimeSDR's second chain already uses, as
-PlutoAuxConfig), pa_gpo (PlutoPaPin), pa_on and pa_active_low, plus the
-pseudo-gain element names that drive them. The wire protocol moves to v166
+Adapted from the LimeSDR-USB's second-chain support: PlutoConfig gains aux,
+the same block a LimeSDR's second chain uses (PlutoAuxConfig is
+LimeAuxConfig), and src/pluto_source.rs follows src/lime_source.rs, borrowing
+RX2 into the RX1 radio and feeding it to the shared sdroxide_dsp::Diversity
+(Cancel/Combine, driven from the main window's DIV strip) or
+sdroxide_dsp::PureSignal. PureSignal needs full duplex, since the coupler is
+only heard while receive keeps running through the over. Wire protocol v187,
 because the radio configuration crosses whole.
----
- crates/sdroxide-proto/src/lib.rs   |  11 ++-
- crates/sdroxide-types/src/lib.rs   |  17 +++--
- crates/sdroxide-types/src/radio.rs | 118 +++++++++++++++++++++++++++++
- 3 files changed, 137 insertions(+), 9 deletions(-)
 
-diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
-index 26e66c9d..198d67a0 100644
---- a/crates/sdroxide-proto/src/lib.rs
-+++ b/crates/sdroxide-proto/src/lib.rs
-@@ -1516,7 +1516,16 @@ use sdroxide_types::{
- /// `DigiStatus` whole, so a v172 peer reads the extra byte as the start of the
- /// next field and fails to decode every config — the same break as v172's
- /// appended message buttons.
--pub const PROTO_VERSION: u16 = 173;
-+///
-+/// v174: the PlutoSDR's second receive chain can serve the RX1 radio as a
-+/// second aerial or as PureSignal feedback, and a GPO pin can switch an
-+/// amplifier in and out (issue #525). `PlutoConfig` gains `aux`
-+/// (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses),
-+/// `pa_gpo` (`PlutoPaPin`), `pa_on` and `pa_active_low` on its tail, and the
-+/// radio configuration rides whole in both a command and an event, so a v173
-+/// peer reads the extra bytes as the start of the next field and fails to
-+/// decode either.
-+pub const PROTO_VERSION: u16 = 174;
- const VERSION_BYTE: u8 = 0x12;
+Both chains arrive in one 2R2T device buffer. The receive thread commits each
+buffer to both chains' rings or to neither, recording where chain 1 starts in
+chain 0's count, so PlutoRx::rx_read_paired hands over the two chains'
+samples of the same instants. PlutoRig::aux_rx borrows chain 1 that way, and
+a loopback test covers the pairing.
+
+Over Ethernet the transmission comes back on RX2 a few hundred milliseconds
+after it was predistorted (host ring, DMA buffers both ways, the network
+twice), well past the tenth of a second PureSignal::new keeps.
+PureSignal::with_history takes a longer history, and while unlocked the
+delay search runs eight times a second rather than on every block, so the
+longer history costs nothing extra. The Pluto uses one second and unlocks at
+each key-up. A test covers a delay the default history cannot reach.
+
+Diversity (Cancel) tried on a PlutoSky R2. PureSignal is not yet verified on
+hardware: the receive stalls of #719 break its feedback stream.
+---
+ crates/sdroxide-dsp/src/predistort.rs        |  70 ++-
+ crates/sdroxide-pluto/src/net.rs             | 165 ++++++-
+ crates/sdroxide-pluto/src/stream.rs          |  98 ++++-
+ crates/sdroxide-pluto/tests/iiod_loopback.rs |  67 +++
+ crates/sdroxide-proto/src/lib.rs             |   9 +-
+ crates/sdroxide-types/src/lib.rs             |  17 +-
+ crates/sdroxide-types/src/radio.rs           |  36 ++
+ crates/sdroxide-ui/src/app/settings/radio.rs | 222 +++++++++-
+ docs/USER_MANUAL.md                          |  25 ++
+ src/main.rs                                  |   3 +
+ src/pluto_source.rs                          | 431 ++++++++++++++++++-
+ 11 files changed, 1092 insertions(+), 51 deletions(-)
+
+diff --git a/crates/sdroxide-dsp/src/predistort.rs b/crates/sdroxide-dsp/src/predistort.rs
+index 2fa700e2..2d600bf7 100644
+--- a/crates/sdroxide-dsp/src/predistort.rs
++++ b/crates/sdroxide-dsp/src/predistort.rs
+@@ -126,6 +126,13 @@ pub struct PureSignal {
+     check_every: u64,
+     /// How much history to keep, which bounds the delay that can be found.
+     keep: usize,
++    /// Feedback samples since the last search for the alignment while there
++    /// is none, and how many must pass between searches. A search costs the
++    /// whole history times the block, so searching on *every* block while
++    /// unlocked — fine over a tenth of a second of history — is a gigaflop a
++    /// second over the second of history a networked radio needs.
++    since_locate: u64,
++    locate_every: u64,
  
- #[derive(Debug, thiserror::Error)]
-diff --git a/crates/sdroxide-types/src/lib.rs b/crates/sdroxide-types/src/lib.rs
-index 6a5bf4fa..2b0e3ace 100644
---- a/crates/sdroxide-types/src/lib.rs
-+++ b/crates/sdroxide-types/src/lib.rs
-@@ -218,14 +218,15 @@ pub use radio::{
-     IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, KiwiConfig,
-     LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, MAX_TRANSVERTERS, ModeControl,
-     PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
--    PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
--    RS_HFIQ_CAT_BAUD, RadioConfig, RtlSdrAgc, RtlSdrConfig, RtlSdrDevice, RtlSdrHfMode,
--    RtlTcpConfig, Rx888Config, Rx888Device, RxSite, SdrPlayAgc, SdrPlayConfig, SdrPlayDevice,
--    SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayHdrBw, SdrPlayModel, SerialConfig,
--    SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat, SpyServerConfig,
--    SpyServerFormat, StopBits, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ, TciConfig, TrUsdxAudio,
--    Transverter, cat_iq_offset_max_hz, converter_preset_name, diversity_cost_note, elad_cat_baud,
--    format_freq_ranges, hackrf_serial_matches, hpsdr_alex_oc, hpsdr_n2adr_oc, parse_freq_ranges,
-+    PlutoAuxConfig, PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPaPin, PlutoPtt, PttMethod,
-+    QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ, RS_HFIQ_CAT_BAUD, RadioConfig, RtlSdrAgc, RtlSdrConfig,
-+    RtlSdrDevice, RtlSdrHfMode, RtlTcpConfig, Rx888Config, Rx888Device, RxSite, SdrPlayAgc,
-+    SdrPlayConfig, SdrPlayDevice, SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayHdrBw,
-+    SdrPlayModel, SerialConfig, SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo,
-+    SoundFormat, SpyServerConfig, SpyServerFormat, StopBits, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ,
-+    TciConfig, TrUsdxAudio, Transverter, cat_iq_offset_max_hz, converter_preset_name,
-+    diversity_cost_note, elad_cat_baud, format_freq_ranges, hackrf_serial_matches, hpsdr_alex_oc,
-+    hpsdr_n2adr_oc, parse_freq_ranges,
- };
- pub use rds::{
-     RdsClock, RdsData, RdsGroupLog, RdsStandard, RdsStats, RtPlus, af_code_hz, pi_callsign,
-diff --git a/crates/sdroxide-types/src/radio.rs b/crates/sdroxide-types/src/radio.rs
-index 401e12e7..6417fcc8 100644
---- a/crates/sdroxide-types/src/radio.rs
-+++ b/crates/sdroxide-types/src/radio.rs
-@@ -5309,6 +5309,79 @@ impl PlutoPtt {
-     }
- }
- 
-+/// Which GPO pin, if any, holds an amplifier on or bypassed — a static switch
-+/// the operator flips, not a PTT line (issue #525).
-+///
-+/// Boards built around a Pluto with an amplifier on them — the PlutoSky R2 "with
-+/// PA" is the one this was asked for — can bring the amplifier's enable or
-+/// bypass control out to one of the AD9361's GPO pins. Unlike [`PlutoPtt`] the
-+/// pin does not follow the enable-state machine: it is put in the part's
-+/// *manual* GPO mode and set from here, high or low, and stays there across
-+/// overs. That is also why it works in FDD, and so beside full duplex and
-+/// PureSignal, which the TDD-only PTT pair rules out.
-+///
-+/// The two cannot share the pins: the AD9361 has one switch that hands all four
-+/// GPOs either to the state machine or to manual control, so choosing a pin
-+/// here while [`PlutoPtt`] is on is refused with a note on connect.
-+///
-+/// Which pin a given board uses is the board maker's choice and is not
-+/// published anywhere this backend can read — try each with the amplifier's
-+/// output into a dummy load, or check the schematic.
-+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-+pub enum PlutoPaPin {
-+    /// Leave every GPO alone.
-+    #[default]
-+    Off,
-+    Gpo0,
-+    Gpo1,
-+    Gpo2,
-+    Gpo3,
-+}
-+
-+impl PlutoPaPin {
-+    pub const ALL: [PlutoPaPin; 5] =
-+        [PlutoPaPin::Off, PlutoPaPin::Gpo0, PlutoPaPin::Gpo1, PlutoPaPin::Gpo2, PlutoPaPin::Gpo3];
-+
-+    pub fn label(self) -> &'static str {
-+        match self {
-+            PlutoPaPin::Off => "Not used",
-+            PlutoPaPin::Gpo0 => "GPO0",
-+            PlutoPaPin::Gpo1 => "GPO1",
-+            PlutoPaPin::Gpo2 => "GPO2",
-+            PlutoPaPin::Gpo3 => "GPO3",
-+        }
+     /// De-rotation and envelope scratch, kept to avoid allocating per block.
+     scratch: Vec<Complex32>,
+@@ -137,12 +144,30 @@ impl PureSignal {
+     /// `sample_rate_hz` sizes the reference history: the loop delay is mostly
+     /// the transmit FIFO, so the history has to span it.
+     pub fn new(bins: usize, rate: f32, sample_rate_hz: f64) -> PureSignal {
+-        let bins = bins.clamp(4, 256);
+         // A tenth of a second of history, bounded so a fast device does not
+         // cost eight megabytes: the transmit FIFO is what the delay is made
+         // of, and the engine paces the over to keep it at tens of
+         // milliseconds.
+         let keep = ((sample_rate_hz * 0.1) as usize).clamp(1 << 16, 1 << 19);
++        Self::with_keep(bins, rate, sample_rate_hz, keep)
 +    }
 +
-+    /// The pin number, or `None` when this is off.
-+    pub fn pin(self) -> Option<u8> {
-+        match self {
-+            PlutoPaPin::Off => None,
-+            PlutoPaPin::Gpo0 => Some(0),
-+            PlutoPaPin::Gpo1 => Some(1),
-+            PlutoPaPin::Gpo2 => Some(2),
-+            PlutoPaPin::Gpo3 => Some(3),
-+        }
++    /// The same, for a radio whose loop delay is longer than a tenth of a
++    /// second — one reached over a network, where the samples pass through a
++    /// host ring, the device's own DMA buffers and back again before the
++    /// feedback arrives (a Pluto, issue #525). `history_s` is how far back the
++    /// alignment may look; past what it covers the loop simply never locks.
++    pub fn with_history(bins: usize, rate: f32, sample_rate_hz: f64, history_s: f64) -> PureSignal {
++        let keep = ((sample_rate_hz * history_s.max(0.1)) as usize).clamp(1 << 16, 1 << 22);
++        Self::with_keep(bins, rate, sample_rate_hz, keep)
 +    }
 +
-+    /// The level the pin is driven to for an amplifier that should be `on`,
-+    /// given whether the board's control is active-low.
-+    pub fn level(on: bool, active_low: bool) -> bool {
-+        on != active_low
-+    }
-+}
-+
-+/// The Pluto's second receive chain, and what is done with it.
-+///
-+/// The same block a LimeSDR's second chain uses ([`LimeAuxConfig`]), because it
-+/// is the same idea on the same kind of part: two receive chains on one
-+/// synthesiser and one clock, so the second hears the same span at the same
-+/// instant as the first. The DSP behind it — the adaptive combiner and the
-+/// predistortion loop — is shared too, and so are its controls.
-+///
-+/// [`LimeAuxConfig::antenna`] is not used on a Pluto: the AD9361 selects one
-+/// receive port for both chains.
-+pub type PlutoAuxConfig = LimeAuxConfig;
-+
- /// ADALM-Pluto (PlutoSDR) backend configuration.
- ///
- /// The device is reached over the network — which the USB cable already
-@@ -5387,6 +5460,28 @@ pub struct PlutoConfig {
-     /// whole time in FDD, so nothing would ever toggle.
-     #[serde(default)]
-     pub ptt_gpo: PlutoPtt,
-+    /// The second receive chain on a 2R2T firmware, used by this radio as a
-+    /// second aerial (diversity) or as transmit feedback (PureSignal) rather
-+    /// than by a radio tab of its own (issue #525).
-+    ///
-+    /// Only honoured on the RX1 radio — it owns the transmitter and the chain
-+    /// being borrowed is RX2. While it is on, RX2 is not free for another tab.
-+    /// PureSignal also needs [`Self::full_duplex`]: the coupler is only heard
-+    /// if receive keeps running through the over.
-+    #[serde(default)]
-+    pub aux: PlutoAuxConfig,
-+    /// Which GPO pin switches an on-board or external amplifier in and out —
-+    /// see [`PlutoPaPin`].
-+    #[serde(default)]
-+    pub pa_gpo: PlutoPaPin,
-+    /// Whether the amplifier is switched in. Applies immediately, and is
-+    /// remembered so the board comes up the way it was left.
-+    #[serde(default)]
-+    pub pa_on: bool,
-+    /// The board's amplifier control is active-low: the pin is driven low to
-+    /// switch the amplifier in.
-+    #[serde(default)]
-+    pub pa_active_low: bool,
- }
- 
- impl Default for PlutoConfig {
-@@ -5410,6 +5505,13 @@ impl Default for PlutoConfig {
-             full_duplex: false,
-             duplex: PlutoDuplex::default(),
-             ptt_gpo: PlutoPtt::default(),
-+            aux: PlutoAuxConfig::default(),
-+            pa_gpo: PlutoPaPin::default(),
-+            // Bypassed until the operator says otherwise: an amplifier that
-+            // comes up switched in on a board somebody has only just plugged
-+            // in is ten decibels nobody asked for.
-+            pa_on: false,
-+            pa_active_low: false,
++    fn with_keep(bins: usize, rate: f32, sample_rate_hz: f64, keep: usize) -> PureSignal {
++        let bins = bins.clamp(4, 256);
++        let check_every = (sample_rate_hz * 0.5) as u64;
++        // Eight tries a second while unlocked: quick enough that an over is
++        // found within its first syllable, rare enough to cost nothing.
++        let locate_every = (check_every / 4).max(1);
+         PureSignal {
+             table: vec![Complex32::new(1.0, 0.0); bins],
+             alpha: Self::alpha_for_rate(rate),
+@@ -156,8 +181,11 @@ impl PureSignal {
+             score: 0.0,
+             since_check: 0,
+             // Twice a second at any rate people transmit at.
+-            check_every: (sample_rate_hz * 0.5) as u64,
++            check_every,
+             keep,
++            // So that the very first block is searched at once.
++            since_locate: locate_every,
++            locate_every,
+             scratch: Vec::new(),
+             fenv: Vec::new(),
          }
+@@ -234,6 +262,8 @@ impl PureSignal {
+         self.offset = None;
+         self.score = 0.0;
+         self.since_check = 0;
++        // Search on the first feedback block of the new over, not a slot later.
++        self.since_locate = self.locate_every;
      }
- }
-@@ -5431,6 +5533,22 @@ impl PlutoConfig {
-     /// renders them as sliders — the Pluto settings panel drives them directly.
-     pub const AGC_ELEMENT: &'static str = "AGC";
-     pub const PPM_ELEMENT: &'static str = "PPM";
-+    /// The amplifier switch: at or above 0.5 switches it in. See
-+    /// [`PlutoPaPin`].
-+    pub const PA_ELEMENT: &'static str = "PA";
-+    /// The second chain and what it feeds — the same names a LimeSDR's use, so
-+    /// the main window's diversity strip drives either without knowing which
-+    /// board is behind it.
-+    pub const AUX_GAIN_ELEMENT: &'static str = LimeConfig::AUX_GAIN_ELEMENT;
-+    pub const DIV_MODE_ELEMENT: &'static str = DIV_MODE_ELEMENT;
-+    pub const DIV_RATE_ELEMENT: &'static str = DIV_RATE_ELEMENT;
-+    pub const DIV_TAPS_ELEMENT: &'static str = DIV_TAPS_ELEMENT;
-+    pub const DIV_FREEZE_ELEMENT: &'static str = DIV_FREEZE_ELEMENT;
-+    pub const DIV_RESET_ELEMENT: &'static str = DIV_RESET_ELEMENT;
-+    pub const PS_BINS_ELEMENT: &'static str = LimeConfig::PS_BINS_ELEMENT;
-+    pub const PS_RATE_ELEMENT: &'static str = LimeConfig::PS_RATE_ELEMENT;
-+    pub const PS_FREEZE_ELEMENT: &'static str = LimeConfig::PS_FREEZE_ELEMENT;
-+    pub const PS_RESET_ELEMENT: &'static str = LimeConfig::PS_RESET_ELEMENT;
  
-     /// Sample rates offered in the UI.
-     ///
--- 
-2.43.0
-
-
-From 1d798bc00b03ec81fd4997b5083b4de658edd50a Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 2/7] Keep a borrowed second Pluto chain in step with the
- first, and switch an amplifier from a GPO pin (#525)
-
-The receive thread can now commit a 2R2T buffer to both chains' rings or to
-neither, recording where chain 1 starts in chain 0's count, so
-PlutoRx::rx_read_paired hands over the two chains' samples of the same
-instants. PlutoRig::aux_rx borrows chain 1 that way.
-
-Phy::setup_pa_switch puts one GPO pin in the AD9361's manual mode at the
-requested level before the initialise, and Phy::set_pa flips it live through
-the driver's gpo_set entry. It works in FDD, and is refused with a note beside
-a PTT pair, which needs the same pins slaved. Loopback tests cover pairing,
-the switch, and the refusal.
----
- crates/sdroxide-pluto/src/net.rs             | 201 +++++++++++++++++--
- crates/sdroxide-pluto/src/phy.rs             | 154 +++++++++++++-
- crates/sdroxide-pluto/src/stream.rs          |  98 +++++++--
- crates/sdroxide-pluto/tests/iiod_loopback.rs | 138 +++++++++++++
- 4 files changed, 562 insertions(+), 29 deletions(-)
-
+     /// Bend one block on its way to the transmitter, and keep what was wanted.
+@@ -320,9 +350,12 @@ impl PureSignal {
+         self.fb_total += m as u64;
+ 
+         self.since_check += m as u64;
++        self.since_locate += m as u64;
+         let recheck = self.since_check >= self.check_every;
+-        if self.offset.is_none() || recheck {
++        let searching = self.offset.is_none() && self.since_locate >= self.locate_every;
++        if searching || recheck {
+             self.since_check = 0;
++            self.since_locate = 0;
+             self.locate(start, m);
+         }
+         let Some(off) = self.offset else { return false };
+@@ -636,6 +669,37 @@ mod tests {
+         );
+     }
+ 
++    /// A networked radio's loop delay — a Pluto over Ethernet, issue #525 —
++    /// is hundreds of milliseconds, far past the default history: the
++    /// default never locks on it, and a history long enough does. Run at a
++    /// low rate so the test stays quick; what matters is delay against
++    /// history, not the rate.
++    #[test]
++    fn a_long_loop_delay_locks_with_a_long_enough_history() {
++        let rate = 200_000.0;
++        // 0.8 s. The default keeps at least 65536 samples and holds up to
++        // twice that, so at this low rate it reaches 0.65 s; this is past
++        // that and inside the one-second history.
++        let delay = 160_000usize;
++        let run = |mut ps: PureSignal| {
++            let mut line: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); delay];
++            let coupler = Complex32::from_polar(0.11, 1.0);
++            for round in 0..70 {
++                let mut block = source(8192, 300 + round);
++                ps.predistort(&mut block);
++                line.extend(block.iter().map(|s| amplifier(*s) * coupler));
++                let fb: Vec<Complex32> = line.drain(..8192).collect();
++                ps.feed_back(&fb, 0.0, rate);
++            }
++            ps
++        };
++        let short = run(PureSignal::new(32, 0.9, rate));
++        assert!(!short.locked(), "the default history should not reach a 0.8 s delay");
++        let long = run(PureSignal::with_history(32, 0.9, rate, 1.0));
++        assert!(long.locked(), "a one-second history never found it (score {:.2})", long.score());
++        assert!(long.correction_db() > 0.5, "locked, but learned nothing");
++    }
++
+     /// Feedback that is not the transmission — an unconnected coupler, a
+     /// receiver hearing the band instead — never locks, and an unlocked loop
+     /// leaves the transmitter exactly as it was.
 diff --git a/crates/sdroxide-pluto/src/net.rs b/crates/sdroxide-pluto/src/net.rs
-index 37be799a..d77f1052 100644
+index 37be799a..420c3d65 100644
 --- a/crates/sdroxide-pluto/src/net.rs
 +++ b/crates/sdroxide-pluto/src/net.rs
 @@ -50,6 +50,9 @@ pub use crate::phy::PlutoLimits;
@@ -255,17 +181,7 @@ index 37be799a..d77f1052 100644
  /// How long the TCP handshake may take before the address counts as wrong.
  pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
  
-@@ -142,6 +145,9 @@ pub(crate) enum Ctrl {
-     Ppm(f64),
-     TxOn(f64),
-     TxOff,
-+    /// Switch the amplifier in (`true`) or out, on the GPO pin
-+    /// [`Shared::pa`] names. See `sdroxide_types::PlutoPaPin`.
-+    Pa(bool),
-     Shutdown,
- }
- 
-@@ -207,6 +213,25 @@ pub(crate) struct Shared {
+@@ -207,6 +210,22 @@ pub(crate) struct Shared {
      pub rx_pairs: AtomicUsize,
      /// The second chain's ring feed, installed while its stream is attached.
      pub ring1: Mutex<Option<Producer<f32>>>,
@@ -285,31 +201,10 @@ index 37be799a..d77f1052 100644
 +    /// `pair_origin`. [`NO_PAIR`] until then, and again after the auxiliary
 +    /// stream detaches.
 +    pub pair_origin: AtomicU64,
-+    /// The GPO pin switching an amplifier, and whether its control is
-+    /// active-low, when [`Phy::setup_pa_switch`] got it working.
-+    pub pa: Option<(u8, bool)>,
      /// Per-chain LO-move subscribers: `(chain, notify)`. The control thread
      /// tells every chain but the one that asked when the shared LO moves.
      pub lo_watch: Mutex<Vec<(u8, Sender<f64>)>>,
-@@ -430,6 +455,17 @@ impl PlutoRig {
-         // land on the far side of that.
-         let tr = phy.setup_tr_switching(&mut control, cfg.duplex, cfg.ptt_gpo)?;
-         warnings.extend(tr.warnings);
-+        // The amplifier switch, for the same reason and in the same place: it
-+        // may end in a reinitialise of its own (issue #525).
-+        let (pa_ok, pa_warnings) = phy.setup_pa_switch(
-+            &mut control,
-+            cfg.pa_gpo,
-+            cfg.ptt_gpo,
-+            cfg.pa_on,
-+            cfg.pa_active_low,
-+        )?;
-+        warnings.extend(pa_warnings);
-+        let pa = cfg.pa_gpo.pin().filter(|_| pa_ok).map(|pin| (pin, cfg.pa_active_low));
-         // TDD is one direction at a time in the silicon, so the link is no
-         // longer what decides this — the part is.
-         let full_duplex = if tr.tdd && cfg.full_duplex {
-@@ -644,6 +680,11 @@ impl PlutoRig {
+@@ -644,6 +663,10 @@ impl PlutoRig {
              tx_buffer_samples: tx_buffer_samples(tx_rate),
              rx_pairs: AtomicUsize::new(1),
              ring1: Mutex::new(None),
@@ -317,11 +212,10 @@ index 37be799a..d77f1052 100644
 +            pushed0: AtomicU64::new(0),
 +            popped0: AtomicU64::new(0),
 +            pair_origin: AtomicU64::new(NO_PAIR),
-+            pa,
              lo_watch: Mutex::new(Vec::new()),
              trace: trace.clone(),
          });
-@@ -838,7 +879,11 @@ impl PlutoRig {
+@@ -838,7 +861,11 @@ impl PlutoRig {
                      // held it (chain 0's producer lives in the thread); drain
                      // the backlog so a re-attached stream starts live rather
                      // than replaying half a second of the past.
@@ -334,7 +228,7 @@ index 37be799a..d77f1052 100644
                      (r, tx)
                  }
                  None => {
-@@ -875,6 +920,28 @@ impl PlutoRig {
+@@ -875,6 +902,28 @@ impl PlutoRig {
      }
  }
  
@@ -363,7 +257,7 @@ index 37be799a..d77f1052 100644
  /// One receive chain's stream on a shared [`PlutoRig`]: its IQ ring, its gain
  /// and port, and — on chain 0 — the transmitter. The LO is the rig's, shared
  /// by every chain: tuning here moves the siblings too, and their moves arrive
-@@ -924,7 +991,12 @@ impl Drop for PlutoRx {
+@@ -924,7 +973,12 @@ impl Drop for PlutoRx {
          } else {
              // The receive thread narrows its buffer back to one pair.
              self.rig.shared.rx_pairs.store(1, Ordering::Relaxed);
@@ -377,7 +271,7 @@ index 37be799a..d77f1052 100644
          }
      }
  }
-@@ -1107,28 +1179,107 @@ impl PlutoRx {
+@@ -1107,28 +1161,93 @@ impl PlutoRx {
      /// Drain interleaved I,Q floats from the RX ring into `out`. Always returns
      /// an even count, so the stream stays aligned. 0 means nothing yet.
      pub fn rx_read(&mut self, out: &mut [f32]) -> usize {
@@ -466,20 +360,6 @@ index 37be799a..d77f1052 100644
 +        }
 +    }
 +
-+    /// Whether a GPO pin is set up to switch an amplifier on this connection.
-+    pub fn pa_available(&self) -> bool {
-+        self.rig.shared.pa.is_some()
-+    }
-+
-+    /// Switch the amplifier in or out. The connection's, so only chain 0's
-+    /// radio — the one with the transmitter — does this; a no-op elsewhere
-+    /// and on a connection with no amplifier pin.
-+    pub fn set_pa(&self, on: bool) {
-+        if self.chain == 0 && self.rig.shared.pa.is_some() {
-+            let _ = self.rig.ctrl.send(Ctrl::Pa(on));
-+        }
-+    }
-+
      /// Drop whatever the receive thread queued. Receive is torn down for the
      /// length of an over, but a partial buffer can still be sitting in the ring
      /// when it resumes, and replaying it would put a burst of stale audio in
@@ -497,7 +377,7 @@ index 37be799a..d77f1052 100644
          }
      }
  
-@@ -1158,6 +1309,24 @@ impl PlutoRx {
+@@ -1158,6 +1277,24 @@ impl PlutoRx {
      }
  }
  
@@ -522,210 +402,6 @@ index 37be799a..d77f1052 100644
  /// The single-stream view of a Pluto: chain 0 of a [`PlutoRig`] of its own.
  /// What every caller used before chains were split from the connection, kept
  /// for them — the loopback tests and the probe example drive exactly one
-@@ -1414,6 +1583,10 @@ fn control_thread(
-                 }
-                 Ctrl::TxOn(hz) => key_up(&mut conn, &shared, *hz, ppm, &mut tx_lo),
-                 Ctrl::TxOff => key_down(&mut conn, &shared, rx_hz, ppm),
-+                Ctrl::Pa(on) => match shared.pa {
-+                    Some((pin, active_low)) => phy.set_pa(&mut conn, pin, *on, active_low),
-+                    None => Ok(()),
-+                },
-                 Ctrl::Shutdown => break 'ctrl,
-             };
-             // A refusal means the board answered — the link is fine and the
-diff --git a/crates/sdroxide-pluto/src/phy.rs b/crates/sdroxide-pluto/src/phy.rs
-index b0792b89..ad3daf78 100644
---- a/crates/sdroxide-pluto/src/phy.rs
-+++ b/crates/sdroxide-pluto/src/phy.rs
-@@ -27,7 +27,7 @@
- //! different things — receive `hardwaregain` is gain in dB, transmit
- //! `hardwaregain` is *attenuation* expressed as negative dB.
- 
--use sdroxide_types::{PlutoDuplex, PlutoPtt};
-+use sdroxide_types::{PlutoDuplex, PlutoPaPin, PlutoPtt};
- 
- use crate::context::{Context, Device, ScanFormat};
- use crate::error::{Error, Result};
-@@ -80,6 +80,21 @@ const ELNA_GPO: [&str; 2] =
-     ["adi,elna-rx1-gpo0-control-enable", "adi,elna-rx2-gpo1-control-enable"];
- /// How many general-purpose output pins an AD9361 has.
- const GPO_PINS: u8 = 4;
-+/// The device-tree property that hands all four GPO pins to manual control —
-+/// set from the host rather than slaved to the enable-state machine. Like
-+/// [`FDD_ENABLE`] it does nothing until [`INITIALIZE`] is written. It is one
-+/// switch for all four pins (the part's `GPO_MANUAL_SELECT` bit), which is why
-+/// the amplifier pin and the PTT pair cannot be used together.
-+const GPO_MANUAL_ENABLE: &str = "adi,gpo-manual-mode-enable";
-+/// The levels the pins come up at when manual mode is initialised, bit `n` for
-+/// GPO`n`. Written before [`INITIALIZE`] so the amplifier is never switched the
-+/// wrong way for the length of an open.
-+const GPO_MANUAL_MASK: &str = "adi,gpo-manual-mode-enable-mask";
-+/// The driver's debugfs entry that sets one manual GPO live: `"<pin> <level>"`.
-+/// Refused unless [`GPO_MANUAL_ENABLE`] was set at the last initialise. It
-+/// takes effect at once, with no reinitialise, so flipping the amplifier costs
-+/// one round trip and nothing on the receive side.
-+const GPO_SET: &str = "gpo_set";
- /// The four slave bits this backend ever sets — one per pin, in the direction
- /// [`PlutoPtt`] gives it. Finding one of them set on a board that is not in FDD
- /// is how a session's own leftovers are told apart from a board somebody put in
-@@ -893,6 +908,19 @@ impl Phy {
-                 self.write_setup_attr(conn, &attr, value, &mut out.warnings)?;
-             }
-         }
-+        if pins.is_some()
-+            && self.has_debug_attr(GPO_MANUAL_ENABLE)
-+            && conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1")
-+        {
-+            // Left by an amplifier switch in an earlier session (or chosen
-+            // alongside this pair — `setup_pa_switch` refuses that). Manual
-+            // mode overrides the slaved pins, so the PTT pair would never move.
-+            tracing::info!(
-+                "PlutoSDR: taking the GPO pins out of manual mode — the PTT pair needs them \
-+                 slaved to the radio"
-+            );
-+            self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "0", &mut out.warnings)?;
-+        }
-         if pins == Some((0, 1)) {
-             // Analog Devices' own note puts an external LNA on these two, so a
-             // board wired that way has them claimed. PTT wins here because the
-@@ -958,6 +986,121 @@ impl Phy {
-         Ok(out)
-     }
- 
-+    /// Put GPO `pa`'s pin in the AD9361's manual GPO mode, driven to the level
-+    /// that has the amplifier `on`, for a board whose amplifier is switched in
-+    /// and out from a GPO (issue #525). Answers whether [`Self::set_pa`] will
-+    /// work afterwards.
-+    ///
-+    /// Runs after [`Self::setup_tr_switching`] and, like it, before the front
-+    /// end is configured: this also ends in [`INITIALIZE`], which puts the
-+    /// rate, the filter, the gains and the oscillators back to the board's
-+    /// defaults. It is only paid when the pin is not already set up — a board
-+    /// found in manual mode from an earlier session just has the level written.
-+    ///
-+    /// Refused with a note, never with an error, alongside a PTT pair (the two
-+    /// want the same four pins in different modes) and on a firmware without
-+    /// the properties: an amplifier switch that cannot be set up must not cost
-+    /// the operator their receiver.
-+    ///
-+    /// Choosing no pin leaves every GPO alone, including a board that an
-+    /// earlier session left in manual mode: those pins then stay where they
-+    /// were, which is the amplifier as it was last switched, and the PTT pair
-+    /// takes manual mode back off if it is ever chosen.
-+    pub fn setup_pa_switch(
-+        &self,
-+        conn: &mut Connection,
-+        pa: PlutoPaPin,
-+        ptt: PlutoPtt,
-+        on: bool,
-+        active_low: bool,
-+    ) -> Result<(bool, Vec<String>)> {
-+        let mut warnings = Vec::new();
-+        let Some(pin) = pa.pin() else { return Ok((false, warnings)) };
-+        if ptt != PlutoPtt::Off {
-+            let msg = format!(
-+                "PlutoSDR: the amplifier switch on {} is off — the AD9361 hands its GPO \
-+                 pins either to the PTT pair or to manual control, not both. Set the PTT \
-+                 pins to Off to use it",
-+                pa.label()
-+            );
-+            tracing::warn!("{msg}");
-+            warnings.push(msg);
-+            return Ok((false, warnings));
-+        }
-+        for attr in [GPO_MANUAL_ENABLE, GPO_MANUAL_MASK, INITIALIZE, GPO_SET] {
-+            if !self.has_debug_attr(attr) {
-+                let msg = format!(
-+                    "PlutoSDR: this firmware publishes no {attr}, so {} cannot switch the \
-+                     amplifier — the GPO pins are left alone",
-+                    pa.label()
-+                );
-+                tracing::warn!("{msg}");
-+                warnings.push(msg);
-+                return Ok((false, warnings));
-+            }
-+        }
-+        let already =
-+            conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1");
-+        if !already {
-+            // The pin's level first, so `initialize` brings it up already
-+            // right; the other three pins keep whatever the mask had for them.
-+            let mask = conn
-+                .read_debug_attr(&self.phy_id, GPO_MANUAL_MASK)
-+                .ok()
-+                .and_then(|v| parse_int(v.trim()))
-+                .unwrap_or(0);
-+            let bit = 1u32 << pin;
-+            let mask = if PlutoPaPin::level(on, active_low) { mask | bit } else { mask & !bit };
-+            if !self.write_setup_attr(conn, GPO_MANUAL_MASK, &mask.to_string(), &mut warnings)? {
-+                return Ok((false, warnings));
-+            }
-+            if pin <= 1 {
-+                // An external-LNA claim on this pin would fight the switch.
-+                let attr = ELNA_GPO[usize::from(pin)];
-+                if self.has_debug_attr(attr) {
-+                    self.write_setup_attr(conn, attr, "0", &mut warnings)?;
-+                }
-+            }
-+            if !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)?
-+                || !self.write_setup_attr(conn, INITIALIZE, "1", &mut warnings)?
-+            {
-+                return Ok((false, warnings));
-+            }
-+            // `initialize` leaves an FDD part's state machine where the
-+            // driver's setup puts it; `ensure_receiving` at the end of the open
-+            // checks it, as it does after `setup_tr_switching`.
-+        }
-+        match self.set_pa(conn, pin, on, active_low) {
-+            Ok(()) => {
-+                tracing::info!(
-+                    "PlutoSDR: {} switches the amplifier (active {}), which is {}",
-+                    pa.label(),
-+                    if active_low { "low" } else { "high" },
-+                    if on { "in" } else { "bypassed" }
-+                );
-+                Ok((true, warnings))
-+            }
-+            Err(e @ (Error::Remote { .. } | Error::Unsupported(_))) => {
-+                let msg = format!(
-+                    "PlutoSDR: the radio would not set {} ({e}) — the amplifier switch is off",
-+                    pa.label()
-+                );
-+                tracing::warn!("{msg}");
-+                warnings.push(msg);
-+                Ok((false, warnings))
-+            }
-+            Err(e) => Err(e),
-+        }
-+    }
-+
-+    /// Drive manual GPO `pin` to switch the amplifier in (`on`) or out. Live —
-+    /// no reinitialise — once [`Self::setup_pa_switch`] has put the pins in
-+    /// manual mode.
-+    pub fn set_pa(&self, conn: &mut Connection, pin: u8, on: bool, active_low: bool) -> Result<()> {
-+        let level = u8::from(PlutoPaPin::level(on, active_low));
-+        conn.write_debug_attr(&self.phy_id, GPO_SET, &format!("{pin} {level}"))
-+    }
-+
-     /// Write one setup attribute, answering whether it landed. A device that
-     /// refuses the value becomes a warning for the operator; a socket that has
-     /// gone is still an error, because nothing after it would work either.
-@@ -1267,6 +1410,15 @@ fn usable_ports(
- ///
- /// The brackets are part of the value, and the fields are in that order — not
- /// min/max/step, which is the natural reading and the wrong one.
-+/// A debug attribute's integer, which the driver prints in decimal but a
-+/// firmware may equally print as `0x…`.
-+fn parse_int(text: &str) -> Option<u32> {
-+    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
-+        None => text.parse().ok(),
-+    }
-+}
-+
- fn parse_range(text: &str) -> Option<(f64, f64, f64)> {
-     let inner = text.trim().trim_start_matches('[').trim_end_matches(']');
-     let mut it = inner.split_whitespace();
 diff --git a/crates/sdroxide-pluto/src/stream.rs b/crates/sdroxide-pluto/src/stream.rs
 index 8f93e272..31675d3e 100644
 --- a/crates/sdroxide-pluto/src/stream.rs
@@ -864,20 +540,10 @@ index 8f93e272..31675d3e 100644
          stats.tick();
      }
 diff --git a/crates/sdroxide-pluto/tests/iiod_loopback.rs b/crates/sdroxide-pluto/tests/iiod_loopback.rs
-index 774e38ab..e0eba48a 100644
+index 774e38ab..34c4b790 100644
 --- a/crates/sdroxide-pluto/tests/iiod_loopback.rs
 +++ b/crates/sdroxide-pluto/tests/iiod_loopback.rs
-@@ -74,6 +74,9 @@ const CONTEXT_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
-     <debug-attribute name="adi,gpo3-slave-tx-enable" />
-     <debug-attribute name="adi,elna-rx1-gpo0-control-enable" />
-     <debug-attribute name="adi,elna-rx2-gpo1-control-enable" />
-+    <debug-attribute name="adi,gpo-manual-mode-enable" />
-+    <debug-attribute name="adi,gpo-manual-mode-enable-mask" />
-+    <debug-attribute name="gpo_set" />
-     <debug-attribute name="initialize" />
-   </device>
-   <device id="iio:device3" name="cf-ad9361-lpc">
-@@ -2220,3 +2223,138 @@ fn a_chain_found_in_the_wrong_mode_is_put_right_and_the_gain_retried() {
+@@ -2220,3 +2220,70 @@ fn a_chain_found_in_the_wrong_mode_is_put_right_and_the_gain_retried() {
              && g.get("ad9361-phy/INPUT/voltage1/hardwaregain").is_some_and(|v| v.starts_with("11"))
      });
  }
@@ -948,172 +614,138 @@ index 774e38ab..e0eba48a 100644
 +    drop(r0);
 +    rig.release();
 +}
+diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
+index c7250ac6..2970b040 100644
+--- a/crates/sdroxide-proto/src/lib.rs
++++ b/crates/sdroxide-proto/src/lib.rs
+@@ -1609,7 +1609,14 @@ use sdroxide_types::{
+ /// so a v185 peer reads the extra bytes as the start of the next field and
+ /// fails to decode every digital status, the same break as every appended field
+ /// before it.
+-pub const PROTO_VERSION: u16 = 186;
++///
++/// v187: the PlutoSDR's second receive chain can serve the RX1 radio as a
++/// second aerial or as PureSignal feedback (issue #525). `PlutoConfig` gains
++/// `aux` (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses) on
++/// its tail, and the radio configuration rides whole in both a command and an
++/// event, so a v186 peer reads the extra bytes as the start of the next field
++/// and fails to decode either.
++pub const PROTO_VERSION: u16 = 187;
+ const VERSION_BYTE: u8 = 0x12;
+ 
+ #[derive(Debug, thiserror::Error)]
+diff --git a/crates/sdroxide-types/src/lib.rs b/crates/sdroxide-types/src/lib.rs
+index 8c8b43ca..441947c4 100644
+--- a/crates/sdroxide-types/src/lib.rs
++++ b/crates/sdroxide-types/src/lib.rs
+@@ -236,14 +236,15 @@ pub use radio::{
+     IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, KiwiConfig,
+     LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, MAX_TRANSVERTERS, ModeControl,
+     PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
+-    PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
+-    RS_HFIQ_CAT_BAUD, RadioConfig, RtlSdrAgc, RtlSdrConfig, RtlSdrDevice, RtlSdrHfMode,
+-    RtlTcpConfig, Rx888Config, Rx888Device, RxSite, SdrPlayAgc, SdrPlayConfig, SdrPlayDevice,
+-    SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayHdrBw, SdrPlayModel, SerialConfig,
+-    SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat, SpyServerConfig,
+-    SpyServerFormat, StopBits, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ, TciConfig, TrUsdxAudio,
+-    Transverter, cat_iq_offset_max_hz, converter_preset_name, diversity_cost_note, elad_cat_baud,
+-    format_freq_ranges, hackrf_serial_matches, hpsdr_alex_oc, hpsdr_n2adr_oc, parse_freq_ranges,
++    PlutoAuxConfig, PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ,
++    QMX_IQ_RATE_HZ, RS_HFIQ_CAT_BAUD, RadioConfig, RtlSdrAgc, RtlSdrConfig, RtlSdrDevice,
++    RtlSdrHfMode, RtlTcpConfig, Rx888Config, Rx888Device, RxSite, SdrPlayAgc, SdrPlayConfig,
++    SdrPlayDevice, SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayHdrBw, SdrPlayModel,
++    SerialConfig, SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat,
++    SpyServerConfig, SpyServerFormat, StopBits, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ, TciConfig,
++    TrUsdxAudio, Transverter, cat_iq_offset_max_hz, converter_preset_name, diversity_cost_note,
++    elad_cat_baud, format_freq_ranges, hackrf_serial_matches, hpsdr_alex_oc, hpsdr_n2adr_oc,
++    parse_freq_ranges,
+ };
+ pub use rds::{
+     RdsClock, RdsData, RdsGroupLog, RdsStandard, RdsStats, RtPlus, af_code_hz, pi_callsign,
+diff --git a/crates/sdroxide-types/src/radio.rs b/crates/sdroxide-types/src/radio.rs
+index 72f5a445..dcd1140c 100644
+--- a/crates/sdroxide-types/src/radio.rs
++++ b/crates/sdroxide-types/src/radio.rs
+@@ -5322,6 +5322,18 @@ impl PlutoPtt {
+     }
+ }
+ 
++/// The Pluto's second receive chain, and what is done with it.
++///
++/// The same block a LimeSDR's second chain uses ([`LimeAuxConfig`]), because it
++/// is the same idea on the same kind of part: two receive chains on one
++/// synthesiser and one clock, so the second hears the same span at the same
++/// instant as the first. The DSP behind it — the adaptive combiner and the
++/// predistortion loop — is shared too, and so are its controls.
++///
++/// [`LimeAuxConfig::antenna`] is not used on a Pluto: the AD9361 selects one
++/// receive port for both chains.
++pub type PlutoAuxConfig = LimeAuxConfig;
 +
-+/// Issue #525: an amplifier switched in and out from a GPO pin. The pin is put
-+/// in manual mode *at the level asked for* before the commit, so the amplifier
-+/// is never switched the wrong way for the length of an open, and flipping it
-+/// afterwards is one `gpo_set` — no reinitialise, so nothing is retuned.
-+#[test]
-+fn a_gpo_pin_switches_the_amplifier_in_fdd() {
-+    let fake = Fake::start();
-+    let cfg = PlutoConfig {
-+        pa_gpo: sdroxide_types::PlutoPaPin::Gpo2,
-+        pa_on: true,
-+        full_duplex: true,
-+        ..config()
-+    };
-+    let rig = sdroxide_pluto::PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
-+    let r0 = rig.rx(0).expect("attach chain 0");
-+    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
-+    {
-+        let g = fake.state.lock().expect("lock");
-+        let debug = |attr: &str| g.get(&format!("ad9361-phy/DEBUG/{attr}")).map(str::to_string);
-+        assert_eq!(debug("adi,gpo-manual-mode-enable").as_deref(), Some("1"));
-+        assert_eq!(debug("adi,gpo-manual-mode-enable-mask").as_deref(), Some("4"));
-+        assert_eq!(debug("gpo_set").as_deref(), Some("2 1"));
-+        // Still FDD: this is not the PTT pair, and full duplex survives it.
-+        assert_eq!(debug("adi,frequency-division-duplex-mode-enable"), None);
-+        let at = |key: &str| g.attrs.iter().position(|(k, _)| k == key).expect(key);
-+        assert!(
-+            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable-mask")
-+                < at("ad9361-phy/DEBUG/initialize")
-+                && at("ad9361-phy/DEBUG/initialize")
-+                    < at("ad9361-phy/INPUT/voltage0/sampling_frequency"),
-+            "level, then commit, then the front end the commit would undo"
-+        );
-+    }
-+    assert!(r0.pa_available());
-+    r0.set_pa(false);
-+    wait_for("the bypass", || {
-+        fake.state.lock().unwrap().get("ad9361-phy/DEBUG/gpo_set") == Some("2 0")
-+    });
-+    let inits = fake.state.lock().unwrap().writes_of("ad9361-phy/DEBUG/initialize").len();
-+    assert_eq!(inits, 1, "flipping the switch must not reinitialise the part");
-+    drop(r0);
-+    rig.release();
-+}
-+
-+/// The amplifier pin and the PTT pair want the same four pins in different
-+/// modes, so asking for both keeps the PTT pair and says why the switch is off.
-+#[test]
-+fn an_amplifier_pin_beside_a_ptt_pair_is_refused_and_says_so() {
-+    let fake = Fake::start();
-+    let cfg = PlutoConfig {
-+        pa_gpo: sdroxide_types::PlutoPaPin::Gpo0,
-+        ptt_gpo: sdroxide_types::PlutoPtt::Gpo23,
-+        ..config()
-+    };
-+    let rig = sdroxide_pluto::PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
-+    let r0 = rig.rx(0).expect("attach chain 0");
-+    let status = rig.open_status().unwrap_or_default();
-+    assert!(status.contains("amplifier switch"), "{status}");
-+    {
-+        let g = fake.state.lock().expect("lock");
-+        assert_eq!(g.get("ad9361-phy/DEBUG/gpo_set"), None);
-+        assert_ne!(g.get("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable"), Some("1"));
-+    }
-+    assert!(!r0.pa_available());
-+    drop(r0);
-+    rig.release();
-+}
--- 
-2.43.0
-
-
-From 6df63b8d77dbb1051202659fa034b2ebf5637baf Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Wed, 23 Sep 2026 12:30:22 -0400
-Subject: [PATCH 3/7] PlutoSDR: RX2 as diversity or PureSignal feedback for the
- RX1 radio, and a PA bypass switch in the settings (#525)
-
-The RX1 radio can borrow RX2 as a second aerial, combined by the shared
-adaptive filter and driven from the main window's DIV strip, or as the
-coupler PureSignal learns the amplifier from; PureSignal needs full duplex.
-The Pluto settings gain an amplifier pin, an active-low option and a live
-PA on/bypass switch. Documented in the manual's PlutoSDR section. Not yet
-verified against hardware.
----
- crates/sdroxide-ui/src/app/settings/radio.rs | 274 +++++++++++-
- docs/USER_MANUAL.md                          |  38 ++
- src/main.rs                                  |   3 +
- src/pluto_source.rs                          | 413 ++++++++++++++++++-
- 4 files changed, 719 insertions(+), 9 deletions(-)
-
+ /// ADALM-Pluto (PlutoSDR) backend configuration.
+ ///
+ /// The device is reached over the network — which the USB cable already
+@@ -5400,6 +5412,16 @@ pub struct PlutoConfig {
+     /// whole time in FDD, so nothing would ever toggle.
+     #[serde(default)]
+     pub ptt_gpo: PlutoPtt,
++    /// The second receive chain on a 2R2T firmware, used by this radio as a
++    /// second aerial (diversity) or as transmit feedback (PureSignal) rather
++    /// than by a radio tab of its own (issue #525).
++    ///
++    /// Only honoured on the RX1 radio — it owns the transmitter and the chain
++    /// being borrowed is RX2. While it is on, RX2 is not free for another tab.
++    /// PureSignal also needs [`Self::full_duplex`]: the coupler is only heard
++    /// if receive keeps running through the over.
++    #[serde(default)]
++    pub aux: PlutoAuxConfig,
+ }
+ 
+ impl Default for PlutoConfig {
+@@ -5423,6 +5445,7 @@ impl Default for PlutoConfig {
+             full_duplex: false,
+             duplex: PlutoDuplex::default(),
+             ptt_gpo: PlutoPtt::default(),
++            aux: PlutoAuxConfig::default(),
+         }
+     }
+ }
+@@ -5444,6 +5467,19 @@ impl PlutoConfig {
+     /// renders them as sliders — the Pluto settings panel drives them directly.
+     pub const AGC_ELEMENT: &'static str = "AGC";
+     pub const PPM_ELEMENT: &'static str = "PPM";
++    /// The second chain and what it feeds — the same names a LimeSDR's use, so
++    /// the main window's diversity strip drives either without knowing which
++    /// board is behind it.
++    pub const AUX_GAIN_ELEMENT: &'static str = LimeConfig::AUX_GAIN_ELEMENT;
++    pub const DIV_MODE_ELEMENT: &'static str = DIV_MODE_ELEMENT;
++    pub const DIV_RATE_ELEMENT: &'static str = DIV_RATE_ELEMENT;
++    pub const DIV_TAPS_ELEMENT: &'static str = DIV_TAPS_ELEMENT;
++    pub const DIV_FREEZE_ELEMENT: &'static str = DIV_FREEZE_ELEMENT;
++    pub const DIV_RESET_ELEMENT: &'static str = DIV_RESET_ELEMENT;
++    pub const PS_BINS_ELEMENT: &'static str = LimeConfig::PS_BINS_ELEMENT;
++    pub const PS_RATE_ELEMENT: &'static str = LimeConfig::PS_RATE_ELEMENT;
++    pub const PS_FREEZE_ELEMENT: &'static str = LimeConfig::PS_FREEZE_ELEMENT;
++    pub const PS_RESET_ELEMENT: &'static str = LimeConfig::PS_RESET_ELEMENT;
+ 
+     /// Sample rates offered in the UI.
+     ///
 diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index a8e20e69..ad918dcb 100644
+index 506ab49f..c902a423 100644
 --- a/crates/sdroxide-ui/src/app/settings/radio.rs
 +++ b/crates/sdroxide-ui/src/app/settings/radio.rs
-@@ -3171,7 +3171,10 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -3173,7 +3173,9 @@ pub(in crate::app) fn settings_pluto_tab(
      can_probe: bool,
      cmds: &mut Vec<Command>,
  ) {
 -    use sdroxide_types::{PlutoAgc, PlutoConfig, PlutoDuplex, PlutoPtt};
 +    use sdroxide_types::{
-+        DiversityMode, LimeAuxRole, PlutoAgc, PlutoAuxConfig, PlutoConfig, PlutoDuplex, PlutoPaPin,
-+        PlutoPtt,
++        DiversityMode, LimeAuxRole, PlutoAgc, PlutoAuxConfig, PlutoConfig, PlutoDuplex, PlutoPtt,
 +    };
      let Some(cfg) = radio_edit.as_mut() else {
          ui.label("Waiting for the configuration of the machine the radio is attached to.");
          return;
-@@ -3433,6 +3436,57 @@ pub(in crate::app) fn settings_pluto_tab(
-         cfg.pluto.ptt_gpo = ptt;
-         ui.end_row();
- 
-+        // The amplifier switch (issue #525). The pin and its polarity are part
-+        // of how the connection is set up, so they wait for Apply; the switch
-+        // itself is one register write and goes at once.
-+        ui.label("Amplifier pin").on_hover_text(
-+            "For a board whose amplifier can be switched in or bypassed from one of \
-+             the AD9361's GPO pins — the PlutoSky R2 \"with PA\" is one. Pick the pin \
-+             the board wires to the amplifier's enable (the schematic says which; failing \
-+             that, try each with a dummy load on the output).\n\nThis puts the GPO pins \
-+             in manual mode, so it cannot be used together with the PTT pins above — \
-+             but unlike them it works in FDD, alongside Full duplex and PureSignal.\n\n\
-+             Takes effect on Apply.",
-+        );
-+        let mut pa = cfg.pluto.pa_gpo;
-+        enum_combo(ui, "pluto_pa_pin", &mut pa, &PlutoPaPin::ALL, PlutoPaPin::label);
-+        cfg.pluto.pa_gpo = pa;
-+        ui.end_row();
-+
-+        if cfg.pluto.pa_gpo != PlutoPaPin::Off {
-+            ui.label("Amplifier");
-+            ui.horizontal(|ui| {
-+                if crate::chrome::checkbox(ui, &mut cfg.pluto.pa_on, "Switched in (PA on)")
-+                    .on_hover_text(
-+                        "On: the amplifier is in the transmit path. Off: it is bypassed. \
-+                         Applies immediately, and is remembered for the next start. Turn \
-+                         the TX gain down before switching it in the first time.",
-+                    )
-+                    .changed()
-+                {
-+                    push_gain(cmds, PlutoConfig::PA_ELEMENT, f64::from(u8::from(cfg.pluto.pa_on)));
-+                }
-+                crate::chrome::checkbox(ui, &mut cfg.pluto.pa_active_low, "Active low")
-+                    .on_hover_text(
-+                        "Tick if the board switches its amplifier in when the pin is \
-+                         driven LOW. If \"Switched in\" does the opposite of what it \
-+                         says, this is the setting to change. Takes effect on Apply.",
-+                    );
-+            });
-+            ui.end_row();
-+            if cfg.pluto.ptt_gpo != PlutoPtt::Off {
-+                ui.label("");
-+                ui.label(
-+                    RichText::new(
-+                        "The PTT pins are on, and they take the GPO pins away from manual \
-+                         control — set them to Off to use the amplifier switch.",
-+                    )
-+                    .color(crate::theme::YELLOW()),
-+                );
-+                ui.end_row();
-+            }
-+        }
-+
-         // Next to Full duplex because it belongs to the same subject: both are
-         // about what the link between here and the board can carry, not about
-         // what the AD9361 can do. This one used to be reachable only by hand-
-@@ -3532,6 +3586,224 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -3534,6 +3536,224 @@ pub(in crate::app) fn settings_pluto_tab(
  
      test_result_line(ui, test_result);
  
@@ -1339,31 +971,10 @@ index a8e20e69..ad918dcb 100644
      ui.label(
          RichText::new(
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index f563480f..4859508e 100644
+index 84ce4c45..a56bb008 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -9054,6 +9054,20 @@ configured in exactly the same way as one on your desk.
-   no host software in the loop. **Off**, **GPO0 = RX, GPO1 = TX**, or **GPO2 =
-   RX, GPO3 = TX**. Picking a pair puts the radio in TDD whatever *Duplex* says.
-   See *Keying an external amplifier*, below. Takes effect on Apply.
-+- **Amplifier pin**, **Amplifier** — for a board whose amplifier can be
-+  switched in or bypassed from one of the AD9361's GPO pins, such as the
-+  PlutoSky R2 "with PA" (issue #525). Choose the pin the board wires to the
-+  amplifier's enable, then use **Switched in (PA on)** to put the amplifier in
-+  the transmit path or bypass it — that checkbox applies at once and is
-+  remembered for the next start. Tick **Active low** if the board switches the
-+  amplifier in when the pin is driven low (if the switch does the opposite of
-+  what it says, this is the setting). The pin is put in the AD9361's *manual*
-+  GPO mode, so unlike the PTT pins it works in FDD, beside Full duplex and
-+  PureSignal — and for the same reason the two cannot be used together: with
-+  PTT pins chosen the amplifier switch stays off and the connect note says why.
-+  Which pin a board uses is up to its maker; check the schematic, or try each
-+  with a dummy load and the TX gain turned right down. The pin and the polarity
-+  take effect on Apply.
- - **Buffer size** — how much the radio holds before each transfer, in complex
-   samples, with the airtime and byte count it works out to shown beside it. The
-   default of 32768 is about 16 ms at 2 Msps: long enough that the per-transfer
-@@ -9073,6 +9087,30 @@ configured in exactly the same way as one on your desk.
+@@ -9557,6 +9557,31 @@ configured in exactly the same way as one on your desk.
    the AD9361 ignores a gain written then; set the AGC to *Manual* to use it
    (issue #417).
  
@@ -1388,17 +999,18 @@ index f563480f..4859508e 100644
 +so both aerials show about the same noise floor; for PureSignal, start at the
 +bottom and keep the coupled signal well out of compression. While RX2 is used
 +here it cannot be a second radio tab. Changing what it is used for takes effect
-+on Apply; the other controls apply immediately. **Not yet verified against
-+hardware** — reports with the diagnostic report attached are welcome.
++on Apply; the other controls apply immediately. Diversity has been tried on a
++PlutoSky R2; **PureSignal is not yet verified against hardware** — reports with
++the diagnostic report attached are welcome.
 +
  **AD9363 or AD9364.** A stock Pluto is an AD9363 and covers **325 MHz–3.8 GHz**;
  a great many have had the well-known firmware change applied, which turns them
  into an AD9364 covering **70 MHz–6 GHz** with a 56 MHz filter. sdroxide does not
 diff --git a/src/main.rs b/src/main.rs
-index b7cd10e3..94c8c3fc 100644
+index ea97f110..1e577436 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -2421,6 +2421,9 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
+@@ -2452,6 +2452,9 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
          // sibling radio's retune moves this radio's centre too (and vice
          // versa). Stated only when a sibling is possible.
          shared_lo_rx: src.rx_chains() > 1,
@@ -1409,13 +1021,17 @@ index b7cd10e3..94c8c3fc 100644
      }
  }
 diff --git a/src/pluto_source.rs b/src/pluto_source.rs
-index f668487b..c1ff9a59 100644
+index f668487b..2362fe88 100644
 --- a/src/pluto_source.rs
 +++ b/src/pluto_source.rs
-@@ -22,13 +22,31 @@
+@@ -22,13 +22,24 @@
  //! SoapySDR path does for the same reason — it asks the engine to park the LO a
  //! quarter-span away ([`IqSource::lo_offset_hz`]) and DC-blocks the stream
  //! before anything downstream sees it.
+-
+-use std::time::Duration;
+-
+-use sdroxide_dsp::ComplexDcBlock;
 +//!
 +//! # The second chain as this radio's own (issue #525)
 +//!
@@ -1427,18 +1043,9 @@ index f668487b..c1ff9a59 100644
 +//! hardware interleaves the two, and `PlutoRx::rx_read_paired` keeps them that
 +//! way on the host. PureSignal also needs full duplex, since the coupler is
 +//! only heard while receive keeps running through the over.
-+//!
-+//! # The amplifier switch
-+//!
-+//! A board whose amplifier is switched in and out from a GPO pin (the
-+//! PlutoSky R2 "with PA") gets that switch as a pseudo-gain element,
-+//! [`PlutoConfig::PA_ELEMENT`], set up on the connection by
-+//! `Phy::setup_pa_switch`.
- 
--use std::time::Duration;
++
 +use std::time::{Duration, Instant};
- 
--use sdroxide_dsp::ComplexDcBlock;
++
 +use sdroxide_dsp::{ComplexDcBlock, Diversity, PureSignal};
  use sdroxide_pluto::{PlutoRig, PlutoRx};
  use sdroxide_radio::{Complex32, ControlUpdate, DC_BLOCK_HZ, IqSource, Result, lo_offset_for};
@@ -1447,13 +1054,24 @@ index f668487b..c1ff9a59 100644
  
  use crate::device_registry::{DeviceKey, SharedDevice, registry};
  
-@@ -55,6 +73,29 @@ impl SharedDevice for PlutoRig {
+@@ -55,6 +66,40 @@ impl SharedDevice for PlutoRig {
  /// teardown here.
  const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(10);
  
 +/// How often the diversity filter's null depth, or the predistortion loop's
 +/// state, reaches the log — the same cadence the LimeSDR backend keeps.
 +const AUX_LOG_INTERVAL: Duration = Duration::from_secs(10);
++
++/// How far back PureSignal may look for the transmission in RX2's samples.
++///
++/// The LimeSDR's tenth of a second is far too short here, and that is what a
++/// first test on a PlutoSky R2 showed as `PS --` on every over: between the
++/// predistorter and the coupler's samples coming back lie the host's transmit
++/// ring, the board's DMA buffers in both directions, the network twice, and
++/// the receive ring — easily a few hundred milliseconds. One second covers it
++/// with room to spare; the search is throttled so the longer history costs
++/// nothing while unlocked.
++const PS_HISTORY_S: f64 = 1.0;
 +
 +/// The second receive chain, borrowed by the RX1 radio (issue #525).
 +struct Aux {
@@ -1477,7 +1095,7 @@ index f668487b..c1ff9a59 100644
  pub struct PlutoSource {
      /// The shared connection and this source's stream on it. `None` after
      /// [`IqSource::release`]: the stream is given back so a rebuilt source
-@@ -75,6 +116,18 @@ pub struct PlutoSource {
+@@ -75,6 +120,18 @@ pub struct PlutoSource {
      /// gain so a panel can tell that the gain register is the AD9361's while
      /// an attack mode runs, and a gain slider moves nothing (issue #417).
      agc: PlutoAgc,
@@ -1496,17 +1114,11 @@ index f668487b..c1ff9a59 100644
  }
  
  impl PlutoSource {
-@@ -110,7 +163,19 @@ impl PlutoSource {
+@@ -110,7 +167,13 @@ impl PlutoSource {
              "PlutoSDR source ready: {label}, centre {center_hz:.0} Hz, \
               LO offset {lo_offset:.0} Hz (0 = LO on the VFO)"
          );
 +        let (aux, aux_note) = Self::open_aux(&rig, cfg, rate);
-+        // Where the operator left it. The connection set the pin up at this
-+        // level already; saying it again costs one write and covers a
-+        // connection another radio opened with an older copy of the setting.
-+        if cfg.rx == 0 && rx.pa_available() {
-+            rx.set_pa(cfg.pa_on);
-+        }
          Ok(PlutoSource {
 +            aux,
 +            aux_note,
@@ -1516,7 +1128,7 @@ index f668487b..c1ff9a59 100644
              center: center_hz,
              rx_scratch: Vec::new(),
              tx_scratch: Vec::new(),
-@@ -124,6 +189,101 @@ impl PlutoSource {
+@@ -124,6 +187,106 @@ impl PlutoSource {
          })
      }
  
@@ -1568,7 +1180,12 @@ index f668487b..c1ff9a59 100644
 +            Diversity::new(div_mode(cfg.aux.mode), usize::from(cfg.aux.taps), cfg.aux.rate)
 +        });
 +        let puresignal = (role == LimeAuxRole::PureSignal).then(|| {
-+            let mut ps = PureSignal::new(usize::from(cfg.aux.ps_bins), cfg.aux.ps_rate, rate);
++            let mut ps = PureSignal::with_history(
++                usize::from(cfg.aux.ps_bins),
++                cfg.aux.ps_rate,
++                rate,
++                PS_HISTORY_S,
++            );
 +            ps.set_frozen(cfg.aux.ps_frozen);
 +            ps
 +        });
@@ -1618,7 +1235,7 @@ index f668487b..c1ff9a59 100644
      /// What the device says it can do — the source of every figure in
      /// `pluto_caps`.
      pub fn limits(&self) -> Option<&sdroxide_pluto::PlutoLimits> {
-@@ -149,7 +309,15 @@ impl PlutoSource {
+@@ -149,7 +312,15 @@ impl PlutoSource {
          if self.rx_scratch.len() < need {
              self.rx_scratch.resize(need, 0.0);
          }
@@ -1635,7 +1252,7 @@ index f668487b..c1ff9a59 100644
          let pairs = n / 2;
          if pairs == 0 {
              if wait {
-@@ -165,9 +333,184 @@ impl PlutoSource {
+@@ -165,9 +336,189 @@ impl PlutoSource {
          // the hardware, not of the stream, so carrying the estimate avoids a
          // re-convergence transient every time receive resumes.
          self.dc.process(&mut buf[..pairs]);
@@ -1807,7 +1424,12 @@ index f668487b..c1ff9a59 100644
 +                aux.cfg.ps_bins = bins;
 +                if aux.puresignal.is_some() {
 +                    // A new table means learning it again.
-+                    let mut ps = PureSignal::new(usize::from(bins), aux.cfg.ps_rate, self.rate);
++                    let mut ps = PureSignal::with_history(
++                        usize::from(bins),
++                        aux.cfg.ps_rate,
++                        self.rate,
++                        PS_HISTORY_S,
++                    );
 +                    ps.set_frozen(aux.cfg.ps_frozen);
 +                    aux.puresignal = Some(ps);
 +                }
@@ -1820,7 +1442,7 @@ index f668487b..c1ff9a59 100644
      /// How many receive chains this firmware streams.
      pub fn rx_chains(&self) -> u8 {
          self.rig.as_deref().map_or(1, PlutoRig::rx_chains)
-@@ -202,6 +545,12 @@ impl IqSource for PlutoSource {
+@@ -202,6 +553,12 @@ impl IqSource for PlutoSource {
      /// the engine to adopt — the chains share the one synthesiser, so this
      /// source's span moved whether its operator asked or not.
      fn poll_control(&mut self) -> Vec<ControlUpdate> {
@@ -1833,28 +1455,34 @@ index f668487b..c1ff9a59 100644
          let Some(rx) = self.rx.as_ref() else { return Vec::new() };
          rx.poll_lo_moves()
              .into_iter()
-@@ -241,7 +590,10 @@ impl IqSource for PlutoSource {
+@@ -241,7 +598,9 @@ impl IqSource for PlutoSource {
                  rx.set_agc_mode(self.agc.iio_name());
              }
              PlutoConfig::PPM_ELEMENT => rx.set_ppm(db),
 -            _ => {}
-+            PlutoConfig::PA_ELEMENT => rx.set_pa(db >= 0.5),
 +            other => {
 +                self.set_aux_element(other, db);
 +            }
          }
          Ok(())
      }
-@@ -298,6 +650,8 @@ impl IqSource for PlutoSource {
+@@ -298,6 +657,15 @@ impl IqSource for PlutoSource {
      }
  
      fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {
 +        self.tx_hz = center_hz;
 +        self.transmitting = true;
++        // A new over: the table (the amplifier's curve) carries over, but the
++        // two sample counts the alignment is measured between restart here,
++        // so the delay is found afresh rather than inherited from an over
++        // whose tail never reached the coupler.
++        if let Some(ps) = self.aux.as_mut().and_then(|a| a.puresignal.as_mut()) {
++            ps.unlock();
++        }
          match self.rx.as_ref() {
              Some(rx) => Ok(rx.tx_begin(center_hz)),
              None => Ok(0.0),
-@@ -306,6 +660,18 @@ impl IqSource for PlutoSource {
+@@ -306,6 +674,18 @@ impl IqSource for PlutoSource {
  
      fn tx_write(&mut self, samples: &[Complex32]) -> Result<()> {
          let Some(rx) = self.rx.as_mut() else { return Ok(()) };
@@ -1873,7 +1501,7 @@ index f668487b..c1ff9a59 100644
          self.tx_scratch.clear();
          self.tx_scratch.reserve(samples.len() * 2);
          for s in samples {
-@@ -329,6 +695,7 @@ impl IqSource for PlutoSource {
+@@ -329,6 +709,7 @@ impl IqSource for PlutoSource {
      }
  
      fn tx_end(&mut self) -> Result<()> {
@@ -1881,7 +1509,7 @@ index f668487b..c1ff9a59 100644
          if let Some(rx) = self.rx.as_ref() {
              rx.tx_end();
          }
-@@ -346,8 +713,12 @@ impl IqSource for PlutoSource {
+@@ -346,8 +727,12 @@ impl IqSource for PlutoSource {
          if self.full_duplex() {
              return;
          }
@@ -1896,7 +1524,7 @@ index f668487b..c1ff9a59 100644
          }
      }
  
-@@ -363,7 +734,22 @@ impl IqSource for PlutoSource {
+@@ -363,7 +748,22 @@ impl IqSource for PlutoSource {
      }
  
      fn open_status(&self) -> Option<String> {
@@ -1920,7 +1548,7 @@ index f668487b..c1ff9a59 100644
      }
  
      /// A Pluto that has stopped delivering samples — unplugged, rebooted, its
-@@ -406,6 +792,9 @@ impl IqSource for PlutoSource {
+@@ -406,6 +806,9 @@ impl IqSource for PlutoSource {
      /// do with what broke the link. Shutting the sockets down here ends that
      /// read at once, whether or not a sibling still holds the `Arc`.
      fn release(&mut self) {
@@ -1930,7 +1558,7 @@ index f668487b..c1ff9a59 100644
          self.rx = None;
          let Some(rig) = self.rig.take() else { return };
          if !rig.is_alive() {
-@@ -414,3 +803,11 @@ impl IqSource for PlutoSource {
+@@ -414,3 +817,11 @@ impl IqSource for PlutoSource {
          // and the drop below closes a healthy one, if this was the last holder
      }
  }
@@ -1946,494 +1574,63 @@ index f668487b..c1ff9a59 100644
 2.43.0
 
 
-From d22e61022fcab8794b1286fd9ace224532fdc905 Mon Sep 17 00:00:00 2001
-From: Claude <noreply@anthropic.com>
-Date: Wed, 23 Sep 2026 13:50:35 -0400
-Subject: [PATCH 4/7] PlutoSDR: switch the amplifier without reinitialising the
- AD9361 (#525)
-
-adi,gpo-manual-mode-enable is stored straight into the driver's gpo_ctrl,
-and gpo_set sets GPO_MANUAL_SELECT itself, so the amplifier pin needs only
-those two writes, the same ones that work from the board's shell. Dropping
-the initialize keeps the front end, and a sibling radio on the same
-connection, undisturbed. The settings and the manual now say to power the
-board from both USB ports with the amplifier in.
----
- crates/sdroxide-pluto/src/phy.rs             | 78 ++++++--------------
- crates/sdroxide-pluto/tests/iiod_loopback.rs | 20 +++--
- crates/sdroxide-ui/src/app/settings/radio.rs |  4 +-
- docs/USER_MANUAL.md                          |  9 ++-
- 4 files changed, 42 insertions(+), 69 deletions(-)
-
-diff --git a/crates/sdroxide-pluto/src/phy.rs b/crates/sdroxide-pluto/src/phy.rs
-index ad3daf78..a7e5b737 100644
---- a/crates/sdroxide-pluto/src/phy.rs
-+++ b/crates/sdroxide-pluto/src/phy.rs
-@@ -80,20 +80,21 @@ const ELNA_GPO: [&str; 2] =
-     ["adi,elna-rx1-gpo0-control-enable", "adi,elna-rx2-gpo1-control-enable"];
- /// How many general-purpose output pins an AD9361 has.
- const GPO_PINS: u8 = 4;
--/// The device-tree property that hands all four GPO pins to manual control —
--/// set from the host rather than slaved to the enable-state machine. Like
--/// [`FDD_ENABLE`] it does nothing until [`INITIALIZE`] is written. It is one
--/// switch for all four pins (the part's `GPO_MANUAL_SELECT` bit), which is why
--/// the amplifier pin and the PTT pair cannot be used together.
-+/// The device-tree property that lets the host drive the GPO pins by hand
-+/// rather than have them slaved to the enable-state machine.
-+///
-+/// Unlike [`FDD_ENABLE`] this one needs no [`INITIALIZE`] to matter: the
-+/// driver's debugfs write stores straight into the same `gpo_ctrl` field that
-+/// [`GPO_SET`] checks, and `gpo_set` itself sets the part's
-+/// `GPO_MANUAL_SELECT` bit. So the amplifier can be set up without resetting
-+/// the front end. That bit is one switch for all four pins, which is why the
-+/// amplifier pin and the PTT pair cannot be used together.
- const GPO_MANUAL_ENABLE: &str = "adi,gpo-manual-mode-enable";
--/// The levels the pins come up at when manual mode is initialised, bit `n` for
--/// GPO`n`. Written before [`INITIALIZE`] so the amplifier is never switched the
--/// wrong way for the length of an open.
--const GPO_MANUAL_MASK: &str = "adi,gpo-manual-mode-enable-mask";
- /// The driver's debugfs entry that sets one manual GPO live: `"<pin> <level>"`.
--/// Refused unless [`GPO_MANUAL_ENABLE`] was set at the last initialise. It
--/// takes effect at once, with no reinitialise, so flipping the amplifier costs
--/// one round trip and nothing on the receive side.
-+/// Refused (`-EINVAL`) unless [`GPO_MANUAL_ENABLE`] is set. It takes effect at
-+/// once, so flipping the amplifier costs one round trip and nothing on the
-+/// receive side. The driver also records the level in its manual-mode mask,
-+/// so a later `initialize` puts the pin back where it was left.
- const GPO_SET: &str = "gpo_set";
- /// The four slave bits this backend ever sets — one per pin, in the direction
- /// [`PlutoPtt`] gives it. Finding one of them set on a board that is not in FDD
-@@ -991,11 +992,13 @@ impl Phy {
-     /// and out from a GPO (issue #525). Answers whether [`Self::set_pa`] will
-     /// work afterwards.
-     ///
--    /// Runs after [`Self::setup_tr_switching`] and, like it, before the front
--    /// end is configured: this also ends in [`INITIALIZE`], which puts the
--    /// rate, the filter, the gains and the oscillators back to the board's
--    /// defaults. It is only paid when the pin is not already set up — a board
--    /// found in manual mode from an earlier session just has the level written.
-+    /// Two writes, and no reinitialise: [`GPO_MANUAL_ENABLE`] takes effect as
-+    /// soon as it is written, and [`GPO_SET`] then drives the pin. This is the
-+    /// same sequence as running `echo 1 > adi,gpo-manual-mode-enable` and then
-+    /// `echo <pin> <level> > gpo_set` in the board's debugfs, so if it works by
-+    /// hand it works here. Leaving `initialize` out matters: that resets the
-+    /// rate, the filter, the gains and both oscillators, and on a shared
-+    /// connection it would pull the rug from under a sibling radio.
-     ///
-     /// Refused with a note, never with an error, alongside a PTT pair (the two
-     /// want the same four pins in different modes) and on a firmware without
-@@ -1027,7 +1030,7 @@ impl Phy {
-             warnings.push(msg);
-             return Ok((false, warnings));
-         }
--        for attr in [GPO_MANUAL_ENABLE, GPO_MANUAL_MASK, INITIALIZE, GPO_SET] {
-+        for attr in [GPO_MANUAL_ENABLE, GPO_SET] {
-             if !self.has_debug_attr(attr) {
-                 let msg = format!(
-                     "PlutoSDR: this firmware publishes no {attr}, so {} cannot switch the \
-@@ -1041,34 +1044,8 @@ impl Phy {
-         }
-         let already =
-             conn.read_debug_attr(&self.phy_id, GPO_MANUAL_ENABLE).is_ok_and(|v| v.trim() == "1");
--        if !already {
--            // The pin's level first, so `initialize` brings it up already
--            // right; the other three pins keep whatever the mask had for them.
--            let mask = conn
--                .read_debug_attr(&self.phy_id, GPO_MANUAL_MASK)
--                .ok()
--                .and_then(|v| parse_int(v.trim()))
--                .unwrap_or(0);
--            let bit = 1u32 << pin;
--            let mask = if PlutoPaPin::level(on, active_low) { mask | bit } else { mask & !bit };
--            if !self.write_setup_attr(conn, GPO_MANUAL_MASK, &mask.to_string(), &mut warnings)? {
--                return Ok((false, warnings));
--            }
--            if pin <= 1 {
--                // An external-LNA claim on this pin would fight the switch.
--                let attr = ELNA_GPO[usize::from(pin)];
--                if self.has_debug_attr(attr) {
--                    self.write_setup_attr(conn, attr, "0", &mut warnings)?;
--                }
--            }
--            if !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)?
--                || !self.write_setup_attr(conn, INITIALIZE, "1", &mut warnings)?
--            {
--                return Ok((false, warnings));
--            }
--            // `initialize` leaves an FDD part's state machine where the
--            // driver's setup puts it; `ensure_receiving` at the end of the open
--            // checks it, as it does after `setup_tr_switching`.
-+        if !already && !self.write_setup_attr(conn, GPO_MANUAL_ENABLE, "1", &mut warnings)? {
-+            return Ok((false, warnings));
-         }
-         match self.set_pa(conn, pin, on, active_low) {
-             Ok(()) => {
-@@ -1410,15 +1387,6 @@ fn usable_ports(
- ///
- /// The brackets are part of the value, and the fields are in that order — not
- /// min/max/step, which is the natural reading and the wrong one.
--/// A debug attribute's integer, which the driver prints in decimal but a
--/// firmware may equally print as `0x…`.
--fn parse_int(text: &str) -> Option<u32> {
--    match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
--        Some(hex) => u32::from_str_radix(hex, 16).ok(),
--        None => text.parse().ok(),
--    }
--}
--
- fn parse_range(text: &str) -> Option<(f64, f64, f64)> {
-     let inner = text.trim().trim_start_matches('[').trim_end_matches(']');
-     let mut it = inner.split_whitespace();
-diff --git a/crates/sdroxide-pluto/tests/iiod_loopback.rs b/crates/sdroxide-pluto/tests/iiod_loopback.rs
-index e0eba48a..f5f83b30 100644
---- a/crates/sdroxide-pluto/tests/iiod_loopback.rs
-+++ b/crates/sdroxide-pluto/tests/iiod_loopback.rs
-@@ -2291,10 +2291,11 @@ fn a_borrowed_second_chain_is_read_in_step_with_the_first() {
-     rig.release();
- }
- 
--/// Issue #525: an amplifier switched in and out from a GPO pin. The pin is put
--/// in manual mode *at the level asked for* before the commit, so the amplifier
--/// is never switched the wrong way for the length of an open, and flipping it
--/// afterwards is one `gpo_set` — no reinitialise, so nothing is retuned.
-+/// Issue #525: an amplifier switched in and out from a GPO pin. Manual mode
-+/// takes effect as soon as it is written, so the whole setup is that write
-+/// and one `gpo_set` — the same two commands that work from the board's own
-+/// shell — with no `initialize`, which would reset the front end. Flipping it
-+/// afterwards is one more `gpo_set`.
- #[test]
- fn a_gpo_pin_switches_the_amplifier_in_fdd() {
-     let fake = Fake::start();
-@@ -2311,17 +2312,14 @@ fn a_gpo_pin_switches_the_amplifier_in_fdd() {
-         let g = fake.state.lock().expect("lock");
-         let debug = |attr: &str| g.get(&format!("ad9361-phy/DEBUG/{attr}")).map(str::to_string);
-         assert_eq!(debug("adi,gpo-manual-mode-enable").as_deref(), Some("1"));
--        assert_eq!(debug("adi,gpo-manual-mode-enable-mask").as_deref(), Some("4"));
-         assert_eq!(debug("gpo_set").as_deref(), Some("2 1"));
-         // Still FDD: this is not the PTT pair, and full duplex survives it.
-         assert_eq!(debug("adi,frequency-division-duplex-mode-enable"), None);
-+        assert_eq!(debug("initialize"), None, "the switch must not reset the front end");
-         let at = |key: &str| g.attrs.iter().position(|(k, _)| k == key).expect(key);
-         assert!(
--            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable-mask")
--                < at("ad9361-phy/DEBUG/initialize")
--                && at("ad9361-phy/DEBUG/initialize")
--                    < at("ad9361-phy/INPUT/voltage0/sampling_frequency"),
--            "level, then commit, then the front end the commit would undo"
-+            at("ad9361-phy/DEBUG/adi,gpo-manual-mode-enable") < at("ad9361-phy/DEBUG/gpo_set"),
-+            "gpo_set is refused until manual mode is on"
-         );
-     }
-     assert!(r0.pa_available());
-@@ -2330,7 +2328,7 @@ fn a_gpo_pin_switches_the_amplifier_in_fdd() {
-         fake.state.lock().unwrap().get("ad9361-phy/DEBUG/gpo_set") == Some("2 0")
-     });
-     let inits = fake.state.lock().unwrap().writes_of("ad9361-phy/DEBUG/initialize").len();
--    assert_eq!(inits, 1, "flipping the switch must not reinitialise the part");
-+    assert_eq!(inits, 0, "flipping the switch must not reinitialise the part");
-     drop(r0);
-     rig.release();
- }
-diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index ad918dcb..8f04d91a 100644
---- a/crates/sdroxide-ui/src/app/settings/radio.rs
-+++ b/crates/sdroxide-ui/src/app/settings/radio.rs
-@@ -3460,7 +3460,9 @@ pub(in crate::app) fn settings_pluto_tab(
-                     .on_hover_text(
-                         "On: the amplifier is in the transmit path. Off: it is bypassed. \
-                          Applies immediately, and is remembered for the next start. Turn \
--                         the TX gain down before switching it in the first time.",
-+                         the TX gain down before switching it in the first time, and power \
-+                         the board from both USB ports (or its DC input): the amplifier \
-+                         draws enough that one USB 2.0 port can sag and reboot the Pluto.",
-                     )
-                     .changed()
-                 {
-diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index 4859508e..78b744d7 100644
---- a/docs/USER_MANUAL.md
-+++ b/docs/USER_MANUAL.md
-@@ -9066,8 +9066,13 @@ configured in exactly the same way as one on your desk.
-   PureSignal — and for the same reason the two cannot be used together: with
-   PTT pins chosen the amplifier switch stays off and the connect note says why.
-   Which pin a board uses is up to its maker; check the schematic, or try each
--  with a dummy load and the TX gain turned right down. The pin and the polarity
--  take effect on Apply.
-+  with a dummy load and the TX gain turned right down. **Power the board from
-+  both USB ports** (or its DC input) with the amplifier in: it draws enough
-+  current that a single USB 2.0 port can sag and reboot the Pluto. The switch
-+  is the same as typing `echo 1 > adi,gpo-manual-mode-enable` and then
-+  `echo <pin> <0|1> > gpo_set` in the board's `/sys/kernel/debug/iio/iio:deviceN`
-+  directory, so you can check a pin by hand the same way. It does not
-+  reinitialise the radio. The pin and the polarity take effect on Apply.
- - **Buffer size** — how much the radio holds before each transfer, in complex
-   samples, with the airtime and byte count it works out to shown beside it. The
-   default of 32768 is about 16 ms at 2 Msps: long enough that the per-transfer
--- 
-2.43.0
-
-
-From 538c1410746250c5a6c3485e0112fbde90b6050d Mon Sep 17 00:00:00 2001
-From: yankneck696 <yankneck696@gmail.com>
-Date: Tue, 6 Oct 2026 15:32:43 -0400
-Subject: [PATCH 5/7] PlutoSDR PureSignal: look back a second for the feedback,
- and find the delay afresh each over (#525)
-
-On a PlutoSky R2 over Ethernet PureSignal never locked: the transmission
-comes back on RX2 a few hundred milliseconds after it was predistorted
-(host ring, DMA buffers both ways, the network twice), well past the tenth
-of a second PureSignal::new keeps. PureSignal::with_history takes a longer
-history, and while unlocked the search now runs eight times a second rather
-than on every block, so the longer history costs nothing extra. The Pluto
-uses one second, and unlocks at each key-up so the two sample counts the
-delay is measured between start together. A test covers a delay the default
-history cannot reach.
----
- crates/sdroxide-dsp/src/predistort.rs | 70 +++++++++++++++++++++++++--
- src/pluto_source.rs                   | 32 +++++++++++-
- 2 files changed, 97 insertions(+), 5 deletions(-)
-
-diff --git a/crates/sdroxide-dsp/src/predistort.rs b/crates/sdroxide-dsp/src/predistort.rs
-index 2fa700e2..2d600bf7 100644
---- a/crates/sdroxide-dsp/src/predistort.rs
-+++ b/crates/sdroxide-dsp/src/predistort.rs
-@@ -126,6 +126,13 @@ pub struct PureSignal {
-     check_every: u64,
-     /// How much history to keep, which bounds the delay that can be found.
-     keep: usize,
-+    /// Feedback samples since the last search for the alignment while there
-+    /// is none, and how many must pass between searches. A search costs the
-+    /// whole history times the block, so searching on *every* block while
-+    /// unlocked — fine over a tenth of a second of history — is a gigaflop a
-+    /// second over the second of history a networked radio needs.
-+    since_locate: u64,
-+    locate_every: u64,
- 
-     /// De-rotation and envelope scratch, kept to avoid allocating per block.
-     scratch: Vec<Complex32>,
-@@ -137,12 +144,30 @@ impl PureSignal {
-     /// `sample_rate_hz` sizes the reference history: the loop delay is mostly
-     /// the transmit FIFO, so the history has to span it.
-     pub fn new(bins: usize, rate: f32, sample_rate_hz: f64) -> PureSignal {
--        let bins = bins.clamp(4, 256);
-         // A tenth of a second of history, bounded so a fast device does not
-         // cost eight megabytes: the transmit FIFO is what the delay is made
-         // of, and the engine paces the over to keep it at tens of
-         // milliseconds.
-         let keep = ((sample_rate_hz * 0.1) as usize).clamp(1 << 16, 1 << 19);
-+        Self::with_keep(bins, rate, sample_rate_hz, keep)
-+    }
-+
-+    /// The same, for a radio whose loop delay is longer than a tenth of a
-+    /// second — one reached over a network, where the samples pass through a
-+    /// host ring, the device's own DMA buffers and back again before the
-+    /// feedback arrives (a Pluto, issue #525). `history_s` is how far back the
-+    /// alignment may look; past what it covers the loop simply never locks.
-+    pub fn with_history(bins: usize, rate: f32, sample_rate_hz: f64, history_s: f64) -> PureSignal {
-+        let keep = ((sample_rate_hz * history_s.max(0.1)) as usize).clamp(1 << 16, 1 << 22);
-+        Self::with_keep(bins, rate, sample_rate_hz, keep)
-+    }
-+
-+    fn with_keep(bins: usize, rate: f32, sample_rate_hz: f64, keep: usize) -> PureSignal {
-+        let bins = bins.clamp(4, 256);
-+        let check_every = (sample_rate_hz * 0.5) as u64;
-+        // Eight tries a second while unlocked: quick enough that an over is
-+        // found within its first syllable, rare enough to cost nothing.
-+        let locate_every = (check_every / 4).max(1);
-         PureSignal {
-             table: vec![Complex32::new(1.0, 0.0); bins],
-             alpha: Self::alpha_for_rate(rate),
-@@ -156,8 +181,11 @@ impl PureSignal {
-             score: 0.0,
-             since_check: 0,
-             // Twice a second at any rate people transmit at.
--            check_every: (sample_rate_hz * 0.5) as u64,
-+            check_every,
-             keep,
-+            // So that the very first block is searched at once.
-+            since_locate: locate_every,
-+            locate_every,
-             scratch: Vec::new(),
-             fenv: Vec::new(),
-         }
-@@ -234,6 +262,8 @@ impl PureSignal {
-         self.offset = None;
-         self.score = 0.0;
-         self.since_check = 0;
-+        // Search on the first feedback block of the new over, not a slot later.
-+        self.since_locate = self.locate_every;
-     }
- 
-     /// Bend one block on its way to the transmitter, and keep what was wanted.
-@@ -320,9 +350,12 @@ impl PureSignal {
-         self.fb_total += m as u64;
- 
-         self.since_check += m as u64;
-+        self.since_locate += m as u64;
-         let recheck = self.since_check >= self.check_every;
--        if self.offset.is_none() || recheck {
-+        let searching = self.offset.is_none() && self.since_locate >= self.locate_every;
-+        if searching || recheck {
-             self.since_check = 0;
-+            self.since_locate = 0;
-             self.locate(start, m);
-         }
-         let Some(off) = self.offset else { return false };
-@@ -636,6 +669,37 @@ mod tests {
-         );
-     }
- 
-+    /// A networked radio's loop delay — a Pluto over Ethernet, issue #525 —
-+    /// is hundreds of milliseconds, far past the default history: the
-+    /// default never locks on it, and a history long enough does. Run at a
-+    /// low rate so the test stays quick; what matters is delay against
-+    /// history, not the rate.
-+    #[test]
-+    fn a_long_loop_delay_locks_with_a_long_enough_history() {
-+        let rate = 200_000.0;
-+        // 0.8 s. The default keeps at least 65536 samples and holds up to
-+        // twice that, so at this low rate it reaches 0.65 s; this is past
-+        // that and inside the one-second history.
-+        let delay = 160_000usize;
-+        let run = |mut ps: PureSignal| {
-+            let mut line: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); delay];
-+            let coupler = Complex32::from_polar(0.11, 1.0);
-+            for round in 0..70 {
-+                let mut block = source(8192, 300 + round);
-+                ps.predistort(&mut block);
-+                line.extend(block.iter().map(|s| amplifier(*s) * coupler));
-+                let fb: Vec<Complex32> = line.drain(..8192).collect();
-+                ps.feed_back(&fb, 0.0, rate);
-+            }
-+            ps
-+        };
-+        let short = run(PureSignal::new(32, 0.9, rate));
-+        assert!(!short.locked(), "the default history should not reach a 0.8 s delay");
-+        let long = run(PureSignal::with_history(32, 0.9, rate, 1.0));
-+        assert!(long.locked(), "a one-second history never found it (score {:.2})", long.score());
-+        assert!(long.correction_db() > 0.5, "locked, but learned nothing");
-+    }
-+
-     /// Feedback that is not the transmission — an unconnected coupler, a
-     /// receiver hearing the band instead — never locks, and an unlocked loop
-     /// leaves the transmitter exactly as it was.
-diff --git a/src/pluto_source.rs b/src/pluto_source.rs
-index c1ff9a59..433b0aba 100644
---- a/src/pluto_source.rs
-+++ b/src/pluto_source.rs
-@@ -77,6 +77,17 @@ const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(10);
- /// state, reaches the log — the same cadence the LimeSDR backend keeps.
- const AUX_LOG_INTERVAL: Duration = Duration::from_secs(10);
- 
-+/// How far back PureSignal may look for the transmission in RX2's samples.
-+///
-+/// The LimeSDR's tenth of a second is far too short here, and that is what a
-+/// first test on a PlutoSky R2 showed as `PS --` on every over: between the
-+/// predistorter and the coupler's samples coming back lie the host's transmit
-+/// ring, the board's DMA buffers in both directions, the network twice, and
-+/// the receive ring — easily a few hundred milliseconds. One second covers it
-+/// with room to spare; the search is throttled so the longer history costs
-+/// nothing while unlocked.
-+const PS_HISTORY_S: f64 = 1.0;
-+
- /// The second receive chain, borrowed by the RX1 radio (issue #525).
- struct Aux {
-     rx: PlutoRx,
-@@ -237,7 +248,12 @@ impl PlutoSource {
-             Diversity::new(div_mode(cfg.aux.mode), usize::from(cfg.aux.taps), cfg.aux.rate)
-         });
-         let puresignal = (role == LimeAuxRole::PureSignal).then(|| {
--            let mut ps = PureSignal::new(usize::from(cfg.aux.ps_bins), cfg.aux.ps_rate, rate);
-+            let mut ps = PureSignal::with_history(
-+                usize::from(cfg.aux.ps_bins),
-+                cfg.aux.ps_rate,
-+                rate,
-+                PS_HISTORY_S,
-+            );
-             ps.set_frozen(cfg.aux.ps_frozen);
-             ps
-         });
-@@ -501,7 +517,12 @@ impl PlutoSource {
-                 aux.cfg.ps_bins = bins;
-                 if aux.puresignal.is_some() {
-                     // A new table means learning it again.
--                    let mut ps = PureSignal::new(usize::from(bins), aux.cfg.ps_rate, self.rate);
-+                    let mut ps = PureSignal::with_history(
-+                        usize::from(bins),
-+                        aux.cfg.ps_rate,
-+                        self.rate,
-+                        PS_HISTORY_S,
-+                    );
-                     ps.set_frozen(aux.cfg.ps_frozen);
-                     aux.puresignal = Some(ps);
-                 }
-@@ -652,6 +673,13 @@ impl IqSource for PlutoSource {
-     fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {
-         self.tx_hz = center_hz;
-         self.transmitting = true;
-+        // A new over: the table (the amplifier's curve) carries over, but the
-+        // two sample counts the alignment is measured between restart here,
-+        // so the delay is found afresh rather than inherited from an over
-+        // whose tail never reached the coupler.
-+        if let Some(ps) = self.aux.as_mut().and_then(|a| a.puresignal.as_mut()) {
-+            ps.unlock();
-+        }
-         match self.rx.as_ref() {
-             Some(rx) => Ok(rx.tx_begin(center_hz)),
-             None => Ok(0.0),
--- 
-2.43.0
-
-
-From 2d97ffe5ca9f37010a27e07434e06a394b7f7246 Mon Sep 17 00:00:00 2001
-From: yankneck696 <yankneck696@gmail.com>
-Date: Tue, 6 Oct 2026 17:14:24 -0400
-Subject: [PATCH 6/7] Two-tone test signal on TUNE, and keep up with fast
- receivers through a full-duplex over (#525)
+From e1b666f9ba9afd02ecf6b018a760cbf83e43bbe2 Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 06:40:11 -0400
+Subject: [PATCH 2/2] Two-tone test signal on TUNE, a movable TRANSMIT window,
+ and keep up with fast receivers through a full-duplex over (#525)
 
 A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
-level until clicked again, like the Tone button other SDR programs have:
-the signal amplifier linearity is judged with, and the one PureSignal learns
+level until clicked again, like the Tone button other SDR programs have: the
+signal amplifier linearity is judged with, and the one PureSignal learns
 from, since a steady carrier has a single amplitude. TxState gains two_tone
-and Command gains SetTuneTwoTone; wire protocol v175. Keying and level are
+and Command gains SetTuneTwoTone; wire protocol v188. Keying and level are
 TUNE's own, so every guard on TUNE applies.
+
+On the compact strip the TX chip's drop-down hung over the S-meter, which is
+what an operator watches while setting drive and tune. It now opens a
+TRANSMIT window instead: the same controls, draggable clear of the meter,
+and open through an over until closed.
 
 During a full-duplex over the engine read one 16384-sample block per 10 ms
 tick, a 1.64 Msps ceiling: a 2.083 Msps PlutoSDR dropped a fifth of its
 receive, which is also PureSignal's feedback. It now takes up to four blocks
-a tick when that many are already waiting, still never waiting for more.
+a tick when that many are already waiting, still never waiting for more, and
+each goes to the panadapter as well as the audio, as #652 made it.
 ---
  crates/sdroxide-proto/src/lib.rs      |   7 +-
- crates/sdroxide-radio/src/engine.rs   | 146 ++++++++++++++++++++++++--
- crates/sdroxide-types/src/command.rs  |   4 +
+ crates/sdroxide-radio/src/engine.rs   | 148 ++++++++++++++++++++++++--
+ crates/sdroxide-types/src/command.rs  |   5 +
  crates/sdroxide-types/src/state.rs    |  12 +++
- crates/sdroxide-ui/src/app/top_bar.rs |  83 ++++++++++++---
- docs/USER_MANUAL.md                   |   6 +-
- 6 files changed, 233 insertions(+), 25 deletions(-)
+ crates/sdroxide-ui/src/app/frame.rs   |   1 +
+ crates/sdroxide-ui/src/app/mod.rs     |   6 ++
+ crates/sdroxide-ui/src/app/top_bar.rs | 141 +++++++++++++++++++-----
+ docs/USER_MANUAL.md                   |   8 +-
+ 8 files changed, 288 insertions(+), 40 deletions(-)
 
 diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
-index 198d67a0..a07cd4b8 100644
+index 2970b040..1fc00c95 100644
 --- a/crates/sdroxide-proto/src/lib.rs
 +++ b/crates/sdroxide-proto/src/lib.rs
-@@ -1525,7 +1525,12 @@ use sdroxide_types::{
- /// radio configuration rides whole in both a command and an event, so a v173
- /// peer reads the extra bytes as the start of the next field and fails to
- /// decode either.
--pub const PROTO_VERSION: u16 = 174;
+@@ -1616,7 +1616,12 @@ use sdroxide_types::{
+ /// its tail, and the radio configuration rides whole in both a command and an
+ /// event, so a v186 peer reads the extra bytes as the start of the next field
+ /// and fails to decode either.
+-pub const PROTO_VERSION: u16 = 187;
 +///
-+/// v175: TUNE can send a two-tone test signal (issue #525). `TxState` gains
++/// v188: TUNE can send a two-tone test signal (issue #525). `TxState` gains
 +/// `two_tone` on its tail and `Command` gains a trailing `SetTuneTwoTone`;
-+/// `TxState` rides whole inside `RadioState`, so a v174 peer reads the extra
++/// `TxState` rides whole inside `RadioState`, so a v187 peer reads the extra
 +/// byte as the start of the next field and fails to decode every state.
-+pub const PROTO_VERSION: u16 = 175;
++pub const PROTO_VERSION: u16 = 188;
  const VERSION_BYTE: u8 = 0x12;
  
  #[derive(Debug, thiserror::Error)]
 diff --git a/crates/sdroxide-radio/src/engine.rs b/crates/sdroxide-radio/src/engine.rs
-index 916375bd..3d35ac95 100644
+index f7750526..f0573c5c 100644
 --- a/crates/sdroxide-radio/src/engine.rs
 +++ b/crates/sdroxide-radio/src/engine.rs
-@@ -1695,6 +1695,11 @@ const SILENT_MIC_PEAK: f32 = 0.001;
+@@ -1770,6 +1770,11 @@ const SILENT_MIC_PEAK: f32 = 0.001;
  /// It is also the transmit latency: the over runs this far behind the client's
  /// own waveform, and `Engine::end_tci_tx` plays the remainder out rather than
  /// dropping it, so the tail of a timed burst is not cut off.
@@ -2445,7 +1642,7 @@ index 916375bd..3d35ac95 100644
  const TCI_TX_LEAD: usize = TX_AUDIO_BLOCK * 24;
  /// Blocks (500 ms) of complete silence from a keyed TCI client before what it
  /// was asked for is written off and asked for again.
-@@ -1807,6 +1812,48 @@ const TCI_IQ_DEFAULT_HZ: f64 = 192_000.0;
+@@ -1882,6 +1887,48 @@ const TCI_IQ_DEFAULT_HZ: f64 = 192_000.0;
  const TCI_TX_FIFO_CAP: usize = 24_000;
  /// Sample rate of the TX baseband/audio fed to the TX-monitor analyzer.
  const TX_MONITOR_RATE: f64 = 48_000.0;
@@ -2494,7 +1691,7 @@ index 916375bd..3d35ac95 100644
  /// The TX monitor's baseband/IQ runs near digital full scale (~0 dBFS), far
  /// hotter than any received signal, so on the shared floor/ceil it would clamp
  /// the waterfall to maximum. Dim it so the strongest TX lands this many dB below
-@@ -2483,6 +2530,9 @@ struct Engine {
+@@ -2789,6 +2836,9 @@ struct Engine {
      /// Phase accumulator for the TUNE tone on audio-modulated rigs (CAT/TCI),
      /// which need an audio carrier to key up.
      tune_phase: f32,
@@ -2504,15 +1701,15 @@ index 916375bd..3d35ac95 100644
      /// The CTCSS tone or DCS stream going out under the voice, built from
      /// [`RadioState::repeater`] and rebuilt whenever that changes. `None` with
      /// the tone off, which is also what every non-FM mode gets: sub-audible
-@@ -4043,6 +4093,7 @@ fn engine_thread(
-         tx_analyzer: SpectrumAnalyzer::new(cfg.fft_size as usize, TX_MONITOR_RATE, cfg.avg_tc),
+@@ -4411,6 +4461,7 @@ fn engine_thread(
+         ),
          tx_mon_buf: Vec::new(),
          tune_phase: 0.0,
 +        two_tone: TwoTone::default(),
          sub_tone: None,
          burst: None,
          burst_unkeys: false,
-@@ -4549,13 +4600,26 @@ fn engine_thread(
+@@ -4956,8 +5007,18 @@ fn engine_thread(
              // spends that budget: the transmit ring empties, and hardware that
              // answers an underrun by skipping ahead (SoapySX does) puts the
              // over on the air as chirps. See `IqSource::read_available`.
@@ -2525,22 +1722,24 @@ index 916375bd..3d35ac95 100644
 +            // feedback that has to arrive unbroken (issue #525). Still only
 +            // what has already arrived, and bounded, so the transmitter's
 +            // budget is never spent waiting.
-             if engine.caps.full_duplex && !engine.audio_mode {
+             if engine.rx_drawn_during_tx() {
 -                if let Ok(n @ 1..) = engine.source.read_available(&mut buf) {
 +                for _ in 0..FULL_DUPLEX_READS_PER_TICK {
 +                    let Ok(n @ 1..) = engine.source.read_available(&mut buf) else { break };
+                     lane_samples += n as u64;
                      engine.samples_read += n as u64;
                      engine.last_block = n as u64;
-                     engine.adc.observe(&buf[..n]);
-                     let iq = decimate(engine.decim.as_mut(), &buf[..n], &mut dbuf);
-                     engine.run_audio(iq);
+@@ -4970,6 +5031,9 @@ fn engine_thread(
+                     // QO-100 station watches its own downlink through the over
+                     // (#652).
+                     engine.process_block(iq, pool.as_ref());
 +                    if n < buf.len() {
 +                        break; // drained
 +                    }
                  }
              }
          } else {
-@@ -8298,6 +8362,14 @@ impl Engine {
+@@ -8864,6 +8928,14 @@ impl Engine {
                      self.source.set_tx_drive(self.tx_power_level() as f64);
                  }
              }
@@ -2555,13 +1754,15 @@ index 916375bd..3d35ac95 100644
              SetSwrGuard { enabled, limit } => {
                  // Clamped, not trusted. Below about 1.1:1 no real antenna ever
                  // sits, so a low value would refuse every transmission and look
-@@ -16573,9 +16645,17 @@ impl Engine {
+@@ -17897,10 +17969,18 @@ impl Engine {
          tx.mod_buf.clear();
          let mut burst_done = false;
          if self.state.tx.tune || tx.modulator.is_none() {
--            // Steady carrier at the tune level (also CW until the keyer exists).
-+            // Steady carrier at the tune level (also CW until the keyer exists)
-+            // — or, with two-tone on, the test signal at the same peak level.
+-            // Steady carrier at the tune level. A PTT in CW only gets here with
+-            // no keyer to hold the over for (see `set_ptt`).
++            // Steady carrier at the tune level — or, with two-tone on, the test
++            // signal at the same peak level. A PTT in CW only gets here with no
++            // keyer to hold the over for (see `set_ptt`).
              let level = tune_level;
 -            tx.mod_buf.resize(TX_AUDIO_BLOCK, Complex32::new(level, 0.0));
 +            if self.state.tx.tune && self.state.tx.two_tone {
@@ -2575,7 +1776,7 @@ index 916375bd..3d35ac95 100644
              self.mic_fifo.clear();
              // The recording tap has no other source of TX audio during tune —
              // without this the tap goes quiet for the tune's duration and
-@@ -16830,12 +16910,20 @@ impl Engine {
+@@ -18169,12 +18249,20 @@ impl Engine {
              } else {
                  self.state.tx.tune_drive.clamp(0.05, 1.0)
              };
@@ -2602,8 +1803,8 @@ index 916375bd..3d35ac95 100644
                  }
              }
          } else if self.burst.is_some() && self.state.rx[0].mode == Mode::Nfm {
-@@ -19543,3 +19631,43 @@ mod cw_monitor_tests {
-         assert_eq!(*ready.back().unwrap(), (400 * 480 - 1) as f32, "the newest is kept");
+@@ -21041,3 +21129,43 @@ mod tx_voice_tester_tests {
+         assert_eq!(t.status().0, TxVoiceTest::Idle);
      }
  }
 +
@@ -2647,23 +1848,24 @@ index 916375bd..3d35ac95 100644
 +    }
 +}
 diff --git a/crates/sdroxide-types/src/command.rs b/crates/sdroxide-types/src/command.rs
-index 5ee6ec2c..198a8e76 100644
+index 809c969f..16a9b3bc 100644
 --- a/crates/sdroxide-types/src/command.rs
 +++ b/crates/sdroxide-types/src/command.rs
-@@ -1146,4 +1146,8 @@ pub enum Command {
-     ResetModeDefaults {
-         mode: Option<Mode>,
-     },
+@@ -1212,4 +1212,9 @@ pub enum Command {
+     ///
+     /// Appended for the usual reason — postcard numbers variants by position.
+     SetRigPowerStep(u8),
++
 +    /// Make TUNE send the two-tone test signal (`true`) or a steady carrier
 +    /// (`false`) — see [`crate::TxState::two_tone`]. Does not key anything by
 +    /// itself: [`Command::SetTune`] does that. Appended for the usual reason.
 +    SetTuneTwoTone(bool),
  }
 diff --git a/crates/sdroxide-types/src/state.rs b/crates/sdroxide-types/src/state.rs
-index 93d161a1..6a39fd4d 100644
+index f1987d9d..97882384 100644
 --- a/crates/sdroxide-types/src/state.rs
 +++ b/crates/sdroxide-types/src/state.rs
-@@ -182,6 +182,18 @@ pub struct TxState {
+@@ -187,6 +187,18 @@ pub struct TxState {
      /// sends a wild figure gets a sane one back.
      #[serde(default)]
      pub cessb_db: f32,
@@ -2682,218 +1884,23 @@ index 93d161a1..6a39fd4d 100644
  }
  
  /// The most controlled-envelope compression the control offers, in decibels.
-diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
-index 7545f52a..1ab11ba2 100644
---- a/crates/sdroxide-ui/src/app/top_bar.rs
-+++ b/crates/sdroxide-ui/src/app/top_bar.rs
-@@ -1309,17 +1309,21 @@ impl SdroxideApp {
-             // PTT is on the strip already; TUNE rides with the levels it is
-             // set up with.
-             self.tx_controls(ui, cmds, true);
--            if crate::chrome::chip_accent(
--                ui,
--                self.state.tx.tune,
--                RichText::new(" TUNE ").size(15.0),
--                crate::theme::YELLOW(),
--                crate::theme::INK_ON_CYAN(),
--            )
--            .clicked()
--            {
--                cmds.push(Command::SetTune(!self.state.tx.tune));
--            }
-+            ui.horizontal(|ui| {
-+                let tx = self.state.tx;
-+                if crate::chrome::chip_accent(
-+                    ui,
-+                    tx.tune && !tx.two_tone,
-+                    RichText::new(" TUNE ").size(15.0),
-+                    crate::theme::YELLOW(),
-+                    crate::theme::INK_ON_CYAN(),
-+                )
-+                .clicked()
-+                {
-+                    tune_clicked(tx, false, cmds);
-+                }
-+                self.tx_two_tone_chip(ui, cmds);
-+            });
-         });
-     }
- 
-@@ -4226,7 +4230,7 @@ impl SdroxideApp {
-         let tx = self.state.tx;
-         if crate::chrome::chip_accent_sized(
-             ui,
--            tx.tune,
-+            tx.tune && !tx.two_tone,
-             RichText::new(" TUNE ").size(15.0),
-             crate::theme::YELLOW(),
-             crate::theme::INK_ON_CYAN(),
-@@ -4234,7 +4238,34 @@ impl SdroxideApp {
-         )
-         .clicked()
-         {
--            cmds.push(Command::SetTune(!tx.tune));
-+            tune_clicked(tx, false, cmds);
-+        }
-+        self.tx_two_tone_chip(ui, cmds);
-+    }
-+
-+    /// The two-tone chip beside TUNE (issue #525): one click keys the
-+    /// two-tone test signal at the tune level, another unkeys it — what other
-+    /// SDR programs call their "Tone" button. Lit only while that is what is
-+    /// on the air, so it and TUNE never both read as keyed.
-+    fn tx_two_tone_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-+        let tx = self.state.tx;
-+        if crate::chrome::chip_accent(
-+            ui,
-+            tx.tune && tx.two_tone,
-+            RichText::new(TWO_TONE_CHIP).size(15.0),
-+            crate::theme::YELLOW(),
-+            crate::theme::INK_ON_CYAN(),
-+        )
-+        .on_hover_text(
-+            "Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, \
-+             until clicked again. Its envelope swings from nothing to full, so it \
-+             shows an amplifier's splatter plainly on a second receiver, and it is \
-+             the signal PureSignal learns from fastest — a steady carrier only \
-+             teaches it one point. Use a dummy load.",
-+        )
-+        .clicked()
-+        {
-+            tune_clicked(tx, true, cmds);
-         }
-     }
- 
-@@ -5717,6 +5748,22 @@ pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WID
- /// draw site.
- const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
- 
-+/// The two-tone chip's label, shared by its draw sites and the width sums.
-+const TWO_TONE_CHIP: &str = " 2T ";
-+
-+/// What a click on TUNE (`two_tone` false) or on the two-tone chip (`true`)
-+/// sends. Clicking the one that is lit unkeys; clicking the other keys with
-+/// that waveform — switching over without unkeying if TUNE was already down,
-+/// since the waveform is all that differs.
-+fn tune_clicked(tx: sdroxide_types::TxState, two_tone: bool, cmds: &mut Vec<Command>) {
-+    if tx.tune && tx.two_tone == two_tone {
-+        cmds.push(Command::SetTune(false));
-+    } else {
-+        cmds.push(Command::SetTuneTwoTone(two_tone));
-+        cmds.push(Command::SetTune(true));
-+    }
-+}
-+
- /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
- /// labels, so the chips match and the level blocks beside them start on the
- /// same column.
-@@ -5741,7 +5788,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
-         |s: &str| crate::chrome::text_width(ui, s, egui::TextStyle::Body.resolve(ui.style()));
-     let keyer_w = if keyer { crate::chrome::chip_width(ui, " ▶ ", Some(15.0)) + g } else { 0.0 };
-     let row1 = key_w + g + keyer_w + label("Drive") + g + g + TX_SLIDER_VALUE_W;
--    let row2 = key_w + g + label("Tune") + g + g + TX_SLIDER_VALUE_W;
-+    let two_tone_w = crate::chrome::chip_width(ui, TWO_TONE_CHIP, Some(15.0)) + g;
-+    let row2 = key_w + g + two_tone_w + label("Tune") + g + g + TX_SLIDER_VALUE_W;
-     (row1, row2)
- }
- 
-@@ -7674,6 +7722,13 @@ mod tests {
-                             crate::theme::INK_ON_CYAN(),
-                             size,
-                         );
-+                        crate::chrome::chip_accent(
-+                            ui,
-+                            false,
-+                            RichText::new(TWO_TONE_CHIP).size(15.0),
-+                            crate::theme::YELLOW(),
-+                            crate::theme::INK_ON_CYAN(),
-+                        );
-                         ui.label("Tune");
-                         crate::chrome::slider_readout(
-                             ui,
-diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index 78b744d7..7f6b9529 100644
---- a/docs/USER_MANUAL.md
-+++ b/docs/USER_MANUAL.md
-@@ -9107,7 +9107,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
-   what comes out is straight. It needs **Full duplex** on and the **PTT pins**
-   off, because the coupler is only heard while receive keeps running through
-   the over; the correction shows on the PS meter and in the log while you
--  transmit, and stays at unity until the feedback lines up.
-+  transmit, and stays at unity until the feedback lines up. The **2T** chip
-+  beside **TUNE** is the easiest thing to learn from: it transmits the classic
-+  two-tone test signal (700 Hz and 1900 Hz together) at the Tune level until
-+  clicked again. A steady carrier has only one amplitude, so it teaches
-+  PureSignal nothing, and a silent microphone teaches it less.
- 
- **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
- so both aerials show about the same noise floor; for PureSignal, start at the
--- 
-2.43.0
-
-
-From 171f0e8064e99f534bc8b4116ac3bfde0c400eb8 Mon Sep 17 00:00:00 2001
-From: yankneck696 <yankneck696@gmail.com>
-Date: Wed, 7 Oct 2026 06:36:23 -0400
-Subject: [PATCH 7/7] The TX chip opens a movable TRANSMIT window; the PlutoSky
- R2's PA is not GPO-switched (#525)
-
-On the compact strip the TX chip's drop-down hung over the S-meter, which is
-what an operator watches while setting drive and tune. It now opens a
-TRANSMIT window instead: the same controls, draggable clear of the meter,
-and open through an over until closed.
-
-Tested on a PlutoSky R2 "with PA", no GPO pin switched its amplifier: its
-maker documents the bypass as a capacitor moved on the board, and the Tezuka
-device tree for the board drives no PA line. The amplifier-pin setting
-stays, for boards and external amplifiers that are wired to a GPO, but no
-longer names the PlutoSky R2 as one.
----
- crates/sdroxide-types/src/radio.rs           |  8 +-
- crates/sdroxide-ui/src/app/frame.rs          |  1 +
- crates/sdroxide-ui/src/app/mod.rs            |  6 ++
- crates/sdroxide-ui/src/app/settings/radio.rs |  9 +-
- crates/sdroxide-ui/src/app/top_bar.rs        | 86 ++++++++++++++------
- docs/USER_MANUAL.md                          | 10 ++-
- src/pluto_source.rs                          |  4 +-
- 7 files changed, 84 insertions(+), 40 deletions(-)
-
-diff --git a/crates/sdroxide-types/src/radio.rs b/crates/sdroxide-types/src/radio.rs
-index 6417fcc8..d29c645e 100644
---- a/crates/sdroxide-types/src/radio.rs
-+++ b/crates/sdroxide-types/src/radio.rs
-@@ -5312,9 +5312,11 @@ impl PlutoPtt {
- /// Which GPO pin, if any, holds an amplifier on or bypassed — a static switch
- /// the operator flips, not a PTT line (issue #525).
- ///
--/// Boards built around a Pluto with an amplifier on them — the PlutoSky R2 "with
--/// PA" is the one this was asked for — can bring the amplifier's enable or
--/// bypass control out to one of the AD9361's GPO pins. Unlike [`PlutoPtt`] the
-+/// A board built around a Pluto, or an external amplifier wired to one, can
-+/// bring the amplifier's enable or bypass control out to one of the AD9361's
-+/// GPO pins. (Not the PlutoSky R2 this was first asked for: tested on one, its
-+/// PA turned out to be bypassed by re-soldering a capacitor, which its maker's
-+/// own page says, and no pin controls it.) Unlike [`PlutoPtt`] the
- /// pin does not follow the enable-state machine: it is put in the part's
- /// *manual* GPO mode and set from here, high or low, and stays there across
- /// overs. That is also why it works in FDD, and so beside full duplex and
 diff --git a/crates/sdroxide-ui/src/app/frame.rs b/crates/sdroxide-ui/src/app/frame.rs
-index f0253f56..3000710a 100644
+index 3f67989d..88b6d31b 100644
 --- a/crates/sdroxide-ui/src/app/frame.rs
 +++ b/crates/sdroxide-ui/src/app/frame.rs
-@@ -939,6 +939,7 @@ impl eframe::App for SdroxideApp {
-         self.drm_window(&ctx, &mut cmds);
+@@ -975,6 +975,7 @@ impl eframe::App for SdroxideApp {
          self.hd_window(&ctx, &mut cmds);
          self.voice_window(&ctx, &mut cmds);
+         self.tx_audio_window(&ctx, &mut cmds);
 +        self.tx_window(&ctx, &mut cmds);
          self.settings_window(&ctx, &mut cmds);
          self.digi_settings_window(&ctx, &mut cmds);
          self.logbook_window(&ctx, &mut cmds);
 diff --git a/crates/sdroxide-ui/src/app/mod.rs b/crates/sdroxide-ui/src/app/mod.rs
-index e6f40bfa..6610d4c7 100644
+index e1d52b20..6a9b378a 100644
 --- a/crates/sdroxide-ui/src/app/mod.rs
 +++ b/crates/sdroxide-ui/src/app/mod.rs
-@@ -775,6 +775,11 @@ pub struct SdroxideApp {
+@@ -803,6 +803,11 @@ pub struct SdroxideApp {
      daylight_at: f64,
      /// The BANDS window.
      show_bands: bool,
@@ -2905,7 +1912,7 @@ index e6f40bfa..6610d4c7 100644
      /// The propagation field rendered to pixels, rebuilt only when it moves.
      prop_heat: crate::prop_map::PropHeat,
      /// The grey-line (night/twilight) overlay rendered to pixels, rebuilt at
-@@ -1517,6 +1522,7 @@ impl SdroxideApp {
+@@ -1613,6 +1618,7 @@ impl SdroxideApp {
              daylight: true,
              daylight_at: f64::NEG_INFINITY,
              show_bands: false,
@@ -2913,28 +1920,8 @@ index e6f40bfa..6610d4c7 100644
              digi_stations: Default::default(),
              prop: Default::default(),
              prop_heat: Default::default(),
-diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index 8f04d91a..557f0632 100644
---- a/crates/sdroxide-ui/src/app/settings/radio.rs
-+++ b/crates/sdroxide-ui/src/app/settings/radio.rs
-@@ -3440,10 +3440,11 @@ pub(in crate::app) fn settings_pluto_tab(
-         // of how the connection is set up, so they wait for Apply; the switch
-         // itself is one register write and goes at once.
-         ui.label("Amplifier pin").on_hover_text(
--            "For a board whose amplifier can be switched in or bypassed from one of \
--             the AD9361's GPO pins — the PlutoSky R2 \"with PA\" is one. Pick the pin \
--             the board wires to the amplifier's enable (the schematic says which; failing \
--             that, try each with a dummy load on the output).\n\nThis puts the GPO pins \
-+            "For a board, or an external amplifier, whose PA is switched in or bypassed \
-+             from one of the AD9361's GPO pins. Pick the pin it is wired to (the \
-+             schematic says which; failing that, try each with a dummy load on the \
-+             output).\n\nNot the PlutoSky R2: its own PA is bypassed by moving a \
-+             capacitor on the board, not from software, so nothing here can switch it.\n\nThis puts the GPO pins \
-              in manual mode, so it cannot be used together with the PTT pins above — \
-              but unlike them it works in FDD, alongside Full duplex and PureSignal.\n\n\
-              Takes effect on Apply.",
 diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
-index 1ab11ba2..ed5b569a 100644
+index 9761b9ca..96e34f22 100644
 --- a/crates/sdroxide-ui/src/app/top_bar.rs
 +++ b/crates/sdroxide-ui/src/app/top_bar.rs
 @@ -848,7 +848,7 @@ impl SdroxideApp {
@@ -2967,7 +1954,7 @@ index 1ab11ba2..ed5b569a 100644
                  MenuChip::Disp => self.disp_menu(ui, btn, cmds),
                  MenuChip::Sys => self.sys_menu(ui, btn, cmds),
              }
-@@ -1301,30 +1302,61 @@ impl SdroxideApp {
+@@ -1301,26 +1302,61 @@ impl SdroxideApp {
          });
      }
  
@@ -2979,20 +1966,18 @@ index 1ab11ba2..ed5b569a 100644
 -            // PTT is on the strip already; TUNE rides with the levels it is
 -            // set up with.
 -            self.tx_controls(ui, cmds, true);
--            ui.horizontal(|ui| {
--                let tx = self.state.tx;
--                if crate::chrome::chip_accent(
--                    ui,
--                    tx.tune && !tx.two_tone,
--                    RichText::new(" TUNE ").size(15.0),
--                    crate::theme::YELLOW(),
--                    crate::theme::INK_ON_CYAN(),
--                )
--                .clicked()
--                {
--                    tune_clicked(tx, false, cmds);
--                }
--                self.tx_two_tone_chip(ui, cmds);
+-            if crate::chrome::chip_accent(
+-                ui,
+-                self.state.tx.tune,
+-                RichText::new(" TUNE ").size(15.0),
+-                crate::theme::YELLOW(),
+-                crate::theme::INK_ON_CYAN(),
+-            )
+-            .clicked()
+-            {
+-                cmds.push(Command::SetTune(!self.state.tx.tune));
+-            }
+-        });
 +    /// The TX chip: opens and closes the TRANSMIT window — tune, the voice
 +    /// keyer, and the drive and mic levels.
 +    ///
@@ -3043,8 +2028,7 @@ index 1ab11ba2..ed5b569a 100644
 +                    }
 +                    self.tx_two_tone_chip(ui, cmds);
 +                });
-             });
--        });
++            });
 +        if let Some(r) = &resp {
 +            crate::chrome::paint_window_border(ctx, &r.response);
 +        }
@@ -3052,26 +2036,116 @@ index 1ab11ba2..ed5b569a 100644
      }
  
      /// The DISP menu: waterfall, spectrum and skimmer controls.
+@@ -4409,7 +4445,7 @@ impl SdroxideApp {
+         let tx = self.state.tx;
+         if crate::chrome::chip_accent_sized(
+             ui,
+-            tx.tune,
++            tx.tune && !tx.two_tone,
+             RichText::new(" TUNE ").size(15.0),
+             crate::theme::YELLOW(),
+             crate::theme::INK_ON_CYAN(),
+@@ -4417,7 +4453,34 @@ impl SdroxideApp {
+         )
+         .clicked()
+         {
+-            cmds.push(Command::SetTune(!tx.tune));
++            tune_clicked(tx, false, cmds);
++        }
++        self.tx_two_tone_chip(ui, cmds);
++    }
++
++    /// The two-tone chip beside TUNE (issue #525): one click keys the
++    /// two-tone test signal at the tune level, another unkeys it — what other
++    /// SDR programs call their "Tone" button. Lit only while that is what is
++    /// on the air, so it and TUNE never both read as keyed.
++    fn tx_two_tone_chip(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
++        let tx = self.state.tx;
++        if crate::chrome::chip_accent(
++            ui,
++            tx.tune && tx.two_tone,
++            RichText::new(TWO_TONE_CHIP).size(15.0),
++            crate::theme::YELLOW(),
++            crate::theme::INK_ON_CYAN(),
++        )
++        .on_hover_text(
++            "Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, \
++             until clicked again. Its envelope swings from nothing to full, so it \
++             shows an amplifier's splatter plainly on a second receiver, and it is \
++             the signal PureSignal learns from fastest — a steady carrier only \
++             teaches it one point. Use a dummy load.",
++        )
++        .clicked()
++        {
++            tune_clicked(tx, true, cmds);
+         }
+     }
+ 
+@@ -6113,6 +6176,22 @@ const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
+ /// The caption under the FDM-DUO's power presets (AJ3G, 18 Oct 2026).
+ const DUO_PRESETS_CAPTION: &str = "ELAD FDM-DUO TX PWR";
+ 
++/// The two-tone chip's label, shared by its draw sites and the width sums.
++const TWO_TONE_CHIP: &str = " 2T ";
++
++/// What a click on TUNE (`two_tone` false) or on the two-tone chip (`true`)
++/// sends. Clicking the one that is lit unkeys; clicking the other keys with
++/// that waveform — switching over without unkeying if TUNE was already down,
++/// since the waveform is all that differs.
++fn tune_clicked(tx: sdroxide_types::TxState, two_tone: bool, cmds: &mut Vec<Command>) {
++    if tx.tune && tx.two_tone == two_tone {
++        cmds.push(Command::SetTune(false));
++    } else {
++        cmds.push(Command::SetTuneTwoTone(two_tone));
++        cmds.push(Command::SetTune(true));
++    }
++}
++
+ /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
+ /// labels, so the chips match and the level blocks beside them start on the
+ /// same column.
+@@ -6137,7 +6216,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
+         |s: &str| crate::chrome::text_width(ui, s, egui::TextStyle::Body.resolve(ui.style()));
+     let keyer_w = if keyer { crate::chrome::chip_width(ui, " ▶ ", Some(15.0)) + g } else { 0.0 };
+     let row1 = key_w + g + keyer_w + label("Drive") + g + g + TX_SLIDER_VALUE_W;
+-    let row2 = key_w + g + label("Tune") + g + g + TX_SLIDER_VALUE_W;
++    let two_tone_w = crate::chrome::chip_width(ui, TWO_TONE_CHIP, Some(15.0)) + g;
++    let row2 = key_w + g + two_tone_w + label("Tune") + g + g + TX_SLIDER_VALUE_W;
+     (row1, row2)
+ }
+ 
+@@ -8414,6 +8494,13 @@ mod tests {
+                             crate::theme::INK_ON_CYAN(),
+                             size,
+                         );
++                        crate::chrome::chip_accent(
++                            ui,
++                            false,
++                            RichText::new(TWO_TONE_CHIP).size(15.0),
++                            crate::theme::YELLOW(),
++                            crate::theme::INK_ON_CYAN(),
++                        );
+                         ui.label("Tune");
+                         crate::chrome::slider_readout(
+                             ui,
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index 7f6b9529..1d96d886 100644
+index a56bb008..e3e025ab 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -9054,9 +9054,11 @@ configured in exactly the same way as one on your desk.
-   no host software in the loop. **Off**, **GPO0 = RX, GPO1 = TX**, or **GPO2 =
-   RX, GPO3 = TX**. Picking a pair puts the radio in TDD whatever *Duplex* says.
-   See *Keying an external amplifier*, below. Takes effect on Apply.
--- **Amplifier pin**, **Amplifier** — for a board whose amplifier can be
--  switched in or bypassed from one of the AD9361's GPO pins, such as the
--  PlutoSky R2 "with PA" (issue #525). Choose the pin the board wires to the
-+- **Amplifier pin**, **Amplifier** — for a board, or an external amplifier,
-+  whose PA can be switched in or bypassed from one of the AD9361's GPO pins
-+  (issue #525). **Not the PlutoSky R2:** its own PA is bypassed by moving a
-+  capacitor on the board, as OpenSourceSDRLab's product page describes, and
-+  no software can switch it. Choose the pin the board wires to the
-   amplifier's enable, then use **Switched in (PA on)** to put the amplifier in
-   the transmit path or bypass it — that checkbox applies at once and is
-   remembered for the next start. Tick **Active low** if the board switches the
-@@ -13967,7 +13969,7 @@ row of menu buttons:
+@@ -9572,7 +9572,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
+   what comes out is straight. It needs **Full duplex** on and the **PTT pins**
+   off, because the coupler is only heard while receive keeps running through
+   the over; the correction shows on the PS meter and in the log while you
+-  transmit, and stays at unity until the feedback lines up.
++  transmit, and stays at unity until the feedback lines up. The **2T** chip
++  beside **TUNE** is the easiest thing to learn from: it transmits the classic
++  two-tone test signal (700 Hz and 1900 Hz together) at the Tune level until
++  clicked again. A steady carrier has only one amplitude, so it teaches
++  PureSignal nothing, and a silent microphone teaches it less.
+ 
+ **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
+ so both aerials show about the same noise floor; for PureSignal, start at the
+@@ -14587,7 +14591,7 @@ row of menu buttons:
  | **RX** | Volume, front-end gain, AGC, squelch, the filter width and edges, NB, ANC, NR, BIN |
  | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
  | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
@@ -3079,21 +2153,6 @@ index 7f6b9529..1d96d886 100644
 +| **TX** | TUNE, 2T (two-tone), the voice keyer, and the drive, tune and mic levels — in a **TRANSMIT** window you can drag clear of the S-meter, which stays open through an over until you close it or tap **TX** again |
  | **DISP** | ☀ 3D, WIDE, FIT, CTR, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
  | **SYS** | LOG, SPOTS, AWARDS, BANDS, SAT, ISM, PUBLIC SDR, MAIL, MEM, SCAN, SETTINGS, HELP |
- 
-diff --git a/src/pluto_source.rs b/src/pluto_source.rs
-index 433b0aba..f6fa1e20 100644
---- a/src/pluto_source.rs
-+++ b/src/pluto_source.rs
-@@ -36,8 +36,8 @@
- //!
- //! # The amplifier switch
- //!
--//! A board whose amplifier is switched in and out from a GPO pin (the
--//! PlutoSky R2 "with PA") gets that switch as a pseudo-gain element,
-+//! A board whose amplifier is switched in and out from a GPO pin gets that
-+//! switch as a pseudo-gain element,
- //! [`PlutoConfig::PA_ELEMENT`], set up on the connection by
- //! `Phy::setup_pa_switch`.
  
 -- 
 2.43.0
