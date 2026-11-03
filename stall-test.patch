@@ -1,0 +1,36 @@
+From 033ad20c7467b568c8104dad318aa5b2121e623c Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@users.noreply.github.com>
+Date: Tue, 3 Nov 2026 12:27:59 -0500
+Subject: [PATCH] TEST BUILD (#719): poll the IIOD sockets every 5 s instead of
+ 250 ms
+
+Not for merging. With a 5 s receive timeout the socket's timeout never
+fires while samples are flowing, so if the Windows SO_RCVTIMEO fault is
+what wedges the receive socket, the stalls should stop with this build.
+---
+ crates/sdroxide-pluto/src/iiod.rs | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/crates/sdroxide-pluto/src/iiod.rs b/crates/sdroxide-pluto/src/iiod.rs
+index 2df05005..810f20f1 100644
+--- a/crates/sdroxide-pluto/src/iiod.rs
++++ b/crates/sdroxide-pluto/src/iiod.rs
+@@ -59,8 +59,13 @@ pub const DEFAULT_PORT: u16 = 30431;
+ /// How long one socket read may block before [`Patient`] looks at the clock
+ /// again. This is a polling granularity, not a deadline — see [`IO_DEADLINE`].
+ ///
+-/// Fine enough that [`PAYLOAD_PROBE_AFTER`] is kept to within a poll.
+-const IO_POLL: Duration = Duration::from_millis(250);
++/// TEST BUILD for issue #719, not for merging: raised from 250 ms to 5 s so
++/// that, on a link delivering a buffer every few milliseconds, the socket's
++/// receive timeout (`SO_RCVTIMEO` on Windows) never fires in normal running.
++/// Microsoft documents a socket as unusable after that timeout fires; if the
++/// stalls stop with this build, that is the fault. A genuinely wedged socket
++/// is now noticed after about 5 s instead of 0.5 s.
++const IO_POLL: Duration = Duration::from_secs(5);
+ 
+ /// How long a payload may go silent on a probed connection before the board is
+ /// asked, on a connection of its own, whether it is still answering — see
+-- 
+2.43.0
+
