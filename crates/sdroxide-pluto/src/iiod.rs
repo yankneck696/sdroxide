@@ -59,8 +59,13 @@ pub const DEFAULT_PORT: u16 = 30431;
 /// How long one socket read may block before [`Patient`] looks at the clock
 /// again. This is a polling granularity, not a deadline — see [`IO_DEADLINE`].
 ///
-/// Fine enough that [`PAYLOAD_PROBE_AFTER`] is kept to within a poll.
-const IO_POLL: Duration = Duration::from_millis(250);
+/// TEST BUILD for issue #719, not for merging: raised from 250 ms to 5 s so
+/// that, on a link delivering a buffer every few milliseconds, the socket's
+/// receive timeout (`SO_RCVTIMEO` on Windows) never fires in normal running.
+/// Microsoft documents a socket as unusable after that timeout fires; if the
+/// stalls stop with this build, that is the fault. A genuinely wedged socket
+/// is now noticed after about 5 s instead of 0.5 s.
+const IO_POLL: Duration = Duration::from_secs(5);
 
 /// How long a payload may go silent on a probed connection before the board is
 /// asked, on a connection of its own, whether it is still answering — see
