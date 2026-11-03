@@ -1,0 +1,36 @@
+name: Apply stall test patch (#719) and build MSI
+
+# Helper for testing issue #719. When stall-test.patch is uploaded to main,
+# this applies it on top of the current upstream sdroxide (dividebysandwich/main),
+# pushes the result to the branch stall-test, and starts the "Windows MSI"
+# workflow on that branch. Not for merging anywhere.
+on:
+  push:
+    branches: [main]
+    paths: ['stall-test.patch']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply the patch on current upstream main
+        run: |
+          git config user.name "yankneck696"
+          git config user.email "yankneck696@users.noreply.github.com"
+          cp stall-test.patch "$RUNNER_TEMP/p.patch"
+          git fetch https://github.com/dividebysandwich/sdroxide.git main
+          git checkout -B stall-test FETCH_HEAD
+          git am "$RUNNER_TEMP/p.patch"
+          git push -f origin stall-test
+      - name: Start the Windows MSI build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run windows-msi.yml --ref stall-test
