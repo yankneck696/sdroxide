@@ -1,4 +1,4 @@
-From f597ae36806e5406d4763ee77132cb1be16f74fb Mon Sep 17 00:00:00 2001
+From 0ee6111e0f67e68b3cc900cd8fbd212446743bd3 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:00 -0400
 Subject: [PATCH 1/2] PlutoSDR: RX2 as a second aerial or PureSignal feedback
@@ -10,7 +10,7 @@ LimeAuxConfig), and src/pluto_source.rs follows src/lime_source.rs, borrowing
 RX2 into the RX1 radio and feeding it to the shared sdroxide_dsp::Diversity
 (Cancel/Combine, driven from the main window's DIV strip) or
 sdroxide_dsp::PureSignal. PureSignal needs full duplex, since the coupler is
-only heard while receive keeps running through the over. Wire protocol v187,
+only heard while receive keeps running through the over. Wire protocol v191,
 because the radio configuration crosses whole.
 
 Both chains arrive in one 2R2T device buffer. The receive thread commits each
@@ -27,6 +27,9 @@ delay search runs eight times a second rather than on every block, so the
 longer history costs nothing extra. The Pluto uses one second and unlocks at
 each key-up. A test covers a delay the default history cannot reach.
 
+The settings reuse the LimeSDR second chain's translated messages; the
+Pluto's own heading, introduction and warning are new en-US messages.
+
 Diversity (Cancel) tried on a PlutoSky R2. PureSignal is not yet verified on
 hardware: the receive stalls of #719 break its feedback stream.
 ---
@@ -37,11 +40,12 @@ hardware: the receive stalls of #719 break its feedback stream.
  crates/sdroxide-proto/src/lib.rs             |   9 +-
  crates/sdroxide-types/src/lib.rs             |  17 +-
  crates/sdroxide-types/src/radio.rs           |  36 ++
- crates/sdroxide-ui/src/app/settings/radio.rs | 222 +++++++++-
+ crates/sdroxide-ui/i18n/en-US/sdroxide.ftl   |   8 +
+ crates/sdroxide-ui/src/app/settings/radio.rs | 190 +++++++-
  docs/USER_MANUAL.md                          |  25 ++
  src/main.rs                                  |   3 +
  src/pluto_source.rs                          | 431 ++++++++++++++++++-
- 11 files changed, 1092 insertions(+), 51 deletions(-)
+ 12 files changed, 1068 insertions(+), 51 deletions(-)
 
 diff --git a/crates/sdroxide-dsp/src/predistort.rs b/crates/sdroxide-dsp/src/predistort.rs
 index 2fa700e2..2d600bf7 100644
@@ -168,7 +172,7 @@ index 2fa700e2..2d600bf7 100644
      /// receiver hearing the band instead — never locks, and an unlocked loop
      /// leaves the transmitter exactly as it was.
 diff --git a/crates/sdroxide-pluto/src/net.rs b/crates/sdroxide-pluto/src/net.rs
-index 37be799a..420c3d65 100644
+index 222c9d97..acef7427 100644
 --- a/crates/sdroxide-pluto/src/net.rs
 +++ b/crates/sdroxide-pluto/src/net.rs
 @@ -50,6 +50,9 @@ pub use crate::phy::PlutoLimits;
@@ -181,7 +185,7 @@ index 37be799a..420c3d65 100644
  /// How long the TCP handshake may take before the address counts as wrong.
  pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
  
-@@ -207,6 +210,22 @@ pub(crate) struct Shared {
+@@ -212,6 +215,22 @@ pub(crate) struct Shared {
      pub rx_pairs: AtomicUsize,
      /// The second chain's ring feed, installed while its stream is attached.
      pub ring1: Mutex<Option<Producer<f32>>>,
@@ -204,7 +208,7 @@ index 37be799a..420c3d65 100644
      /// Per-chain LO-move subscribers: `(chain, notify)`. The control thread
      /// tells every chain but the one that asked when the shared LO moves.
      pub lo_watch: Mutex<Vec<(u8, Sender<f64>)>>,
-@@ -644,6 +663,10 @@ impl PlutoRig {
+@@ -658,6 +677,10 @@ impl PlutoRig {
              tx_buffer_samples: tx_buffer_samples(tx_rate),
              rx_pairs: AtomicUsize::new(1),
              ring1: Mutex::new(None),
@@ -215,7 +219,7 @@ index 37be799a..420c3d65 100644
              lo_watch: Mutex::new(Vec::new()),
              trace: trace.clone(),
          });
-@@ -838,7 +861,11 @@ impl PlutoRig {
+@@ -852,7 +875,11 @@ impl PlutoRig {
                      // held it (chain 0's producer lives in the thread); drain
                      // the backlog so a re-attached stream starts live rather
                      // than replaying half a second of the past.
@@ -228,7 +232,7 @@ index 37be799a..420c3d65 100644
                      (r, tx)
                  }
                  None => {
-@@ -875,6 +902,28 @@ impl PlutoRig {
+@@ -889,6 +916,28 @@ impl PlutoRig {
      }
  }
  
@@ -257,7 +261,7 @@ index 37be799a..420c3d65 100644
  /// One receive chain's stream on a shared [`PlutoRig`]: its IQ ring, its gain
  /// and port, and — on chain 0 — the transmitter. The LO is the rig's, shared
  /// by every chain: tuning here moves the siblings too, and their moves arrive
-@@ -924,7 +973,12 @@ impl Drop for PlutoRx {
+@@ -938,7 +987,12 @@ impl Drop for PlutoRx {
          } else {
              // The receive thread narrows its buffer back to one pair.
              self.rig.shared.rx_pairs.store(1, Ordering::Relaxed);
@@ -271,7 +275,7 @@ index 37be799a..420c3d65 100644
          }
      }
  }
-@@ -1107,28 +1161,93 @@ impl PlutoRx {
+@@ -1124,28 +1178,93 @@ impl PlutoRx {
      /// Drain interleaved I,Q floats from the RX ring into `out`. Always returns
      /// an even count, so the stream stays aligned. 0 means nothing yet.
      pub fn rx_read(&mut self, out: &mut [f32]) -> usize {
@@ -377,7 +381,7 @@ index 37be799a..420c3d65 100644
          }
      }
  
-@@ -1158,6 +1277,24 @@ impl PlutoRx {
+@@ -1175,6 +1294,24 @@ impl PlutoRx {
      }
  }
  
@@ -615,30 +619,30 @@ index 774e38ab..34c4b790 100644
 +    rig.release();
 +}
 diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
-index c7250ac6..2970b040 100644
+index 164fdfb1..2b271b53 100644
 --- a/crates/sdroxide-proto/src/lib.rs
 +++ b/crates/sdroxide-proto/src/lib.rs
-@@ -1609,7 +1609,14 @@ use sdroxide_types::{
- /// so a v185 peer reads the extra bytes as the start of the next field and
- /// fails to decode every digital status, the same break as every appended field
- /// before it.
--pub const PROTO_VERSION: u16 = 186;
+@@ -1627,7 +1627,14 @@ use sdroxide_types::{
+ /// enums; [`sdroxide_types::Command`] gains the `Vara*` commands; `DigiStatus`
+ /// gains `vara` (`Option<VaraStatus>`) and `DigiConfig` the `vara_*` settings,
+ /// each on its tail, so a v189 peer reads digital status out of step.
+-pub const PROTO_VERSION: u16 = 190;
 +///
-+/// v187: the PlutoSDR's second receive chain can serve the RX1 radio as a
++/// v191: the PlutoSDR's second receive chain can serve the RX1 radio as a
 +/// second aerial or as PureSignal feedback (issue #525). `PlutoConfig` gains
 +/// `aux` (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses) on
 +/// its tail, and the radio configuration rides whole in both a command and an
-+/// event, so a v186 peer reads the extra bytes as the start of the next field
++/// event, so a v190 peer reads the extra bytes as the start of the next field
 +/// and fails to decode either.
-+pub const PROTO_VERSION: u16 = 187;
++pub const PROTO_VERSION: u16 = 191;
  const VERSION_BYTE: u8 = 0x12;
  
  #[derive(Debug, thiserror::Error)]
 diff --git a/crates/sdroxide-types/src/lib.rs b/crates/sdroxide-types/src/lib.rs
-index 8c8b43ca..441947c4 100644
+index ab3b75fe..6d2baa3b 100644
 --- a/crates/sdroxide-types/src/lib.rs
 +++ b/crates/sdroxide-types/src/lib.rs
-@@ -236,14 +236,15 @@ pub use radio::{
+@@ -237,14 +237,15 @@ pub use radio::{
      IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, KiwiConfig,
      LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, MAX_TRANSVERTERS, ModeControl,
      PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
@@ -730,11 +734,30 @@ index 72f5a445..dcd1140c 100644
  
      /// Sample rates offered in the UI.
      ///
+diff --git a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
+index 30436a7e..e37010b3 100644
+--- a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
++++ b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
+@@ -1977,6 +1977,14 @@ settings-radio-automatic-board-receives-switched-transmit = On Automatic the boa
+ settings-radio-limesdr-support-has-not-been = LimeSDR support has not been verified against hardware. This is the last session's trace, for an issue report.
+ settings-radio-gains-filters-corrections-antenna-sockets = Gains, filters, corrections, the antenna sockets and every LimeRFE control — its connectors, band, relays, attenuator, notch and fan — apply immediately. The board, the receive chain, the sample rate, arming transmit and the LimeRFE's connection take effect on Apply.
+ 
++## Settings window, Radio tab: the PlutoSDR's second receive chain (issue #525).
++## Its other controls share the LimeSDR's second-chain messages above.
++
++settings-radio-pluto-rx2 = Second receive chain (RX2)
++settings-radio-pluto-rx2-intro = On a 2R2T board (Pluto+, PlutoSky R2 with 2R2T firmware) this radio can keep RX2 for itself: as a second aerial, or as a sample of your own transmitter for PureSignal. RX2 shares the oscillator and the clock with RX1, so it hears the same span at the same instant, and it runs at a fixed gain with its AGC off. While it is used here it is not free for a second radio tab. Changing what it is used for takes effect on Apply.
++settings-radio-pluto-rx2-gain = RX2 gain
++settings-radio-pluto-ps-needs-full-duplex = PureSignal needs Full duplex on and the PTT pins off: the coupler is only heard while receive keeps running through the over.
++
+ ## Settings window, Radio tab: messages with values
+ 
+ settings-radio-fill-from = FILL FROM { $name }
 diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index 506ab49f..c902a423 100644
+index debe8641..58fc442a 100644
 --- a/crates/sdroxide-ui/src/app/settings/radio.rs
 +++ b/crates/sdroxide-ui/src/app/settings/radio.rs
-@@ -3173,7 +3173,9 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2446,7 +2446,9 @@ pub(in crate::app) fn settings_pluto_tab(
      can_probe: bool,
      cmds: &mut Vec<Command>,
  ) {
@@ -743,51 +766,42 @@ index 506ab49f..c902a423 100644
 +        DiversityMode, LimeAuxRole, PlutoAgc, PlutoAuxConfig, PlutoConfig, PlutoDuplex, PlutoPtt,
 +    };
      let Some(cfg) = radio_edit.as_mut() else {
-         ui.label("Waiting for the configuration of the machine the radio is attached to.");
+         ui.label(tr!("settings-radio-waiting-configuration-machine-radio-attached"));
          return;
-@@ -3534,6 +3536,224 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2732,6 +2734,192 @@ pub(in crate::app) fn settings_pluto_tab(
  
      test_result_line(ui, test_result);
  
 +    // ---- RX2 as this radio's own second chain (issue #525) -----------------
++    // The same controls, words and pseudo-gain elements as the LimeSDR's second
++    // chain, which this is modelled on; only the heading, the introduction and
++    // the full-duplex warning are the Pluto's own.
 +    if cfg.pluto.rx == 0 {
 +        ui.add_space(6.0);
 +        ui.separator();
-+        ui.label(RichText::new("Second receive chain (RX2)").strong());
-+        ui.label(
-+            RichText::new(
-+                "On a 2R2T board (Pluto+, PlutoSky R2 with 2R2T firmware) this radio can \
-+                 keep RX2 for itself: as a second aerial, or as a sample of your own \
-+                 transmitter for PureSignal. RX2 shares the oscillator and the clock with \
-+                 RX1, so it hears the same span at the same instant. While it is used here \
-+                 it is not free for a second radio tab. Changing what it is used for takes \
-+                 effect on Apply.",
-+            )
-+            .weak(),
-+        );
++        ui.label(RichText::new(tr!("settings-radio-pluto-rx2")).strong());
++        ui.label(RichText::new(tr!("settings-radio-pluto-rx2-intro")).weak());
 +        egui::Grid::new("pluto-aux-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
-+            ui.label("Used for");
-+            let mut role = cfg.pluto.aux.role;
-+            enum_combo(ui, "pluto-aux-role", &mut role, &LimeAuxRole::ALL, LimeAuxRole::label);
-+            cfg.pluto.aux.role = role;
++            ui.label(tr!("settings-radio-used"));
++            egui::ComboBox::from_id_salt("pluto-aux-role")
++                .selected_text(cfg.pluto.aux.role.tr())
++                .show_styled(ui, |ui| {
++                    for r in LimeAuxRole::ALL {
++                        ui.selectable_value(&mut cfg.pluto.aux.role, r, r.tr());
++                    }
++                });
 +            ui.end_row();
 +
 +            if cfg.pluto.aux.role != LimeAuxRole::Off {
-+                ui.label("RX2 gain");
++                ui.label(tr!("settings-radio-pluto-rx2-gain"));
 +                if crate::chrome::slider(
 +                    ui,
 +                    Slider::new(&mut cfg.pluto.aux.gain_db, 0.0..=71.0).step_by(1.0).suffix(" dB"),
 +                )
 +                .on_hover_text(if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
-+                    "Set this LOW. The coupled sample of your own transmitter is a strong \
-+                     signal, and a feedback chain driven into compression teaches the \
-+                     correction its own distortion. Start at the bottom and use the \
-+                     coupler's attenuator. RX2 runs at this fixed gain, AGC off."
++                    tr!("settings-radio-set-low-coupled-sample-your")
 +                } else {
-+                    "Set so both aerials show about the same noise floor. Combining weights \
-+                     the two by their noise, and a chain driven into compression hands the \
-+                     filter a distorted copy of the interference, which cannot be subtracted \
-+                     from an undistorted one. RX2 runs at this fixed gain, AGC off."
++                    tr!("settings-radio-set-so-both-aerials-show")
 +                })
 +                .changed()
 +                {
@@ -797,40 +811,33 @@ index 506ab49f..c902a423 100644
 +            }
 +
 +            if cfg.pluto.aux.role == LimeAuxRole::Diversity {
-+                ui.label("What to do with it");
-+                let before = cfg.pluto.aux.mode;
-+                let mut mode = before;
-+                enum_combo(
-+                    ui,
-+                    "pluto-div-mode",
-+                    &mut mode,
-+                    &DiversityMode::ALL,
-+                    DiversityMode::label,
-+                );
-+                if mode != before {
-+                    cfg.pluto.aux.mode = mode;
-+                    push_gain(
-+                        cmds,
-+                        PlutoConfig::DIV_MODE_ELEMENT,
-+                        f64::from(u8::from(mode == DiversityMode::Combine)),
-+                    );
-+                }
++                ui.label(tr!("settings-radio-what-do"));
++                egui::ComboBox::from_id_salt("pluto-div-mode")
++                    .selected_text(cfg.pluto.aux.mode.tr())
++                    .show_styled(ui, |ui| {
++                        for m in DiversityMode::ALL {
++                            if ui.selectable_label(cfg.pluto.aux.mode == m, m.tr()).clicked() {
++                                cfg.pluto.aux.mode = m;
++                                push_gain(
++                                    cmds,
++                                    PlutoConfig::DIV_MODE_ELEMENT,
++                                    f64::from(u8::from(m == DiversityMode::Combine)),
++                                );
++                            }
++                        }
++                    });
 +                ui.end_row();
 +
-+                ui.label("Filter length");
++                ui.label(tr!("settings-radio-filter-length"));
 +                ui.horizontal(|ui| {
 +                    if ui
 +                        .add(
 +                            DragValue::new(&mut cfg.pluto.aux.taps)
 +                                .speed(1.0)
 +                                .range(1..=PlutoAuxConfig::MAX_TAPS)
-+                                .suffix(" taps"),
++                                .suffix(tr!("settings-radio-taps")),
 +                        )
-+                        .on_hover_text(
-+                            "One tap is a gain and a phase — a null at one frequency. Each \
-+                             further tap lets the filter equalise one more sample period of \
-+                             path difference between the aerials, widening the null.",
-+                        )
++                        .on_hover_text(tr!("settings-radio-one-tap-gain-phase-null-2"))
 +                        .changed()
 +                    {
 +                        push_gain(
@@ -849,16 +856,13 @@ index 506ab49f..c902a423 100644
 +                });
 +                ui.end_row();
 +
-+                ui.label("Adaptation");
++                ui.label(tr!("settings-radio-adaptation-2"));
 +                ui.horizontal(|ui| {
 +                    if crate::chrome::slider(
 +                        ui,
 +                        Slider::new(&mut cfg.pluto.aux.rate, 0.0..=1.0).show_value(false),
 +                    )
-+                    .on_hover_text(
-+                        "Slow and steady at the left, fast and visibly hunting at the right. \
-+                         Start fast to find the null, then hold it.",
-+                    )
++                    .on_hover_text(tr!("settings-radio-slow-steady-left-converging-inside"))
 +                    .changed()
 +                    {
 +                        push_gain(
@@ -867,8 +871,9 @@ index 506ab49f..c902a423 100644
 +                            f64::from(cfg.pluto.aux.rate),
 +                        );
 +                    }
-+                    if crate::chrome::checkbox(ui, &mut cfg.pluto.aux.frozen, "Hold")
-+                        .on_hover_text("Stop the filter moving once a null has appeared.")
++                    if ui
++                        .checkbox(&mut cfg.pluto.aux.frozen, tr!("settings-radio-hold"))
++                        .on_hover_text(tr!("settings-radio-stop-filter-moving-reach-moment"))
 +                        .changed()
 +                    {
 +                        push_gain(
@@ -878,8 +883,8 @@ index 506ab49f..c902a423 100644
 +                        );
 +                    }
 +                    if ui
-+                        .button("Restart")
-+                        .on_hover_text("Zero the filter and start again.")
++                        .button(tr!("settings-radio-restart"))
++                        .on_hover_text(tr!("settings-radio-zero-filter-find-null-again"))
 +                        .clicked()
 +                    {
 +                        push_gain(cmds, PlutoConfig::DIV_RESET_ELEMENT, 1.0);
@@ -889,31 +894,27 @@ index 506ab49f..c902a423 100644
 +            }
 +
 +            if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
-+                ui.label("Table steps");
++                ui.label(tr!("settings-radio-table-steps-2"));
 +                if ui
 +                    .add(
 +                        DragValue::new(&mut cfg.pluto.aux.ps_bins)
 +                            .speed(1.0)
 +                            .range(PlutoAuxConfig::PS_MIN_BINS..=PlutoAuxConfig::PS_MAX_BINS),
 +                    )
-+                    .on_hover_text(
-+                        "How finely the correction follows the amplifier's curve. Thirty-two \
-+                         suits the smooth curve of a typical amplifier. Changing it starts the \
-+                         correction again.",
-+                    )
++                    .on_hover_text(tr!("settings-radio-how-finely-correction-follows-amplifier"))
 +                    .changed()
 +                {
 +                    push_gain(cmds, PlutoConfig::PS_BINS_ELEMENT, f64::from(cfg.pluto.aux.ps_bins));
 +                }
 +                ui.end_row();
 +
-+                ui.label("Adaptation");
++                ui.label(tr!("settings-radio-adaptation-2"));
 +                ui.horizontal(|ui| {
 +                    if crate::chrome::slider(
 +                        ui,
 +                        Slider::new(&mut cfg.pluto.aux.ps_rate, 0.0..=1.0).show_value(false),
 +                    )
-+                    .on_hover_text("How hard each block of feedback moves the correction.")
++                    .on_hover_text(tr!("settings-radio-how-hard-each-block-feedback"))
 +                    .changed()
 +                    {
 +                        push_gain(
@@ -922,8 +923,9 @@ index 506ab49f..c902a423 100644
 +                            f64::from(cfg.pluto.aux.ps_rate),
 +                        );
 +                    }
-+                    if crate::chrome::checkbox(ui, &mut cfg.pluto.aux.ps_frozen, "Hold")
-+                        .on_hover_text("Keep the correction as it is.")
++                    if ui
++                        .checkbox(&mut cfg.pluto.aux.ps_frozen, tr!("settings-radio-hold"))
++                        .on_hover_text(tr!("settings-radio-keep-correction-curve-learned-clean"))
 +                        .changed()
 +                    {
 +                        push_gain(
@@ -933,8 +935,8 @@ index 506ab49f..c902a423 100644
 +                        );
 +                    }
 +                    if ui
-+                        .button("Restart")
-+                        .on_hover_text("Forget the correction and learn it again.")
++                        .button(tr!("settings-radio-restart"))
++                        .on_hover_text(tr!("settings-radio-forget-correction-learn-again"))
 +                        .clicked()
 +                    {
 +                        push_gain(cmds, PlutoConfig::PS_RESET_ELEMENT, 1.0);
@@ -945,36 +947,25 @@ index 506ab49f..c902a423 100644
 +        });
 +        if cfg.pluto.aux.role == LimeAuxRole::PureSignal {
 +            ui.label(
-+                RichText::new(
-+                    "Connect a directional coupler (with enough attenuation) from the \
-+                     amplifier's output to RX2. The transmitter compares what comes back with \
-+                     what it meant to send and pre-bends the signal so the amplifier's output \
-+                     comes out straight. The correction stays at unity until the feedback \
-+                     lines up, and can never ask for more than full scale. Progress goes to \
-+                     the log and the PS meter while you transmit.",
-+                )
-+                .weak(),
++                RichText::new(tr!("settings-radio-directional-coupler-amplifier-s-output")).weak(),
 +            );
 +            if !cfg.pluto.full_duplex || cfg.pluto.ptt_gpo != PlutoPtt::Off {
 +                ui.label(
-+                    RichText::new(
-+                        "PureSignal needs Full duplex on and the PTT pins off: the coupler is \
-+                         only heard while receive keeps running through the over.",
-+                    )
-+                    .color(crate::theme::YELLOW()),
++                    RichText::new(tr!("settings-radio-pluto-ps-needs-full-duplex"))
++                        .color(crate::theme::YELLOW()),
 +                );
 +            }
 +        }
 +    }
 +
      ui.add_space(6.0);
+     ui.label(RichText::new(tr!("settings-radio-wideband-iq-receive-transmit-half")).weak());
      ui.label(
-         RichText::new(
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index 84ce4c45..a56bb008 100644
+index 89da7479..5b21fb7e 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -9557,6 +9557,31 @@ configured in exactly the same way as one on your desk.
+@@ -9644,6 +9644,31 @@ configured in exactly the same way as one on your desk.
    the AD9361 ignores a gain written then; set the AGC to *Manual* to use it
    (issue #417).
  
@@ -1007,7 +998,7 @@ index 84ce4c45..a56bb008 100644
  a great many have had the well-known firmware change applied, which turns them
  into an AD9364 covering **70 MHz–6 GHz** with a 56 MHz filter. sdroxide does not
 diff --git a/src/main.rs b/src/main.rs
-index ea97f110..1e577436 100644
+index abbc1a15..ea73b98b 100644
 --- a/src/main.rs
 +++ b/src/main.rs
 @@ -2452,6 +2452,9 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
@@ -1574,7 +1565,7 @@ index f668487b..2362fe88 100644
 2.43.0
 
 
-From e1b666f9ba9afd02ecf6b018a760cbf83e43bbe2 Mon Sep 17 00:00:00 2001
+From 530f7c58fd3bb38b60694d922dd0038ccbc9caf6 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:11 -0400
 Subject: [PATCH 2/2] Two-tone test signal on TUNE, a movable TRANSMIT window,
@@ -1584,8 +1575,9 @@ A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
 level until clicked again, like the Tone button other SDR programs have: the
 signal amplifier linearity is judged with, and the one PureSignal learns
 from, since a steady carrier has a single amplitude. TxState gains two_tone
-and Command gains SetTuneTwoTone; wire protocol v188. Keying and level are
-TUNE's own, so every guard on TUNE applies.
+and Command gains SetTuneTwoTone; wire protocol v192. Keying and level are
+TUNE's own, so every guard on TUNE applies. The 2T chip's label and hover
+text are new en-US messages.
 
 On the compact strip the TX chip's drop-down hung over the S-meter, which is
 what an operator watches while setting drive and tune. It now opens a
@@ -1598,39 +1590,40 @@ receive, which is also PureSignal's feedback. It now takes up to four blocks
 a tick when that many are already waiting, still never waiting for more, and
 each goes to the panadapter as well as the audio, as #652 made it.
 ---
- crates/sdroxide-proto/src/lib.rs      |   7 +-
- crates/sdroxide-radio/src/engine.rs   | 148 ++++++++++++++++++++++++--
- crates/sdroxide-types/src/command.rs  |   5 +
- crates/sdroxide-types/src/state.rs    |  12 +++
- crates/sdroxide-ui/src/app/frame.rs   |   1 +
- crates/sdroxide-ui/src/app/mod.rs     |   6 ++
- crates/sdroxide-ui/src/app/top_bar.rs | 141 +++++++++++++++++++-----
- docs/USER_MANUAL.md                   |   8 +-
- 8 files changed, 288 insertions(+), 40 deletions(-)
+ crates/sdroxide-proto/src/lib.rs           |   7 +-
+ crates/sdroxide-radio/src/engine.rs        | 148 +++++++++++++++++++--
+ crates/sdroxide-types/src/command.rs       |   4 +
+ crates/sdroxide-types/src/state.rs         |  12 ++
+ crates/sdroxide-ui/i18n/en-US/sdroxide.ftl |   2 +
+ crates/sdroxide-ui/src/app/frame.rs        |   1 +
+ crates/sdroxide-ui/src/app/mod.rs          |   6 +
+ crates/sdroxide-ui/src/app/top_bar.rs      | 127 ++++++++++++++----
+ docs/USER_MANUAL.md                        |   8 +-
+ 9 files changed, 276 insertions(+), 39 deletions(-)
 
 diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
-index 2970b040..1fc00c95 100644
+index 2b271b53..2296cd5a 100644
 --- a/crates/sdroxide-proto/src/lib.rs
 +++ b/crates/sdroxide-proto/src/lib.rs
-@@ -1616,7 +1616,12 @@ use sdroxide_types::{
+@@ -1634,7 +1634,12 @@ use sdroxide_types::{
  /// its tail, and the radio configuration rides whole in both a command and an
- /// event, so a v186 peer reads the extra bytes as the start of the next field
+ /// event, so a v190 peer reads the extra bytes as the start of the next field
  /// and fails to decode either.
--pub const PROTO_VERSION: u16 = 187;
+-pub const PROTO_VERSION: u16 = 191;
 +///
-+/// v188: TUNE can send a two-tone test signal (issue #525). `TxState` gains
++/// v192: TUNE can send a two-tone test signal (issue #525). `TxState` gains
 +/// `two_tone` on its tail and `Command` gains a trailing `SetTuneTwoTone`;
-+/// `TxState` rides whole inside `RadioState`, so a v187 peer reads the extra
++/// `TxState` rides whole inside `RadioState`, so a v191 peer reads the extra
 +/// byte as the start of the next field and fails to decode every state.
-+pub const PROTO_VERSION: u16 = 188;
++pub const PROTO_VERSION: u16 = 192;
  const VERSION_BYTE: u8 = 0x12;
  
  #[derive(Debug, thiserror::Error)]
 diff --git a/crates/sdroxide-radio/src/engine.rs b/crates/sdroxide-radio/src/engine.rs
-index f7750526..f0573c5c 100644
+index 455dc511..a3f0f14a 100644
 --- a/crates/sdroxide-radio/src/engine.rs
 +++ b/crates/sdroxide-radio/src/engine.rs
-@@ -1770,6 +1770,11 @@ const SILENT_MIC_PEAK: f32 = 0.001;
+@@ -1775,6 +1775,11 @@ const SILENT_MIC_PEAK: f32 = 0.001;
  /// It is also the transmit latency: the over runs this far behind the client's
  /// own waveform, and `Engine::end_tci_tx` plays the remainder out rather than
  /// dropping it, so the tail of a timed burst is not cut off.
@@ -1642,7 +1635,7 @@ index f7750526..f0573c5c 100644
  const TCI_TX_LEAD: usize = TX_AUDIO_BLOCK * 24;
  /// Blocks (500 ms) of complete silence from a keyed TCI client before what it
  /// was asked for is written off and asked for again.
-@@ -1882,6 +1887,48 @@ const TCI_IQ_DEFAULT_HZ: f64 = 192_000.0;
+@@ -1887,6 +1892,48 @@ const TCI_IQ_DEFAULT_HZ: f64 = 192_000.0;
  const TCI_TX_FIFO_CAP: usize = 24_000;
  /// Sample rate of the TX baseband/audio fed to the TX-monitor analyzer.
  const TX_MONITOR_RATE: f64 = 48_000.0;
@@ -1691,7 +1684,7 @@ index f7750526..f0573c5c 100644
  /// The TX monitor's baseband/IQ runs near digital full scale (~0 dBFS), far
  /// hotter than any received signal, so on the shared floor/ceil it would clamp
  /// the waterfall to maximum. Dim it so the strongest TX lands this many dB below
-@@ -2789,6 +2836,9 @@ struct Engine {
+@@ -2794,6 +2841,9 @@ struct Engine {
      /// Phase accumulator for the TUNE tone on audio-modulated rigs (CAT/TCI),
      /// which need an audio carrier to key up.
      tune_phase: f32,
@@ -1701,7 +1694,7 @@ index f7750526..f0573c5c 100644
      /// The CTCSS tone or DCS stream going out under the voice, built from
      /// [`RadioState::repeater`] and rebuilt whenever that changes. `None` with
      /// the tone off, which is also what every non-FM mode gets: sub-audible
-@@ -4411,6 +4461,7 @@ fn engine_thread(
+@@ -4420,6 +4470,7 @@ fn engine_thread(
          ),
          tx_mon_buf: Vec::new(),
          tune_phase: 0.0,
@@ -1709,7 +1702,7 @@ index f7750526..f0573c5c 100644
          sub_tone: None,
          burst: None,
          burst_unkeys: false,
-@@ -4956,8 +5007,18 @@ fn engine_thread(
+@@ -4969,8 +5020,18 @@ fn engine_thread(
              // spends that budget: the transmit ring empties, and hardware that
              // answers an underrun by skipping ahead (SoapySX does) puts the
              // over on the air as chirps. See `IqSource::read_available`.
@@ -1729,7 +1722,7 @@ index f7750526..f0573c5c 100644
                      lane_samples += n as u64;
                      engine.samples_read += n as u64;
                      engine.last_block = n as u64;
-@@ -4970,6 +5031,9 @@ fn engine_thread(
+@@ -4983,6 +5044,9 @@ fn engine_thread(
                      // QO-100 station watches its own downlink through the over
                      // (#652).
                      engine.process_block(iq, pool.as_ref());
@@ -1739,7 +1732,7 @@ index f7750526..f0573c5c 100644
                  }
              }
          } else {
-@@ -8864,6 +8928,14 @@ impl Engine {
+@@ -8900,6 +8964,14 @@ impl Engine {
                      self.source.set_tx_drive(self.tx_power_level() as f64);
                  }
              }
@@ -1754,7 +1747,7 @@ index f7750526..f0573c5c 100644
              SetSwrGuard { enabled, limit } => {
                  // Clamped, not trusted. Below about 1.1:1 no real antenna ever
                  // sits, so a low value would refuse every transmission and look
-@@ -17897,10 +17969,18 @@ impl Engine {
+@@ -18084,10 +18156,18 @@ impl Engine {
          tx.mod_buf.clear();
          let mut burst_done = false;
          if self.state.tx.tune || tx.modulator.is_none() {
@@ -1776,7 +1769,7 @@ index f7750526..f0573c5c 100644
              self.mic_fifo.clear();
              // The recording tap has no other source of TX audio during tune —
              // without this the tap goes quiet for the tune's duration and
-@@ -18169,12 +18249,20 @@ impl Engine {
+@@ -18356,12 +18436,20 @@ impl Engine {
              } else {
                  self.state.tx.tune_drive.clamp(0.05, 1.0)
              };
@@ -1803,7 +1796,7 @@ index f7750526..f0573c5c 100644
                  }
              }
          } else if self.burst.is_some() && self.state.rx[0].mode == Mode::Nfm {
-@@ -21041,3 +21129,43 @@ mod tx_voice_tester_tests {
+@@ -21229,3 +21317,43 @@ mod tx_voice_tester_tests {
          assert_eq!(t.status().0, TxVoiceTest::Idle);
      }
  }
@@ -1848,21 +1841,20 @@ index f7750526..f0573c5c 100644
 +    }
 +}
 diff --git a/crates/sdroxide-types/src/command.rs b/crates/sdroxide-types/src/command.rs
-index 809c969f..16a9b3bc 100644
+index 3c49de19..e02b07ca 100644
 --- a/crates/sdroxide-types/src/command.rs
 +++ b/crates/sdroxide-types/src/command.rs
-@@ -1212,4 +1212,9 @@ pub enum Command {
-     ///
-     /// Appended for the usual reason — postcard numbers variants by position.
-     SetRigPowerStep(u8),
-+
+@@ -1257,4 +1257,8 @@ pub enum Command {
+     },
+     /// VARA HF: empty the panel's transcript. The link is untouched.
+     VaraTermClear,
 +    /// Make TUNE send the two-tone test signal (`true`) or a steady carrier
 +    /// (`false`) — see [`crate::TxState::two_tone`]. Does not key anything by
 +    /// itself: [`Command::SetTune`] does that. Appended for the usual reason.
 +    SetTuneTwoTone(bool),
  }
 diff --git a/crates/sdroxide-types/src/state.rs b/crates/sdroxide-types/src/state.rs
-index f1987d9d..97882384 100644
+index ca574dbc..dcdb70bf 100644
 --- a/crates/sdroxide-types/src/state.rs
 +++ b/crates/sdroxide-types/src/state.rs
 @@ -187,6 +187,18 @@ pub struct TxState {
@@ -1884,11 +1876,24 @@ index f1987d9d..97882384 100644
  }
  
  /// The most controlled-envelope compression the control offers, in decibels.
+diff --git a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
+index e37010b3..cc5cea4d 100644
+--- a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
++++ b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
+@@ -2026,6 +2026,8 @@ topbar-radio = RADIO
+ topbar-tune-voice-keyer-drive-mic = Tune, the voice keyer, and the drive and mic levels
+ topbar-transmit = TRANSMIT
+ topbar-tune = {" "}TUNE{" "}
++topbar-two-tone = {" "}2T{" "}
++topbar-two-tone-hover = Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, until clicked again. Its envelope swings from nothing to full, so it shows an amplifier's splatter plainly on a second receiver, and it is the signal PureSignal learns from fastest — a steady carrier only teaches it one point. Use a dummy load.
+ topbar-panadapter-two-layers-their-speeds = The panadapter — its two layers, their speeds and detail, peak hold — plus waterfall contrast, FFT size and the skimmers
+ topbar-display = DISPLAY
+ topbar-logbook-spots-awards-memories-scanner = Logbook, spots, awards, memories, the scanner, settings and the manual
 diff --git a/crates/sdroxide-ui/src/app/frame.rs b/crates/sdroxide-ui/src/app/frame.rs
-index 3f67989d..88b6d31b 100644
+index 9d489a2e..070d3aaa 100644
 --- a/crates/sdroxide-ui/src/app/frame.rs
 +++ b/crates/sdroxide-ui/src/app/frame.rs
-@@ -975,6 +975,7 @@ impl eframe::App for SdroxideApp {
+@@ -1018,6 +1018,7 @@ impl eframe::App for SdroxideApp {
          self.hd_window(&ctx, &mut cmds);
          self.voice_window(&ctx, &mut cmds);
          self.tx_audio_window(&ctx, &mut cmds);
@@ -1897,10 +1902,10 @@ index 3f67989d..88b6d31b 100644
          self.digi_settings_window(&ctx, &mut cmds);
          self.logbook_window(&ctx, &mut cmds);
 diff --git a/crates/sdroxide-ui/src/app/mod.rs b/crates/sdroxide-ui/src/app/mod.rs
-index e1d52b20..6a9b378a 100644
+index 16f1cb43..098461a0 100644
 --- a/crates/sdroxide-ui/src/app/mod.rs
 +++ b/crates/sdroxide-ui/src/app/mod.rs
-@@ -803,6 +803,11 @@ pub struct SdroxideApp {
+@@ -824,6 +824,11 @@ pub struct SdroxideApp {
      daylight_at: f64,
      /// The BANDS window.
      show_bands: bool,
@@ -1912,7 +1917,7 @@ index e1d52b20..6a9b378a 100644
      /// The propagation field rendered to pixels, rebuilt only when it moves.
      prop_heat: crate::prop_map::PropHeat,
      /// The grey-line (night/twilight) overlay rendered to pixels, rebuilt at
-@@ -1613,6 +1618,7 @@ impl SdroxideApp {
+@@ -1641,6 +1646,7 @@ impl SdroxideApp {
              daylight: true,
              daylight_at: f64::NEG_INFINITY,
              show_bands: false,
@@ -1921,10 +1926,10 @@ index e1d52b20..6a9b378a 100644
              prop: Default::default(),
              prop_heat: Default::default(),
 diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
-index 9761b9ca..96e34f22 100644
+index 9b3c1df5..dd80b502 100644
 --- a/crates/sdroxide-ui/src/app/top_bar.rs
 +++ b/crates/sdroxide-ui/src/app/top_bar.rs
-@@ -848,7 +848,7 @@ impl SdroxideApp {
+@@ -865,7 +865,7 @@ impl SdroxideApp {
                  _ => false,
              }),
              MenuChip::Sub => true,
@@ -1933,7 +1938,7 @@ index 9761b9ca..96e34f22 100644
              // Nothing here reads back: the socket is a name rather than an
              // on/off, and a radio that is switched off answers nothing at all.
              MenuChip::Rig | MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
-@@ -1048,8 +1048,9 @@ impl SdroxideApp {
+@@ -1066,8 +1066,9 @@ impl SdroxideApp {
                  let cell2 = egui::vec2(plan.cell2_w, chip_h);
                  ui.horizontal(|ui| {
                      if tx_capable {
@@ -1945,7 +1950,7 @@ index 9761b9ca..96e34f22 100644
                      }
                      let btn = crate::chrome::chip_sized(ui, false, "DISP", cell2);
                      self.disp_menu(ui, btn, cmds);
-@@ -1215,7 +1216,7 @@ impl SdroxideApp {
+@@ -1229,7 +1230,7 @@ impl SdroxideApp {
                  MenuChip::Div => self.div_menu(ui, btn, cmds),
                  MenuChip::Sub => self.sub_menu(ui, btn, cmds),
                  MenuChip::Rig => self.rig_menu(ui, btn, cmds),
@@ -1954,30 +1959,12 @@ index 9761b9ca..96e34f22 100644
                  MenuChip::Disp => self.disp_menu(ui, btn, cmds),
                  MenuChip::Sys => self.sys_menu(ui, btn, cmds),
              }
-@@ -1301,26 +1302,61 @@ impl SdroxideApp {
+@@ -1309,26 +1310,58 @@ impl SdroxideApp {
          });
      }
  
 -    /// The TX menu: tune, the voice keyer, and the drive and mic levels.
 -    fn tx_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
--        let btn = btn.on_hover_text("Tune, the voice keyer, and the drive and mic levels");
--        crate::chrome::menu_popup(ui, &btn, |ui| {
--            crate::chrome::menu_caption(ui, "Transmit");
--            // PTT is on the strip already; TUNE rides with the levels it is
--            // set up with.
--            self.tx_controls(ui, cmds, true);
--            if crate::chrome::chip_accent(
--                ui,
--                self.state.tx.tune,
--                RichText::new(" TUNE ").size(15.0),
--                crate::theme::YELLOW(),
--                crate::theme::INK_ON_CYAN(),
--            )
--            .clicked()
--            {
--                cmds.push(Command::SetTune(!self.state.tx.tune));
--            }
--        });
 +    /// The TX chip: opens and closes the TRANSMIT window — tune, the voice
 +    /// keyer, and the drive and mic levels.
 +    ///
@@ -1987,10 +1974,24 @@ index 9761b9ca..96e34f22 100644
 +    /// and tune (issue #525). A window can be dragged clear of it, and stays
 +    /// open through an over instead of closing at the first click elsewhere.
 +    fn tx_menu(&mut self, btn: egui::Response) {
-+        let btn = btn.on_hover_text(
-+            "Tune, the voice keyer, and the drive and mic levels — in a window you can \
-+             drag anywhere, so it need not cover the S-meter",
-+        );
+         let btn = btn.on_hover_text(tr!("topbar-tune-voice-keyer-drive-mic"));
+-        crate::chrome::menu_popup(ui, &btn, |ui| {
+-            crate::chrome::menu_caption(ui, &tr!("topbar-transmit"));
+-            // PTT is on the strip already; TUNE rides with the levels it is
+-            // set up with.
+-            self.tx_controls(ui, cmds, true);
+-            if crate::chrome::chip_accent(
+-                ui,
+-                self.state.tx.tune,
+-                RichText::new(tr!("topbar-tune")).size(15.0),
+-                crate::theme::YELLOW(),
+-                crate::theme::INK_ON_CYAN(),
+-            )
+-            .clicked()
+-            {
+-                cmds.push(Command::SetTune(!self.state.tx.tune));
+-            }
+-        });
 +        if btn.clicked() {
 +            self.show_tx_window = !self.show_tx_window;
 +        }
@@ -2002,7 +2003,7 @@ index 9761b9ca..96e34f22 100644
 +            return;
 +        }
 +        let mut open = self.show_tx_window;
-+        let resp = egui::Window::new("TRANSMIT")
++        let resp = egui::Window::new(tr!("topbar-transmit"))
 +            .id(crate::layout::salted_id(ctx, "TRANSMIT"))
 +            .open(&mut open)
 +            .frame(crate::chrome::window_frame())
@@ -2018,7 +2019,7 @@ index 9761b9ca..96e34f22 100644
 +                    if crate::chrome::chip_accent(
 +                        ui,
 +                        tx.tune && !tx.two_tone,
-+                        RichText::new(" TUNE ").size(15.0),
++                        RichText::new(tr!("topbar-tune")).size(15.0),
 +                        crate::theme::YELLOW(),
 +                        crate::theme::INK_ON_CYAN(),
 +                    )
@@ -2036,16 +2037,16 @@ index 9761b9ca..96e34f22 100644
      }
  
      /// The DISP menu: waterfall, spectrum and skimmer controls.
-@@ -4409,7 +4445,7 @@ impl SdroxideApp {
+@@ -4427,7 +4460,7 @@ impl SdroxideApp {
          let tx = self.state.tx;
          if crate::chrome::chip_accent_sized(
              ui,
 -            tx.tune,
 +            tx.tune && !tx.two_tone,
-             RichText::new(" TUNE ").size(15.0),
+             RichText::new(tr!("topbar-tune")).size(15.0),
              crate::theme::YELLOW(),
              crate::theme::INK_ON_CYAN(),
-@@ -4417,7 +4453,34 @@ impl SdroxideApp {
+@@ -4435,7 +4468,28 @@ impl SdroxideApp {
          )
          .clicked()
          {
@@ -2064,30 +2065,21 @@ index 9761b9ca..96e34f22 100644
 +        if crate::chrome::chip_accent(
 +            ui,
 +            tx.tune && tx.two_tone,
-+            RichText::new(TWO_TONE_CHIP).size(15.0),
++            RichText::new(tr!("topbar-two-tone")).size(15.0),
 +            crate::theme::YELLOW(),
 +            crate::theme::INK_ON_CYAN(),
 +        )
-+        .on_hover_text(
-+            "Two-tone test: transmits 700 Hz and 1900 Hz together at the Tune level, \
-+             until clicked again. Its envelope swings from nothing to full, so it \
-+             shows an amplifier's splatter plainly on a second receiver, and it is \
-+             the signal PureSignal learns from fastest — a steady carrier only \
-+             teaches it one point. Use a dummy load.",
-+        )
++        .on_hover_text(tr!("topbar-two-tone-hover"))
 +        .clicked()
 +        {
 +            tune_clicked(tx, true, cmds);
          }
      }
  
-@@ -6113,6 +6176,22 @@ const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
+@@ -6050,6 +6104,19 @@ const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
  /// The caption under the FDM-DUO's power presets (AJ3G, 18 Oct 2026).
  const DUO_PRESETS_CAPTION: &str = "ELAD FDM-DUO TX PWR";
  
-+/// The two-tone chip's label, shared by its draw sites and the width sums.
-+const TWO_TONE_CHIP: &str = " 2T ";
-+
 +/// What a click on TUNE (`two_tone` false) or on the two-tone chip (`true`)
 +/// sends. Clicking the one that is lit unkeys; clicking the other keys with
 +/// that waveform — switching over without unkeying if TUNE was already down,
@@ -2104,24 +2096,24 @@ index 9761b9ca..96e34f22 100644
  /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
  /// labels, so the chips match and the level blocks beside them start on the
  /// same column.
-@@ -6137,7 +6216,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
+@@ -6071,7 +6138,8 @@ fn tx_rows_fixed_w(ui: &egui::Ui, keyer: bool) -> (f32, f32) {
          |s: &str| crate::chrome::text_width(ui, s, egui::TextStyle::Body.resolve(ui.style()));
      let keyer_w = if keyer { crate::chrome::chip_width(ui, " ▶ ", Some(15.0)) + g } else { 0.0 };
-     let row1 = key_w + g + keyer_w + label("Drive") + g + g + TX_SLIDER_VALUE_W;
--    let row2 = key_w + g + label("Tune") + g + g + TX_SLIDER_VALUE_W;
-+    let two_tone_w = crate::chrome::chip_width(ui, TWO_TONE_CHIP, Some(15.0)) + g;
-+    let row2 = key_w + g + two_tone_w + label("Tune") + g + g + TX_SLIDER_VALUE_W;
+     let row1 = key_w + g + keyer_w + label(&tr!("topbar-drive")) + g + g + TX_SLIDER_VALUE_W;
+-    let row2 = key_w + g + label(&tr!("topbar-tune-2")) + g + g + TX_SLIDER_VALUE_W;
++    let two_tone_w = crate::chrome::chip_width(ui, &tr!("topbar-two-tone"), Some(15.0)) + g;
++    let row2 = key_w + g + two_tone_w + label(&tr!("topbar-tune-2")) + g + g + TX_SLIDER_VALUE_W;
      (row1, row2)
  }
  
-@@ -8414,6 +8494,13 @@ mod tests {
+@@ -8355,6 +8423,13 @@ mod tests {
                              crate::theme::INK_ON_CYAN(),
                              size,
                          );
 +                        crate::chrome::chip_accent(
 +                            ui,
 +                            false,
-+                            RichText::new(TWO_TONE_CHIP).size(15.0),
++                            RichText::new(tr!("topbar-two-tone")).size(15.0),
 +                            crate::theme::YELLOW(),
 +                            crate::theme::INK_ON_CYAN(),
 +                        );
@@ -2129,10 +2121,10 @@ index 9761b9ca..96e34f22 100644
                          crate::chrome::slider_readout(
                              ui,
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index a56bb008..e3e025ab 100644
+index 5b21fb7e..70b0acea 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -9572,7 +9572,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
+@@ -9659,7 +9659,11 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
    what comes out is straight. It needs **Full duplex** on and the **PTT pins**
    off, because the coupler is only heard while receive keeps running through
    the over; the correction shows on the PS meter and in the log while you
@@ -2145,7 +2137,7 @@ index a56bb008..e3e025ab 100644
  
  **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
  so both aerials show about the same noise floor; for PureSignal, start at the
-@@ -14587,7 +14591,7 @@ row of menu buttons:
+@@ -14693,7 +14697,7 @@ row of menu buttons:
  | **RX** | Volume, front-end gain, AGC, squelch, the filter width and edges, NB, ANC, NR, BIN |
  | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
  | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
