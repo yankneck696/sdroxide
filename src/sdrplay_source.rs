@@ -304,6 +304,10 @@ impl IqSource for SdrPlaySource {
         self.handle.set_rx_paused(paused);
     }
 
+    fn discard_pending_rx(&mut self) {
+        self.handle.discard_rx();
+    }
+
     fn sample_rate(&self) -> f64 {
         self.handle.out_rate_hz()
     }
@@ -378,6 +382,13 @@ impl IqSource for SdrPlaySource {
             self.log_depth();
         }
         Ok(pairs)
+    }
+
+    /// A centre of its own — the tuner's LO, retuned through the API — so the
+    /// engine may centre the I/Q on a resting dial
+    /// (`Engine::recentre_after_dwell`).
+    fn recentre_on_dwell(&self) -> bool {
+        true
     }
 
     fn describe(&self) -> String {

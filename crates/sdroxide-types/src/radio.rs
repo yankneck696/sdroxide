@@ -1028,6 +1028,13 @@ pub struct CatConfig {
     /// deserialise costs.
     #[serde(default)]
     pub elad_tx_input: EladTxInput,
+    /// The ELAD FDM-DUO's menu 34 `TX POWER` setting, as its `TP` parameter:
+    /// 0 to 8 for 0.3, 0.5, 1.0, 1.2, 1.5, 2.0, 3.0, 4.0 and 5.0 W, 9 for MAX.
+    /// Sent each time the port opens, and chosen with the 1W / 3W / 5W / MAX
+    /// buttons beside Drive. MAX for a config written before this existed,
+    /// which is what was always sent until then.
+    #[serde(default = "default_elad_tx_power")]
+    pub elad_tx_power: u8,
     pub format: SoundFormat,
     /// Conjugate the sound card's I/Q, mirroring the panadapter about the
     /// tuned frequency. Only read for [`SoundFormat::Iq`]: demod audio is real
@@ -1277,6 +1284,11 @@ fn default_rigctld_addr() -> String {
     "127.0.0.1:4532".to_string()
 }
 
+/// Menu 34 at MAX — see [`CatConfig::elad_tx_power`].
+pub fn default_elad_tx_power() -> u8 {
+    9
+}
+
 /// Where an flrig serves XML-RPC unless told otherwise — its own default port,
 /// on this machine.
 fn default_flrig_addr() -> String {
@@ -1299,6 +1311,7 @@ impl Default for CatConfig {
             flrig_addr: default_flrig_addr(),
             kenwood_send: KenwoodSend::default(),
             elad_tx_input: EladTxInput::default(),
+            elad_tx_power: default_elad_tx_power(),
             format: SoundFormat::default(),
             invert_spectrum: false,
             iq_offset_hz: 0.0,
@@ -2554,6 +2567,11 @@ impl RtlSdrConfig {
     /// without depending on the native backend crate — same reason as
     /// [`HpsdrConfig::LNA_GAIN_ELEMENT`].
     pub const TUNER_GAIN_ELEMENT: &'static str = "TUNER";
+    /// The R82xx's three stages one by one — LNA, mixer, and the IF VGA —
+    /// each on its own 16-step ladder, beside the combined `TUNER` ladder
+    /// that walks LNA and mixer together.
+    pub const LNA_GAIN_ELEMENT: &'static str = "LNA";
+    pub const MIX_GAIN_ELEMENT: &'static str = "MIX";
     pub const IF_GAIN_ELEMENT: &'static str = "IF";
     /// Pseudo-elements carrying settings that are not gains at all.
     ///
@@ -3254,6 +3272,8 @@ impl Rx888Config {
     /// `sdroxide-rx888` so the wasm-safe settings UI can address them without
     /// depending on the native backend crate.
     pub const VGA_ELEMENT: &'static str = "VGA";
+    /// The AD8370's gain range: 0 either (the driver's pick), 1 low, 2 high.
+    pub const VGA_RANGE_ELEMENT: &'static str = "VGARANGE";
     pub const ATT_ELEMENT: &'static str = "ATT";
     pub const DITHER_ELEMENT: &'static str = "DITHER";
     pub const BIAS_TEE_ELEMENT: &'static str = "BIASTEE";
@@ -6813,6 +6833,30 @@ impl PanadapterTap {
     }
 }
 
+/// Which speaker channels a radio's audio goes to (#654): both, or one ear
+/// only — two radios on one headset, one per side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AudioRoute {
+    /// Both channels: a sub receiver on the right, as it always was.
+    #[default]
+    Both,
+    /// The left channel only, the main and sub receivers mixed into it.
+    Left,
+    /// The right channel only, the main and sub receivers mixed into it.
+    Right,
+}
+
+impl AudioRoute {
+    pub const ALL: [AudioRoute; 3] = [AudioRoute::Both, AudioRoute::Left, AudioRoute::Right];
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioRoute::Both => "Both channels",
+            AudioRoute::Left => "Left only",
+            AudioRoute::Right => "Right only",
+        }
+    }
+}
+
 /// Which of the two radios you listen to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PanadapterAudio {
@@ -7433,6 +7477,31 @@ pub struct RadioConfig {
     /// refuses to make its rated power. See [`Self::tx_drive_ceiling`] for what
     /// it is for and why it is not the band table.
     pub tx_drive_max: Option<f32>,
+    /// This radio's S-meter calibration, in dB, added to the station's
+    /// `cal_offset_db`. An SDR's meter reads dBFS until it is told where zero
+    /// is, and the station-wide figure lived only in `config.toml` with no
+    /// control for it — and is wrong for every radio but the one it was set
+    /// against (#642). Settable from Settings → Radio and applied live.
+    ///
+    /// `0.0` in a configuration written before this existed: the meter reads
+    /// exactly as it did. Appended last, as every field here is.
+    pub s_meter_cal_db: f32,
+    /// Which speaker channels this radio's audio goes to. See [`AudioRoute`].
+    /// `Both` in a configuration written before this existed. Appended last.
+    pub audio_route: AudioRoute,
+    /// One receive gain on every band, as before #605. Off — the default — the
+    /// gain stages are remembered per band and restored as the dial crosses
+    /// into one; a band never set keeps whatever gain is in force. Appended
+    /// last.
+    pub same_gain_all_bands: bool,
+    /// Leave the I/Q window where it is when the dial comes to rest near its
+    /// edge, instead of centring it after a few seconds (the engine's
+    /// `recentre_after_dwell`). Stored as the opt-out so that a configuration
+    /// written before this existed — and the derived default — keep centring,
+    /// which is what a receiver with a centre of its own should do.
+    ///
+    /// Appended last: the protocol numbers fields by position.
+    pub dwell_recentre_off: bool,
 }
 
 impl RadioConfig {

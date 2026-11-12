@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::{Complex32, Result};
-use sdroxide_types::{Mode, Vfo};
+use sdroxide_types::{AgcMode, Mode, Vfo};
 
 /// Corner frequency of the front-end DC blocker. Low enough to be invisible at
 /// any device rate (10 ppm of a 2 Msps span), high enough to settle in ~8 ms.
@@ -126,6 +126,17 @@ pub enum ControlUpdate {
 /// default for anyone running a frequency converter. Add the forward at the
 /// same time.
 pub trait IqSource: Send {
+    /// Select a mode-dependent receive path. `Some` reports whether the
+    /// resulting stream is demodulated audio; `None` leaves capabilities alone.
+    fn prepare_receive_mode(&mut self, _mode: Mode) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
+    /// Hardware-specific reason a modulation mode cannot be received.
+    fn mode_unavailable(&self, _mode: Mode) -> Option<&'static str> {
+        None
+    }
+
     fn sample_rate(&self) -> f64;
     fn center_hz(&self) -> f64;
     fn set_center_hz(&mut self, hz: f64) -> Result<()>;
@@ -173,6 +184,25 @@ pub trait IqSource: Send {
 
     /// Human-readable description for logs/UI.
     fn describe(&self) -> String;
+
+    /// Where a recording being played back is, or `None` for every source
+    /// that is a radio. The engine reads this to know a playback is running at
+    /// all.
+    fn playback_status(&self) -> Option<sdroxide_types::PlaybackStatus> {
+        None
+    }
+
+    /// Whether an audio-mode source carries a second ear in `im` for the
+    /// speaker — a stereo recording being played back. Default: no, `im` is
+    /// nothing a speaker should hear.
+    fn audio_stereo(&self) -> bool {
+        false
+    }
+
+    /// Pause, seek or loop a playback. Default: nothing to steer.
+    fn playback_control(&mut self, _cmd: &sdroxide_types::PlaybackCommand) -> Result<()> {
+        Ok(())
+    }
 
     // Hardware controls — meaningful only for real devices; default no-ops.
     fn set_gain_element(&mut self, _name: &str, _db: f64) -> Result<()> {
@@ -245,6 +275,9 @@ pub trait IqSource: Send {
     fn set_rig_power(&mut self, _on: bool) -> Result<()> {
         Ok(())
     }
+    /// Put the radio's own power setting on one of its numbered steps — the
+    /// ELAD FDM-DUO's menu 34, by its `TP` parameter. A no-op everywhere else.
+    fn set_power_step(&mut self, _code: u8) {}
     /// Whether [`Self::set_rig_power`] reaches this radio, for
     /// `DeviceCaps::commands_rig_power`.
     fn commands_rig_power(&self) -> bool {
@@ -281,6 +314,25 @@ pub trait IqSource: Send {
     /// Not an assertion: what comes back is adopted. Free on a front end with
     /// nothing to ask.
     fn reread_rx_antenna(&mut self) {}
+    /// Whether this radio has a built-in antenna tuner sdroxide can drive, and
+    /// what it is doing.
+    ///
+    /// `None` — the default — where it has none, or has not said yet. `Some`
+    /// becomes `DeviceCaps::has_atu` and `RadioState::atu`, the same way
+    /// [`Self::rx_antenna`] becomes its pair. Asked on every pass of the engine
+    /// loop, so it must not allocate or block.
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        None
+    }
+    /// Start a tune. The radio keys its own carrier for it; sdroxide transmits
+    /// nothing.
+    fn atu_tune(&mut self) -> Result<()> {
+        Ok(())
+    }
+    /// Take the tuner out of circuit.
+    fn atu_bypass(&mut self) -> Result<()> {
+        Ok(())
+    }
     /// Whether the receive port is the source's own to decide, so a remembered
     /// one must not be restored over the top of it.
     ///
@@ -610,6 +662,27 @@ pub trait IqSource: Send {
         false
     }
 
+    /// Whether the engine may centre the I/Q on a dial that has come to rest
+    /// (see `Engine::recentre_after_dwell`).
+    ///
+    /// True on receivers with a centre of their own — a KiwiSDR's 12 kHz
+    /// window moved by a line to the server, an RX-888's downconverter, the
+    /// LO of an RTL-SDR, an SDRplay, an Airspy … — where one retune per
+    /// resting place is the price of hearing a station tuned near the edge
+    /// in the middle of the window. Never acted on where the centre *is* the
+    /// dial ([`Self::center_is_dial`]): that would turn a transceiver's own
+    /// frequency.
+    ///
+    /// Asked once per pass of the engine loop, so it has to be cheap.
+    /// Default: false.
+    // Why: opt-in rather than a list of drivers in the engine: the source is
+    //      the one that knows what a retune costs it.
+    // Why: HDZ 2026-11-10: "das gleiche Verhalten braucht es auch beim RX-888
+    //      … für eigentlich alle Receiver, die ein Panoramafenster haben".
+    fn recentre_on_dwell(&self) -> bool {
+        false
+    }
+
     /// Where a transceiver's I/Q lands when the radio is in CW: on the
     /// frequency its VFO displays (true), or a sidetone pitch below it (false).
     ///
@@ -678,6 +751,29 @@ pub trait IqSource: Send {
     /// Default: no-op — an SDR's filter is the engine's own, applied to IQ it
     /// has all of.
     fn set_control_filter(&mut self, _mode: Mode, _lo_hz: f64, _hi_hz: f64) {}
+
+    /// Command the rig's own AGC to the setting the operator picked here.
+    ///
+    /// The same case as [`Self::set_control_filter`]: on demodulated audio the
+    /// rig's AGC has already levelled what arrives, so the engine's AGC behind
+    /// it has almost nothing left to do and its button changes nothing that
+    /// can be heard. A family with no way to say a particular setting — Icom
+    /// has no plain AGC OFF — leaves the radio where it was.
+    ///
+    /// Default: no-op.
+    fn set_control_agc(&mut self, _agc: AgcMode) {}
+
+    /// Whether [`Self::set_control_agc`] reaches the radio at all.
+    ///
+    /// Every rig that answers true takes Slow, Med and Fast but has no way to
+    /// be told Off, so while the radio is the one demodulating the engine
+    /// stops offering Off (`DeviceCaps::agc_off_unavailable`) rather than
+    /// show a setting the audio never hears.
+    ///
+    /// Default: false.
+    fn commands_agc(&self) -> bool {
+        false
+    }
 
     /// The receive offset (RIT) this front end has to carry itself, in Hz —
     /// zero when RIT is off.
@@ -974,6 +1070,23 @@ impl ConvertedSource {
         // I.F. has to say so, or the radio comes up on 28 MHz having been
         // opened for 144.
         let step = plan.step_from_hardware(inner.center_hz());
+        Self::with_step(inner, plan, step)
+    }
+
+    /// Open using the dial requested by the caller, which disambiguates
+    /// transverters that share an intermediate frequency.
+    pub fn with_plan_at_dial(inner: Box<dyn IqSource>, plan: ConverterPlan, dial_hz: f64) -> Self {
+        let step = plan.step_for(dial_hz);
+        Self::with_step(inner, plan, step)
+    }
+
+    fn with_step(mut inner: Box<dyn IqSource>, plan: ConverterPlan, step: ConverterStep) -> Self {
+        // The band decoder follows the dial too, and until a retune it would
+        // otherwise be left on the I.F. (#444).
+        if !step.is_identity() {
+            let dial = inner.center_hz() - step.rx_offset_hz;
+            inner.set_dial_hz(dial);
+        }
         ConvertedSource { inner, plan, step }
     }
 
@@ -1343,6 +1456,12 @@ impl IqSource for ConvertedSource {
         format!("{} (+{:.6} MHz converter)", self.inner.describe(), self.step.rx_offset_hz / 1e6)
     }
 
+    /// A converter moves where the hardware sits, not what a retune costs it:
+    /// the answer is the hardware's.
+    fn recentre_on_dwell(&self) -> bool {
+        self.inner.recentre_on_dwell()
+    }
+
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let (center, span) = self.inner.wide_spectrum_db(out)?;
         Some((self.down(center), span))
@@ -1368,6 +1487,14 @@ impl IqSource for ConvertedSource {
     }
 
     // --- forwarded verbatim -------------------------------------------------
+
+    fn prepare_receive_mode(&mut self, mode: Mode) -> Result<Option<bool>> {
+        self.inner.prepare_receive_mode(mode)
+    }
+
+    fn mode_unavailable(&self, mode: Mode) -> Option<&'static str> {
+        self.inner.mode_unavailable(mode)
+    }
 
     fn sample_rate(&self) -> f64 {
         self.inner.sample_rate()
@@ -1440,6 +1567,9 @@ impl IqSource for ConvertedSource {
     fn set_rig_power(&mut self, on: bool) -> Result<()> {
         self.inner.set_rig_power(on)
     }
+    fn set_power_step(&mut self, code: u8) {
+        self.inner.set_power_step(code)
+    }
     fn commands_rig_power(&self) -> bool {
         self.inner.commands_rig_power()
     }
@@ -1451,6 +1581,17 @@ impl IqSource for ConvertedSource {
     }
     fn reread_rx_antenna(&mut self) {
         self.inner.reread_rx_antenna();
+    }
+    /// The tuner sits between the radio and its aerial, behind any converter
+    /// on the receive side, so it is the inner radio's.
+    fn atu(&self) -> Option<sdroxide_types::AtuState> {
+        self.inner.atu()
+    }
+    fn atu_tune(&mut self) -> Result<()> {
+        self.inner.atu_tune()
+    }
+    fn atu_bypass(&mut self) -> Result<()> {
+        self.inner.atu_bypass()
     }
 
     fn owns_rx_antenna(&self) -> bool {
@@ -1596,6 +1737,14 @@ impl IqSource for ConvertedSource {
         self.inner.set_control_filter(mode, lo_hz, hi_hz);
     }
 
+    fn set_control_agc(&mut self, agc: AgcMode) {
+        self.inner.set_control_agc(agc);
+    }
+
+    fn commands_agc(&self) -> bool {
+        self.inner.commands_agc()
+    }
+
     /// Relative (an offset from the dial), so untouched.
     fn set_rit_hz(&mut self, hz: f64) {
         self.inner.set_rit_hz(hz);
@@ -1674,18 +1823,18 @@ impl IqSource for ConvertedSource {
 }
 
 /// Paces reads so a non-hardware source delivers samples in real time.
-struct Throttle {
+pub(crate) struct Throttle {
     start: Instant,
     emitted: u64,
     rate: f64,
 }
 
 impl Throttle {
-    fn new(rate: f64) -> Self {
+    pub(crate) fn new(rate: f64) -> Self {
         Throttle { start: Instant::now(), emitted: 0, rate }
     }
 
-    fn pace(&mut self, n: usize) {
+    pub(crate) fn pace(&mut self, n: usize) {
         self.emitted += n as u64;
         let due = self.start + Duration::from_secs_f64(self.emitted as f64 / self.rate);
         let now = Instant::now();

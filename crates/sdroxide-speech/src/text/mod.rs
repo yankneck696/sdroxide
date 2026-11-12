@@ -141,12 +141,18 @@ impl<'a> Speaker<'a> {
             Mode::RttyFm => "ritty on F M",
             Mode::Olivia => "olivia",
             Mode::Thor => "thor",
+            Mode::Contestia => "contessia",
+            Mode::DominoEx => "domino e x",
+            Mode::Mfsk => "m f s k",
+            Mode::Mt63 => "m t sixty three",
             Mode::Fsq => "F S Q",
             Mode::RfPaint => "R F paint",
             Mode::Rade => "rade",
             Mode::Rifp => "R I F P",
             Mode::Packet => "packet",
             Mode::PacketHf => "H F packet",
+            Mode::Mercury => "mercury",
+            Mode::Data2g => "data 2 G",
             // A word, not four letters: nobody says "A P R S" out loud.
             Mode::Aprs => "aprs",
             Mode::Wefax => "wefax",
@@ -173,6 +179,7 @@ impl<'a> Speaker<'a> {
             Mode::Ais => "A I S",
             // Spelt out for the same reason every other initialism here is.
             Mode::Hfdl => "H F D L",
+            Mode::Jtty => "J T T Y",
             Mode::Fsk441 => "F S K four forty one",
             Mode::AtChat => "at chat",
         }

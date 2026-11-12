@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use sdroxide_radio::{Complex32, EngineConfig, IqSource, Result, start_engine};
-use sdroxide_types::{Command, DeviceCaps, Mode, RadioEvent, RxId};
+use sdroxide_types::{Command, DeviceCaps, Mode, RadioEvent, RxId, SpectrumConfig};
 
 /// A transmit-capable stand-in: RX returns silence, TX writes are accepted.
 struct MockSource {
@@ -140,4 +140,52 @@ fn psk_transmit_shows_on_panadapter() {
         run(&cmds, Duration::from_secs(4)),
         "a PSK transmission should appear on the TX panadapter"
     );
+}
+
+/// Issue #618: a CAT rig paired with a wideband receiver keys, and the narrow
+/// TX monitor should take over the panadapter at once. It was built with the
+/// panadapter's own FFT size, so at 48 kHz a large transform took seconds to
+/// fill and the display sat on the last receive picture until it did.
+#[test]
+fn the_tx_monitor_appears_promptly_with_a_large_fft() {
+    let rate = 2_000_000.0;
+    let src = MockSource { center: 14_074_000.0, rate };
+    let caps = DeviceCaps { tx_audio: true, ..tx_caps(rate) };
+    let cfg = EngineConfig { tx_ham_only: false, ..Default::default() };
+    let mut h = start_engine(Box::new(src), caps, cfg);
+    let thread = h.thread.take();
+
+    h.cmd_tx.send(Command::SetMode { rx: RxId::Main, mode: Mode::Usb }).unwrap();
+    h.cmd_tx
+        .send(Command::SetSpectrumCfg(SpectrumConfig { fft_size: 131_072, ..Default::default() }))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    h.cmd_tx.send(Command::SetTune(true)).unwrap();
+    let t0 = std::time::Instant::now();
+    // Only the TX monitor draws anything above the floor: the source receives
+    // silence, so nothing from before key-down can satisfy the wait.
+    let mut first = None;
+    let mut tx_span = 0.0;
+    while t0.elapsed() < Duration::from_secs(5) {
+        if h.spectrum_out.update() {
+            let f = h.spectrum_out.output_buffer();
+            if f.bins.iter().any(|&b| b > 0) {
+                first = Some(t0.elapsed());
+                tx_span = f.span_hz;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    h.cmd_tx.send(Command::SetTune(false)).unwrap();
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+    let first = first.expect("the TX monitor never appeared");
+    assert!(first < Duration::from_millis(1000), "the TX monitor took {first:?} to appear");
+    // Issue #827: drawn on the receiver's 2 MHz axis, not on its own few
+    // kilohertz. The client's waterfall remaps its history onto every new
+    // axis, so a narrow TX frame zoomed the scrollback away on key-down.
+    assert!(tx_span > 1_000_000.0, "the TX monitor moved the axis to {tx_span} Hz");
 }

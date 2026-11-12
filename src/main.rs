@@ -546,6 +546,9 @@ fn reopen_factory_for(
     // that one path a device that isn't there yet becomes the ordinary
     // reconnecting stand-in instead, and the engine takes it from there.
     let mut was_off = !sdroxide_config::load_radios().is_enabled(id);
+    // Whether this radio already stands in for a lent receiver. See
+    // [`lent_answer`].
+    let mut was_lent = panadapter_owners().contains_key(&id);
     Box::new(move |center: f64| {
         let mut c = cli.clone();
         c.freq = Some(center);
@@ -554,8 +557,16 @@ fn reopen_factory_for(
             was_off = false;
             return open_source(&c, &settings).map_err(|e| format!("{e:#}"));
         }
-        if let Some(owner) = panadapter_owners().get(&id) {
-            return Err(format!("this radio is radio {}'s panadapter receiver", owner + 1));
+        match lent_answer(panadapter_owners().get(&id).copied(), &mut was_lent) {
+            Some(Ok(owner)) => {
+                return Ok((
+                    Box::new(null_source::NullSource::attached(c.center_hz(), owner))
+                        as Box<dyn IqSource>,
+                    DeviceCaps { lent_to: Some(owner), ..synthetic_caps("Panadapter receiver") },
+                ));
+            }
+            Some(Err(e)) => return Err(e),
+            None => {}
         }
         if !sdroxide_config::load_radios().is_enabled(id) {
             was_off = true;
@@ -578,6 +589,26 @@ fn reopen_factory_for(
             other => other,
         }
     })
+}
+
+/// What a reopen of a radio whose receiver another radio has borrowed answers.
+///
+/// The first time the radio finds itself lent it has to *adopt* the attached
+/// stand-in: only that announces `lent_to`, which is what takes its tab off the
+/// strip. A plain refusal there kept the device it had just released, so after
+/// pairing at runtime the tab stayed with a frozen waterfall until a restart
+/// (#620). From then on it refuses, which keeps the stand-in's retries cheap
+/// until the pairing is undone. `None`: not lent, open the radio as usual.
+fn lent_answer(owner: Option<u32>, was_lent: &mut bool) -> Option<Result<u32, String>> {
+    let Some(owner) = owner else {
+        *was_lent = false;
+        return None;
+    };
+    if std::mem::replace(was_lent, true) {
+        Some(Err(format!("this radio is radio {}'s panadapter receiver", owner + 1)))
+    } else {
+        Some(Ok(owner))
+    }
 }
 
 /// The command line, minus everything that belongs to radio 0 alone: the
@@ -1224,7 +1255,7 @@ fn open_converted_source(
     // mean the dial rather than the I.F.
     let caps = sdroxide_radio::plan_caps(caps, &plan, &radio.freq_ranges_rx, &radio.freq_ranges_tx);
     log_stated_ranges(radio, &caps);
-    Ok((Box::new(ConvertedSource::with_plan(source, plan)), caps))
+    Ok((Box::new(ConvertedSource::with_plan_at_dial(source, plan, cli.center_hz())), caps))
 }
 
 /// What is in front of this radio, band by band: the transverter table first,
@@ -1700,7 +1731,7 @@ fn hpsdr_caps(board: &str, sample_rate: f64, protocol: u8, has_lna: bool, ddc: u
         audio_mode: false,
         freq_ranges_rx: vec![(0.0, nyquist)],
         freq_ranges_tx: if tx_channels > 0 {
-            vec![(1_800_000.0, if hermes_lite { 30_000_000.0 } else { 54_000_000.0 })]
+            vec![(1_800_000.0, if hermes_lite { nyquist } else { 54_000_000.0 })]
         } else {
             Vec::new()
         },
@@ -2470,19 +2501,38 @@ fn rtlsdr_caps(src: &rtlsdr_source::RtlSdrSource, driver: &str) -> DeviceCaps {
         audio_mode: false,
         freq_ranges_rx,
         sample_rates: sdroxide_types::RtlSdrConfig::SAMPLE_RATES.to_vec(),
-        gains: vec![
-            // The hardware only has 29 discrete steps; a request is snapped to
-            // the nearest and reported back, so a fine slider is honest enough.
-            sdroxide_types::GainElement::db(
-                sdroxide_types::RtlSdrConfig::TUNER_GAIN_ELEMENT,
-                sdroxide_types::Direction::Rx,
-                0.0,
-                sdroxide_types::RtlSdrConfig::GAIN_MAX_DB,
-                0.1,
-            ),
-        ],
+        gains: rtlsdr_gains(driver),
         ..DeviceCaps::default()
     }
+}
+
+/// An RTL-SDR's gain stages. Over USB the tuner's three, one by one — LNA
+/// and mixer on their measured ladders, the IF VGA in steps for want of a
+/// measured table — while the combined ladder stays in Settings → Radio;
+/// `rtl_tcp` has no opcode for the R82xx's stages, so a network dongle keeps
+/// the one combined rail.
+// Why: HDZ 2026-11-09: "beim RTL-SDR … LNA Gain (RF Gain) … IF Gain"; three
+//      rails fit the strip ("bringen wir drei unter?", measured).
+fn rtlsdr_gains(driver: &str) -> Vec<sdroxide_types::GainElement> {
+    use sdroxide_rtlsdr::{STAGE_MAX_INDEX, Stage, stage_db};
+    use sdroxide_types::{Direction, GainElement, RtlSdrConfig as R};
+    if driver != "rtlsdr" {
+        // The hardware only has 29 discrete steps; a request is snapped to
+        // the nearest and reported back, so a fine slider is honest enough.
+        return vec![GainElement::db(
+            R::TUNER_GAIN_ELEMENT,
+            Direction::Rx,
+            0.0,
+            R::GAIN_MAX_DB,
+            0.1,
+        )];
+    }
+    let top = |s: Stage| (0..=STAGE_MAX_INDEX).map(|i| stage_db(s, i)).fold(0.0, f64::max);
+    vec![
+        GainElement::db(R::LNA_GAIN_ELEMENT, Direction::Rx, 0.0, top(Stage::Lna), 0.1),
+        GainElement::db(R::MIX_GAIN_ELEMENT, Direction::Rx, 0.0, top(Stage::Mixer), 0.1),
+        GainElement::steps(R::IF_GAIN_ELEMENT, Direction::Rx, 0.0, f64::from(STAGE_MAX_INDEX), 1.0),
+    ]
 }
 
 /// Build the wideband SpyServer source from radio.json.
@@ -2783,6 +2833,9 @@ fn smartsdr_caps(model: &str, label: String) -> DeviceCaps {
         tx_audio: true,
         freq_ranges_rx: vec![(30_000.0, rx_top)],
         freq_ranges_tx: tx,
+        // Every FLEX has a directional coupler and reports SWR on its `SWR`
+        // meter, which the backend passes on while it is on the air.
+        has_swr_sensor: true,
         sample_rates: sdroxide_types::SmartSdrConfig::IQ_RATES.to_vec(),
         // No RX gain elements: a FLEX has no user-settable front-end gain in the
         // sense this list means. Its `display pan rfgain` is a per-panadapter
@@ -2870,6 +2923,20 @@ fn synthetic_caps(label: &str) -> DeviceCaps {
 mod tests {
     use super::*;
 
+    /// #620: lent at runtime, the radio takes the attached stand-in once, then
+    /// refuses until the pairing is undone, and takes it again when re-lent.
+    #[test]
+    fn a_radio_lent_at_runtime_adopts_the_stand_in_once() {
+        let mut was_lent = false;
+        assert_eq!(lent_answer(Some(0), &mut was_lent), Some(Ok(0)));
+        assert!(matches!(lent_answer(Some(0), &mut was_lent), Some(Err(_))));
+        assert_eq!(lent_answer(None, &mut was_lent), None);
+        assert_eq!(lent_answer(Some(2), &mut was_lent), Some(Ok(2)));
+        // Lent at boot, it already holds the stand-in: it only refuses.
+        let mut was_lent = true;
+        assert!(matches!(lent_answer(Some(0), &mut was_lent), Some(Err(_))));
+    }
+
     fn cli(oob: bool) -> Cli {
         let mut c = Cli::parse_from(["sdroxide"]);
         c.oob_tx = oob;
@@ -2890,6 +2957,29 @@ mod tests {
         // Already unlocked in the config: the flag changes nothing either way.
         assert!(!cli(false).tx_ham_only(&open));
         assert!(!cli(true).tx_ham_only(&open));
+    }
+
+    #[test]
+    fn hl2_transverter_tx_uses_the_hardware_bandwidth_not_the_ten_meter_band_edge() {
+        use sdroxide_radio::{ConverterPlan, ConverterStep, plan_caps};
+
+        let caps = hpsdr_caps("Hermes-Lite 2", 192_000.0, 1, true, 0);
+        assert!(caps.may_tx_hz(30_220_000.0));
+        assert!(caps.may_tx_hz(38_400_000.0));
+        assert!(!caps.may_tx_hz(38_400_001.0));
+        let plan = ConverterPlan::from_steps([ConverterStep {
+            band: Some((144_000_000.0, 148_000_000.0)),
+            rx_offset_hz: -116_000_000.0,
+            tx_offset_hz: Some(-116_000_000.0),
+            tx_drive: Some(0.02),
+        }]);
+        let converted = plan_caps(caps, &plan, &[], &[]);
+        assert!(converted.may_tx_hz(146_820_000.0 - 600_000.0));
+        assert!(converted.may_tx_hz(148_000_000.0));
+        assert!(!converted.may_tx_hz(148_000_001.0));
+        let secondary = hpsdr_caps("Hermes-Lite 2", 192_000.0, 1, true, 1);
+        assert_eq!(secondary.tx_channels, 0);
+        assert!(secondary.freq_ranges_tx.is_empty());
     }
 
     /// The flag is opt-in on the command line and nowhere else.

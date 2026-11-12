@@ -15,6 +15,7 @@ mod aprs_map;
 /// The world the flat maps are drawn from — the globe's own land raster,
 /// sampled on the CPU, plus the border and river geometry and the city table.
 mod basemap;
+mod catalogs;
 pub mod chrome;
 mod colormap;
 mod digi_map;
@@ -27,24 +28,33 @@ mod fuzzy;
 mod hell;
 mod help;
 mod hfdl_map;
+mod i18n;
 mod input;
 /// Which layout the window wears — desktop strip, tablet menus, or the compact
 /// phone strip — and the metrics that follow from it.
 pub mod layout;
 mod login;
 mod login_globe;
+mod mean_spectrum;
 /// Multi-radio shell: one window, one radio per tab. Native-only — the
 /// browser client drives a single (remote) radio.
 mod multi;
 mod prop_map;
+/// The PUBLIC SDRS window's map view: the receivers where they stand.
+mod publicsdr_map;
 #[cfg(feature = "remote")]
 mod remote;
+/// Pinned certificates for `wss://` stations nothing public vouches for.
+#[cfg(all(feature = "remote", not(target_arch = "wasm32")))]
+mod remote_tls;
 /// Asking egui for the next frame at the rate actually asked for.
 pub mod repaint;
 mod rf_paint;
 /// Solar-system 3D view. A second OS window natively, a second browser tab on
 /// the web; the sole consumer of depth/MSAA/vertex buffers either way.
 mod solar3d;
+mod sonde_map;
+mod sonde_online;
 mod sstv;
 pub mod theme;
 mod time;
@@ -528,6 +538,14 @@ mod v3dv_tests {
         assert!(prefer_gl_over_v3dv(&[adapter(Backend::Vulkan, "Broadcom V3D", "V3DV Mesa")]));
         assert!(prefer_gl_over_v3dv(&[adapter(Backend::Vulkan, "v3d 9.0.0.0", "Mesa")]));
     }
+}
+
+/// The main window's title: the program and its version, then what it is
+/// connected to. The version is there so a screenshot says which build it came
+/// from (#664).
+pub fn window_title(detail: &str) -> String {
+    let base = concat!("sdroxide ", env!("CARGO_PKG_VERSION"));
+    if detail.is_empty() { base.to_string() } else { format!("{base} — {detail}") }
 }
 
 /// The application icon, for [`eframe::egui::ViewportBuilder::with_icon`].

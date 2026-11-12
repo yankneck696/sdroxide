@@ -43,12 +43,15 @@ fn build() -> Vec<SatFreqs> {
                 duplex(
                     "NB transponder",
                     "SSB/CW/digital",
-                    P::range(2400.050, 2400.300),
-                    P::range(10489.550, 10489.800),
+                    P::range(2400.000, 2400.500),
+                    P::range(10489.500, 10490.000),
                 )
                 .note("non-inverting; 2.4 GHz up, 10 GHz down"),
-                down("NB lower beacon", "CW", P::at(10489.500)),
-                down("NB upper beacon", "BPSK 400bd", P::at(10489.800)),
+                // Beacon blocks as in the AMSAT-DL band plan.
+                down("NB lower beacon", "CW", P::range(10489.500, 10489.505)),
+                down("NB middle beacon", "BPSK 400bd", P::at(10489.750))
+                    .note("multimedia beacon; the frequency reference"),
+                down("NB upper beacon", "CW", P::range(10489.990, 10490.000)),
                 duplex(
                     "WB transponder",
                     "DVB-S2",
@@ -64,7 +67,12 @@ fn build() -> Vec<SatFreqs> {
             vec![
                 duplex("FM voice", "FM", P::at(145.200), P::at(145.800))
                     .note("uplink 144.490 in ITU regions 2 and 3"),
-                down("SSTV", "FM / PD120", P::at(145.800)).note("event-driven; check ARISS"),
+                // ARISS has run its SSTV events on 70 cm since 2026 (#622); the
+                // 2 m channel is kept for the older ones.
+                down("SSTV 70 cm", "SSTV FM / PD120", P::at(437.550))
+                    .note("event-driven; check ARISS"),
+                down("SSTV 2 m", "SSTV FM / PD120", P::at(145.800))
+                    .note("event-driven; check ARISS"),
                 duplex("APRS digipeater", "AX.25 1k2 AFSK", P::at(145.825), P::at(145.825))
                     .note("simplex; path ARISS"),
                 duplex("Cross-band repeater", "FM", P::at(145.990), P::at(437.800))
@@ -235,6 +243,18 @@ fn build() -> Vec<SatFreqs> {
             "NOAA-19",
             vec![down("APT", "FM / APT 2400 Hz", P::at(137.100)).note("polar, ~102 min")],
         ),
+        // Meteor's digital picture: QPSK at 72 ksym/s, about 120 kHz wide.
+        // The WEATHER SATELLITES window decodes it.
+        SatFreqs::new(
+            57166,
+            "METEOR-M2 3",
+            vec![down("LRPT", "QPSK / LRPT 72k", P::at(137.900)).note("polar, ~101 min")],
+        ),
+        SatFreqs::new(
+            59051,
+            "METEOR-M2 4",
+            vec![down("LRPT", "QPSK / LRPT 72k", P::at(137.100)).note("polar, ~101 min")],
+        ),
     ]
 }
 
@@ -292,12 +312,13 @@ mod tests {
     fn the_well_known_satellites_are_on_their_published_frequencies() {
         let qo = builtin_for(crate::satellites::QO100_NORAD).expect("QO-100 in the table");
         let nb = &qo.links[0];
-        assert_eq!(nb.downlink.unwrap().lo_mhz, 10489.550);
-        assert_eq!(nb.uplink.unwrap().lo_mhz, 2400.050);
-        assert_eq!(nb.downlink.unwrap().width_khz(), 250.0);
+        assert_eq!(nb.downlink.unwrap().lo_mhz, 10489.500);
+        assert_eq!(nb.uplink.unwrap().lo_mhz, 2400.000);
+        assert_eq!(nb.downlink.unwrap().width_khz(), 500.0);
 
         let iss = builtin_for(25544).expect("ISS in the table");
         assert!(iss.links.iter().any(|l| l.downlink == Some(Passband::at(145.800))));
+        assert!(iss.links.iter().any(|l| l.downlink == Some(Passband::at(437.550))));
         assert!(iss.links.iter().any(|l| l.label.contains("APRS")));
 
         let so50 = builtin_for(27607).expect("SO-50 in the table");
@@ -307,6 +328,9 @@ mod tests {
         // The three APT birds, which is what the 137 MHz antenna is for.
         assert_eq!(builtin_for(25338).unwrap().links[0].downlink, Some(Passband::at(137.620)));
         assert_eq!(builtin_for(33591).unwrap().links[0].downlink, Some(Passband::at(137.100)));
+        // And the Meteor LRPT pair the weather-satellite decoder also reads.
+        assert_eq!(builtin_for(57166).unwrap().links[0].downlink, Some(Passband::at(137.900)));
+        assert!(builtin_for(59051).unwrap().links[0].mode.contains("LRPT"));
     }
 
     /// The inversion flag drives the satellite lock's transmit mapping, so a

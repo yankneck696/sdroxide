@@ -193,6 +193,17 @@ pub(crate) struct RxStats {
     total_lost: u64,
     total_dropped: u64,
     total_keyed: u64,
+    /// Complex samples in the last good datagram: what a lost one would have
+    /// carried, so the clock figure can count the holes as time that passed.
+    last_pairs: u64,
+    /// Largest sequence gap seen in the window, in datagrams.
+    win_max_gap: u64,
+    /// Scheduling of the thread itself, recorded by Protocol 1 only (see
+    /// [`RxStats::on_loop`] and [`RxStats::on_ep2`]).
+    last_loop: Option<Instant>,
+    win_max_loop_gap: Duration,
+    win_max_ep2_late: Duration,
+    win_ep2_resyncs: u64,
 }
 
 impl RxStats {
@@ -213,6 +224,12 @@ impl RxStats {
             total_lost: 0,
             total_dropped: 0,
             total_keyed: 0,
+            last_pairs: 0,
+            win_max_gap: 0,
+            last_loop: None,
+            win_max_loop_gap: Duration::ZERO,
+            win_max_ep2_late: Duration::ZERO,
+            win_ep2_resyncs: 0,
         }
     }
 
@@ -222,6 +239,42 @@ impl RxStats {
         self.total_datagrams += 1;
         self.win_samples += pairs as u64;
         self.total_samples += pairs as u64;
+        self.last_pairs = pairs as u64;
+    }
+
+    /// Note that the network thread went round its loop at `now`. The longest
+    /// gap between two rounds in a window says whether the thread itself was
+    /// ever stalled long enough to matter (issue #553: loss that depends on the
+    /// machine and the sample rate, and on nothing the kernel counts).
+    pub(crate) fn on_loop(&mut self, now: Instant) {
+        if let Some(prev) = self.last_loop {
+            self.win_max_loop_gap = self.win_max_loop_gap.max(now.saturating_duration_since(prev));
+        }
+        self.last_loop = Some(now);
+    }
+
+    /// Note that an EP2 datagram went out `late` after it was due, and whether
+    /// the schedule had to be restarted because it was more than a period behind
+    /// (which silently skips datagrams the radio expected).
+    pub(crate) fn on_ep2(&mut self, late: Duration, resynced: bool) {
+        self.win_max_ep2_late = self.win_max_ep2_late.max(late);
+        if resynced {
+            self.win_ep2_resyncs += 1;
+        }
+    }
+
+    /// Timing of this thread over the window, empty when nothing was recorded
+    /// (Protocol 2 does not record it).
+    fn timing_note(&self) -> String {
+        if self.last_loop.is_none() {
+            return String::new();
+        }
+        format!(
+            "; thread: longest loop gap {:.1} ms, EP2 up to {:.1} ms late, {} EP2 resync(s)",
+            self.win_max_loop_gap.as_secs_f64() * 1e3,
+            self.win_max_ep2_late.as_secs_f64() * 1e3,
+            self.win_ep2_resyncs,
+        )
     }
 
     /// Record a datagram that was not a recognized I/Q frame.
@@ -233,6 +286,15 @@ impl RxStats {
     pub(crate) fn on_lost(&mut self, n: u64) {
         self.win_lost += n;
         self.total_lost += n;
+        self.win_max_gap = self.win_max_gap.max(n);
+    }
+
+    /// Samples the radio produced so far, received or not. The sample clock is
+    /// measured on this: a datagram that never arrived is still time that went
+    /// by, and counting only what arrived read every loss as a slow board
+    /// (-1100 ppm in issue #553, from a board that was within 40 ppm).
+    fn samples_elapsed(&self) -> u64 {
+        self.total_samples + self.total_lost * self.last_pairs
     }
 
     /// Record `pairs` complex samples discarded because the RX ring was full
@@ -269,7 +331,7 @@ impl RxStats {
         if dt < 20.0 || self.total_samples == 0 || self.nominal_hz <= 0.0 {
             return "clock: measuring".to_string();
         }
-        let measured = self.total_samples as f64 / dt;
+        let measured = self.samples_elapsed() as f64 / dt;
         let ppm = (measured / self.nominal_hz - 1.0) * 1e6;
         format!(
             "clock: {measured:.0} sps, {ppm:+.0} ppm vs nominal (≈{:+.0} Hz at 14 MHz)",
@@ -304,24 +366,28 @@ impl RxStats {
         if self.win_lost > 0 || self.win_dropped > 0 {
             tracing::warn!(
                 "HPSDR P{} RX: {} datagrams, {} samples ({:.1} ksps) over {:.2}s; \
-                 {} datagram(s) LOST on the network, {} sample(s) DROPPED (RX ring full — \
-                 the DSP thread is not keeping up; try a lower sample rate); \
-                 totals {} lost / {} dropped{}",
+                 {} datagram(s) LOST on the network (largest gap {}), {} sample(s) DROPPED \
+                 (RX ring full — the DSP thread is not keeping up; try a lower sample rate); \
+                 {} unrecognized; totals {} lost / {} dropped; {}{}{}",
                 self.proto,
                 self.win_datagrams,
                 self.win_samples,
                 ksps,
                 dt.as_secs_f64(),
                 self.win_lost,
+                self.win_max_gap,
                 self.win_dropped,
+                self.win_other,
                 self.total_lost,
                 self.total_dropped,
+                self.clock_error(),
+                self.timing_note(),
                 self.keyed_note(),
             );
         } else {
             tracing::debug!(
                 "HPSDR P{} RX: {} datagrams, {} samples ({:.1} ksps) over {:.2}s; \
-                 {} unrecognized; totals {} datagrams / {} samples; {}{}",
+                 {} unrecognized; totals {} datagrams / {} samples; {}{}{}",
                 self.proto,
                 self.win_datagrams,
                 self.win_samples,
@@ -331,6 +397,7 @@ impl RxStats {
                 self.total_datagrams,
                 self.total_samples,
                 self.clock_error(),
+                self.timing_note(),
                 self.keyed_note(),
             );
         }
@@ -339,9 +406,157 @@ impl RxStats {
         self.win_samples = 0;
         self.win_other = 0;
         self.win_lost = 0;
+        self.win_max_gap = 0;
         self.win_dropped = 0;
         self.win_keyed = 0;
+        self.win_max_loop_gap = Duration::ZERO;
+        self.win_max_ep2_late = Duration::ZERO;
+        self.win_ep2_resyncs = 0;
     }
+}
+
+/// The local UDP socket RX I/Q arrives on, with the largest receive buffer the
+/// system will give it.
+///
+/// **The default is sized for control traffic, not for an IQ stream.** Linux
+/// hands out about 212 KB and Windows as little as 64 KB; at 384 ksample/s a
+/// second of interleaved stereo is 1.5 MB, so the buffer holds a tenth of a
+/// second on Linux and forty milliseconds on Windows. Any stall longer than
+/// that — a repaint, a scan, a page fault, a resume from idle — is a burst of
+/// datagrams the kernel throws away before the loop can read them, and the
+/// radio goes on sending, so the gap is silent and permanent. Reported by
+/// DK8JV as a handful of datagrams lost "almost precisely every two seconds",
+/// which is exactly how a periodic stall shows up against a two-second
+/// statistics window (issue #388).
+///
+/// Asked for four megabytes and **the granted size is logged**, because that is
+/// the number that decides how long a stall can last: on Linux the kernel
+/// doubles the request and then caps it at `net.core.rmem_max`, which is 212 KB
+/// on a stock kernel and cannot be raised from inside a process. A log line
+/// that says `recv buffer 425984 bytes` is the operator's evidence that the
+/// limit is theirs to raise.
+fn receive_socket() -> std::io::Result<UdpSocket> {
+    const WANT: usize = 4 * 1024 * 1024;
+    // Best effort at every step: a system that refuses the size still streams,
+    // it just streams with the buffer it gave us.
+    let socket = match socket2::Socket::new(
+        socket2::Domain::IPV4,
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!("HPSDR: socket2 unavailable ({e}); using a plain UDP socket");
+            return UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0));
+        }
+    };
+    if let Err(e) = socket.set_recv_buffer_size(WANT) {
+        tracing::debug!("HPSDR: asking for a {WANT}-byte receive buffer failed: {e}");
+    }
+    socket.bind(&std::net::SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)).into())?;
+    match socket.recv_buffer_size() {
+        Ok(got) => tracing::info!(
+            "HPSDR: UDP receive buffer {got} bytes (~{:.0} ms of a 384 ksps stereo stream)",
+            got as f64 / 1_536_000.0 * 1000.0
+        ),
+        Err(e) => tracing::debug!("HPSDR: could not read back the receive buffer size: {e}"),
+    }
+    Ok(socket.into())
+}
+
+/// What the receive thread hands to a protocol loop.
+pub(crate) enum RxMsg {
+    /// One datagram exactly as it came off the socket, and where it came from
+    /// (Protocol 2 tells its DDCs apart by source port).
+    Datagram(Vec<u8>, std::net::SocketAddr),
+    /// The socket failed; the loop shuts the stream down.
+    Failed(std::io::Error),
+}
+
+/// Sets a flag when dropped, so the receive thread stops however the protocol
+/// loop returns.
+pub(crate) struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Datagrams the receive thread may hold for a loop that has stalled: about
+/// three seconds of a 384 ksps Protocol 1 stream. Past that the loop is gone for
+/// good and the sequence tracker reports the hole, so a full queue just drops.
+const RX_QUEUE: usize = 8192;
+
+/// How long the receive thread's socket waits before it looks at its stop flag.
+const RX_POLL: Duration = Duration::from_millis(100);
+
+/// Read the radio's datagrams on a thread of its own, with a plain blocking
+/// `recv_from`, and return the channel they arrive on plus the guard that stops
+/// the thread when dropped.
+///
+/// **Why not read in the protocol loop.** Both loops used to read with a 2 ms
+/// (500 µs while keyed) socket timeout so they could also pace the uplink and
+/// poll their control channel. On Windows a receive that times out is cancelled,
+/// and a datagram completing at that instant can be lost — Winsock's own
+/// documentation says the socket is in an "indeterminate state" after a
+/// timeout. DK8JV's Wireshark capture at 96 ksps showed every one of 33 706
+/// datagrams reaching the network card in order, while the same stream read
+/// through the timeout lost about one in 250 (issue #553). The loss fell with
+/// the datagram interval: nothing at 192 and 384 ksps (under a millisecond
+/// between datagrams, so the timeout never fires), most at 48 ksps (2.6 ms, so
+/// it fires on every round).
+///
+/// Here the only timeout is [`RX_POLL`], long enough that it fires only when the
+/// radio has gone quiet — when there is nothing to lose — and exists so the
+/// thread notices the stop flag. The protocol loop waits on the channel instead,
+/// whose timeout is the loop's own and touches no socket.
+///
+/// The socket's read timeout is one option for every handle, so from here on it
+/// is the receive thread's alone: the loop must only send on its handle.
+///
+/// `sdroxide-smartsdr` has its own copy of this (`udp_rx.rs`, for its VITA-49
+/// socket); the two should change together.
+pub(crate) fn start_receiver(
+    socket: &UdpSocket,
+    name: &str,
+) -> std::io::Result<(Receiver<RxMsg>, StopOnDrop)> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let guard = StopOnDrop(stop.clone());
+    let rx = spawn_receiver(socket.try_clone()?, stop, RX_POLL, name)?;
+    Ok((rx, guard))
+}
+
+fn spawn_receiver(
+    socket: UdpSocket,
+    stop: Arc<AtomicBool>,
+    poll: Duration,
+    name: &str,
+) -> std::io::Result<Receiver<RxMsg>> {
+    socket.set_read_timeout(Some(poll))?;
+    let (tx, rx) = crossbeam_channel::bounded(RX_QUEUE);
+    std::thread::Builder::new().name(name.to_string()).spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop.load(Ordering::Relaxed) {
+            match socket.recv_from(&mut buf) {
+                Ok((n, src)) => {
+                    if let Err(crossbeam_channel::TrySendError::Disconnected(_)) =
+                        tx.try_send(RxMsg::Datagram(buf[..n].to_vec(), src))
+                    {
+                        return;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(e) => {
+                    let _ = tx.send(RxMsg::Failed(e));
+                    return;
+                }
+            }
+        }
+    })?;
+    Ok(rx)
 }
 
 /// Follows a radio→host datagram sequence counter and reports how many
@@ -372,6 +587,34 @@ impl SeqTracker {
         self.next = Some(seq.wrapping_add(1));
         lost
     }
+
+    /// The sequence number the next datagram should carry, `None` before the
+    /// first one. Read *before* [`SeqTracker::observe`] to log a gap.
+    pub(crate) fn expected(&self) -> Option<u32> {
+        self.next
+    }
+}
+
+/// The most datagrams a gap is filled for. Beyond it the radio stalled or
+/// restarted, and padding that much silence would only delay the signal.
+pub(crate) const MAX_FILL_DATAGRAMS: u32 = 256;
+
+/// Write `floats` zeros (an even count: whole I/Q pairs) into the RX ring where
+/// datagrams went missing, so everything after the hole keeps its place in
+/// time. Without it a loss shortens the stream: a fax line slips a few samples
+/// per datagram (the slant of issue #553), a WSPR or FT8 slot starts early.
+///
+/// All or nothing, like [`push_iq`], and silent when the ring has no room: it is
+/// a courtesy to the decoders, never a reason to report an overrun.
+pub(crate) fn fill_gap(rx: &mut Producer<f32>, floats: usize) -> bool {
+    let Ok(mut chunk) = rx.write_chunk(floats & !1) else {
+        return false;
+    };
+    let (head, tail) = chunk.as_mut_slices();
+    head.fill(0.0);
+    tail.fill(0.0);
+    chunk.commit_all();
+    true
 }
 
 /// Push one datagram's interleaved I/Q into the RX ring, keeping I and Q
@@ -773,7 +1016,23 @@ impl HpsdrBoard {
         auto_gain: AutoGain,
     ) -> Result<HpsdrBoard, HpsdrError> {
         tracing::info!("HPSDR: opening {ip}, requested RX rate {sample_rate_hz:.0} Hz");
-        let (board, protocol) = match discovery::probe(ip, Duration::from_millis(800)) {
+        // Some boards answer only a *broadcast* discovery request: an ANAN-10
+        // and an ANAN-100D on Protocol 1 gateware were found as "P1" by
+        // Settings → Discover yet never answered the directed probe, so the
+        // open guessed Protocol 2 and got no I/Q (#744, #789). When the
+        // directed probe is silent, broadcast and keep the answer from `ip`.
+        let probed = discovery::probe(ip, Duration::from_millis(800)).or_else(|| {
+            let ip_s = ip.to_string();
+            let dev =
+                discovery::discover(Duration::from_millis(800)).into_iter().find(|d| d.ip == ip_s);
+            if dev.is_some() {
+                tracing::info!(
+                    "HPSDR: {ip} ignored the directed probe but answered a broadcast one"
+                );
+            }
+            dev
+        });
+        let (board, protocol) = match probed {
             Some(dev) => {
                 tracing::info!(
                     "HPSDR: {ip} answered probe: board \"{}\", Protocol {}, MAC {}, {}",
@@ -859,7 +1118,7 @@ impl HpsdrBoard {
             }
         }
 
-        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+        let socket = receive_socket()?;
         socket.set_read_timeout(Some(Duration::from_millis(2)))?;
         tracing::debug!(
             "HPSDR: bound local UDP socket {}",
@@ -1544,6 +1803,96 @@ mod tests {
     }
 
     #[test]
+    fn a_gap_is_filled_with_whole_pairs_of_silence() {
+        let (mut prod, mut cons) = RingBuffer::<f32>::new(16);
+        let mut stats = RxStats::new(1, 48_000.0);
+        assert!(push_iq(&mut prod, &[1.0, 2.0], &mut stats, false));
+        assert!(fill_gap(&mut prod, 4)); // two missing samples
+        assert!(push_iq(&mut prod, &[3.0, 4.0], &mut stats, false));
+        let got: Vec<f32> = std::iter::from_fn(|| cons.pop().ok()).collect();
+        assert_eq!(got, vec![1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 3.0, 4.0]);
+        // An odd request never leaves I and Q out of step.
+        assert!(fill_gap(&mut prod, 3));
+        assert_eq!(std::iter::from_fn(|| cons.pop().ok()).count(), 2);
+    }
+
+    #[test]
+    fn a_gap_that_does_not_fit_is_skipped_without_a_complaint() {
+        let (mut prod, mut cons) = RingBuffer::<f32>::new(4);
+        let stats = RxStats::new(1, 48_000.0);
+        assert!(!fill_gap(&mut prod, 8));
+        assert!(cons.pop().is_err(), "all or nothing");
+        assert_eq!(stats.total_dropped, 0, "a fill is not an overrun");
+    }
+
+    #[test]
+    fn the_clock_counts_lost_datagrams_as_time_that_passed() {
+        let mut stats = RxStats::new(1, 48_000.0);
+        for _ in 0..99 {
+            stats.on_iq(126);
+        }
+        stats.on_lost(1);
+        // 99 received + 1 lost = 100 datagrams of 126 samples.
+        assert_eq!(stats.samples_elapsed(), 100 * 126);
+        assert_eq!(stats.total_samples, 99 * 126);
+        assert_eq!(stats.win_max_gap, 1);
+    }
+
+    #[test]
+    fn thread_timing_keeps_the_worst_of_the_window() {
+        let mut stats = RxStats::new(1, 48_000.0);
+        assert_eq!(stats.timing_note(), "", "nothing recorded, nothing said");
+        let t0 = Instant::now();
+        stats.on_loop(t0);
+        stats.on_loop(t0 + Duration::from_millis(3));
+        stats.on_loop(t0 + Duration::from_millis(5));
+        stats.on_ep2(Duration::from_millis(2), false);
+        stats.on_ep2(Duration::from_millis(1), true);
+        assert_eq!(stats.win_max_loop_gap, Duration::from_millis(3));
+        assert_eq!(stats.win_max_ep2_late, Duration::from_millis(2));
+        assert_eq!(stats.win_ep2_resyncs, 1);
+        assert!(stats.timing_note().contains("1 EP2 resync"));
+    }
+
+    #[test]
+    fn the_receive_thread_delivers_every_datagram_in_order_and_stops() {
+        let rx_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = rx_socket.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let rx =
+            spawn_receiver(rx_socket, stop.clone(), Duration::from_millis(20), "test-rx").unwrap();
+        let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let from = tx.local_addr().unwrap();
+        for seq in 0u32..300 {
+            let mut d = vec![0u8; 1032];
+            d[4..8].copy_from_slice(&seq.to_be_bytes());
+            tx.send_to(&d, addr).unwrap();
+            if seq % 50 == 49 {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        for want in 0u32..300 {
+            match rx.recv_timeout(Duration::from_secs(2)) {
+                Ok(RxMsg::Datagram(d, src)) => {
+                    assert_eq!(d.len(), 1032);
+                    assert_eq!(src, from, "the source port rides along");
+                    assert_eq!(u32::from_be_bytes([d[4], d[5], d[6], d[7]]), want);
+                }
+                Ok(RxMsg::Failed(e)) => panic!("socket error: {e}"),
+                Err(e) => panic!("datagram {want} never came: {e}"),
+            }
+        }
+        // A quiet socket is not an error: the poll timeout just comes round.
+        assert!(rx.recv_timeout(Duration::from_millis(80)).is_err());
+        // And the thread ends once told to, which closes the channel.
+        stop.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+        ));
+    }
+
+    #[test]
     fn ring_overflow_drops_whole_datagrams() {
         // A ring with room for exactly 4 floats (rtrb rounds up to the request).
         let (mut prod, mut cons) = RingBuffer::<f32>::new(4);
@@ -1734,5 +2083,28 @@ mod hl2_swr_regression_tests {
     fn no_forward_drive_has_no_meaningful_swr() {
         assert_eq!(hl2_swr_from_raw(0, 0), None);
         assert_eq!(hl2_swr_from_raw(6, 0), None);
+    }
+
+    /// The receive buffer is the one number that decides how long a stall the radio
+    /// can survive, and it is the OS's decision, not ours.
+    ///
+    /// Asserted as a comparison rather than against a size: the kernel doubles the
+    /// request and then caps it at `net.core.rmem_max`, which differs per machine,
+    /// so an absolute floor would be a test of the machine rather than of this
+    /// code. What is ours to get right is that asking for a larger buffer never
+    /// yields a smaller one than a plain bind, and that the socket still binds.
+    #[test]
+    fn the_receive_socket_asks_for_more_room_than_a_plain_bind() {
+        let plain = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+        let plain_size = socket2::SockRef::from(&plain).recv_buffer_size().unwrap();
+        drop(plain);
+
+        let socket = super::receive_socket().expect("a local UDP socket");
+        assert!(socket.local_addr().is_ok(), "the socket is bound");
+        let size = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+        assert!(
+            size >= plain_size,
+            "the receive buffer ({size}) is smaller than a plain bind's ({plain_size})"
+        );
     }
 }

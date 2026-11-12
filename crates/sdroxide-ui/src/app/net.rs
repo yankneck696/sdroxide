@@ -5,6 +5,7 @@
 //! back is applied to the in-progress QSO and appended to the rolling log the
 //! SPOTS window shows.
 
+use crate::i18n::tr;
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -50,6 +51,9 @@ fn auto_upload_targets(cfg: &NetworkConfig) -> Vec<UploadTarget> {
     if cfg.auto_upload_wrl {
         t.push(UploadTarget::Wrl);
     }
+    if cfg.wavelog.auto_upload && cfg.wavelog.is_configured() {
+        t.push(UploadTarget::Wavelog);
+    }
     t
 }
 
@@ -73,6 +77,9 @@ pub(in crate::app) fn configured_upload_targets(cfg: &NetworkConfig) -> Vec<Uplo
     }
     if !cfg.wrl_api_key.trim().is_empty() {
         t.push(UploadTarget::Wrl);
+    }
+    if cfg.wavelog.is_configured() {
+        t.push(UploadTarget::Wavelog);
     }
     t
 }
@@ -200,8 +207,12 @@ impl SdroxideApp {
 
     /// Record an upload result and mark the QSO's sent flag on success.
     pub(in crate::app) fn on_upload_result(&mut self, r: UploadResult) {
-        let status = if r.ok { "OK" } else { "FAIL" };
-        self.push_net_log(format!("{} → {}: {}", r.target.label(), status, r.message));
+        let status = if r.ok { "OK" } else { &tr!("net-fail") };
+        let retry = if r.retryable { tr!("net-will-retry") } else { String::from("") };
+        self.push_net_log(format!("{} → {}: {}{retry}", r.target.label(), status, r.message));
+        if r.target == UploadTarget::Wavelog && !r.ok && !r.retryable {
+            self.wavelog_refused.insert(r.qso_id);
+        }
         if r.ok {
             if let Some(rec) = self.qso_log.iter_mut().find(|q| q.id == r.qso_id) {
                 match r.target {
@@ -210,10 +221,259 @@ impl SdroxideApp {
                     UploadTarget::ClubLog => rec.clublog_sent = true,
                     UploadTarget::HamQth => rec.hamqth_sent = true,
                     UploadTarget::Wrl => rec.wrl_sent = true,
+                    UploadTarget::Wavelog => rec.wavelog_sent = true,
                 }
                 persist_qso_log(&self.qso_log);
             }
         }
+    }
+
+    /// The QSOs owed to Wavelog: logged since auto-upload to it was switched
+    /// on, and not yet acknowledged.
+    ///
+    /// Read off the logbook rather than kept as a queue, so a QSO logged while
+    /// the server was down is still owed after a restart — the logbook is
+    /// already saved, and a second record of what is pending could only
+    /// disagree with it.
+    pub(in crate::app) fn wavelog_owed(&self) -> impl Iterator<Item = &QsoRecord> {
+        let cfg = &self.net_cfg_edit;
+        let on = cfg.auto_upload && cfg.wavelog.auto_upload && cfg.wavelog.is_configured();
+        let since = cfg.wavelog.auto_upload_since;
+        self.qso_log.iter().filter(move |q| {
+            on && !q.wavelog_sent && q.start_utc >= since && !self.wavelog_refused.contains(&q.id)
+        })
+    }
+
+    /// Every QSO not in Wavelog, for the operator's "send them all" button —
+    /// the backlog from before auto-upload, and anything refused this session
+    /// that they may since have fixed.
+    pub(in crate::app) fn wavelog_unsent(&self) -> impl Iterator<Item = &QsoRecord> {
+        self.qso_log.iter().filter(|q| !q.wavelog_sent && !q.call.trim().is_empty())
+    }
+
+    /// Send whatever is owed to Wavelog again, every few minutes.
+    ///
+    /// The first look is a short while after start, once the network settings
+    /// have arrived, which is what carries a QSO logged with the server down
+    /// across a restart. A QSO already on its way is not sent twice: the
+    /// engine's queue drops a repeat of one it is still holding.
+    ///
+    /// One tab only. Every radio tab holds a copy of the shared logbook, and
+    /// two of them retrying the same QSOs would double the traffic for
+    /// nothing; the station writer is the tab there is exactly one of.
+    pub(in crate::app) fn wavelog_retry_tick(&mut self, now: f64) {
+        const FIRST_S: f64 = 15.0;
+        const EVERY_S: f64 = 300.0;
+        // A batch at a time: the queue sends them in order anyway, and the
+        // rest are still owed at the next look.
+        const BATCH: usize = 200;
+        if !self.net_cfg_seeded || !self.station_writer {
+            return;
+        }
+        if self.wavelog_retry_at == 0.0 {
+            self.wavelog_retry_at = now + FIRST_S;
+            return;
+        }
+        if now < self.wavelog_retry_at {
+            return;
+        }
+        self.wavelog_retry_at = now + EVERY_S;
+        let owed: Vec<(u64, String, Vec<UploadTarget>)> = self
+            .wavelog_owed()
+            .take(BATCH)
+            .map(|q| {
+                let adif = sdroxide_types::qso_log_to_adif(std::slice::from_ref(q));
+                (q.id, adif, vec![UploadTarget::Wavelog])
+            })
+            .collect();
+        self.pending_uploads.extend(owed);
+    }
+
+    /// Start a Wavelog download when one is due: shortly after start, every
+    /// `sync_interval_min` after that, or when the settings tab asks. Also
+    /// carries out the operator's answer to a full resync.
+    ///
+    /// Only where the engine runs in this process — the pages are not sent to
+    /// remote clients — and only in the station-writer tab, for the reason
+    /// the upload retry gives.
+    pub(in crate::app) fn wavelog_sync_tick(&mut self, now: f64, cmds: &mut Vec<Command>) {
+        const FIRST_S: f64 = 5.0;
+        // A download whose end never came (the engine restarted under it) is
+        // given up on after this long, so it cannot block every later one.
+        const STUCK_S: f64 = 1800.0;
+        if let Some(apply) = self.wavelog_resync_answer.take() {
+            self.answer_wavelog_resync(apply);
+        }
+        if !self.net_cfg_seeded || !self.station_writer || self.ctrl.engine_is_remote() {
+            return;
+        }
+        let asked = self.wavelog_sync_request.take();
+        if self.wavelog_sync_running.is_some_and(|t| now - t < STUCK_S) {
+            return;
+        }
+        let cfg = &self.net_cfg_edit.wavelog;
+        let ready = cfg.is_configured() && !cfg.download_station_ids.is_empty();
+        if self.wavelog_sync_at == 0.0 {
+            self.wavelog_sync_at = now + FIRST_S;
+        }
+        let due = cfg.download && now >= self.wavelog_sync_at;
+        let full = match asked {
+            Some(full) => full,
+            None if due => false,
+            None => return,
+        };
+        self.wavelog_sync_at = now + f64::from(cfg.sync_interval_min.max(5)) * 60.0;
+        if !ready {
+            return;
+        }
+        let stations = self.wavelog_sync.starts(&cfg.url, &cfg.download_station_ids);
+        self.wavelog_sync_running = Some(now);
+        self.wavelog_sync_tally = Default::default();
+        if full {
+            self.wavelog_resync_rx = Some(Default::default());
+            self.wavelog_resync = None;
+            self.wavelog_sync_status = Some(tr!("net-full-resync-downloading"));
+        } else {
+            self.wavelog_sync_status = Some(tr!("net-downloading"));
+        }
+        cmds.push(Command::WavelogSync { stations, full });
+    }
+
+    /// One page of a Wavelog download.
+    pub(in crate::app) fn on_wavelog_batch(&mut self, b: sdroxide_types::WavelogBatch) {
+        if b.full {
+            self.on_wavelog_resync_batch(b);
+            return;
+        }
+        if !b.records.is_empty() {
+            // Another tab may have logged since this copy was read.
+            if self.shared_log {
+                self.qso_log = crate::app::persist::after_shared_log(
+                    std::mem::take(&mut self.qso_log),
+                    crate::app::persist::reload_qso_log(None),
+                );
+            }
+            let next = self.next_log_id();
+            let m = sdroxide_types::merge_from_wavelog(&mut self.qso_log, b.records, next);
+            self.wavelog_sync_tally.added += m.added;
+            self.wavelog_sync_tally.matched += m.matched;
+            if m.changed {
+                persist_qso_log(&self.qso_log);
+                self.log_content_changed();
+            }
+        }
+        if !b.done {
+            // Saved per page, after the log it describes: an interrupted
+            // download resumes from the last page that reached the log.
+            self.wavelog_sync.advance(b.station_id, b.last_id);
+            crate::app::persist::persist_wavelog_sync(&self.wavelog_sync);
+            return;
+        }
+        self.wavelog_sync_running = None;
+        let when = crate::app::util::time_str(crate::time::now_unix());
+        let t = self.wavelog_sync_tally;
+        let failed = b.error.is_some();
+        let line = match b.error {
+            Some(e) => format!("{when}Z: {}", e.trim_start_matches("Wavelog: ")),
+            None => {
+                self.wavelog_sync.last_sync_utc = crate::time::now_unix();
+                crate::app::persist::persist_wavelog_sync(&self.wavelog_sync);
+                tr!(
+                    "net-synced-z-new-already-log",
+                    when = when,
+                    added = t.added,
+                    matched = t.matched
+                )
+            }
+        };
+        // The net log hears about a download that brought something or
+        // failed; one that found nothing new every quarter of an hour is not
+        // news.
+        if t.added > 0 || failed {
+            self.push_net_log(tr!("net-wavelog-2", line = line));
+        }
+        self.wavelog_sync_status = Some(line);
+    }
+
+    /// A page of a full resync: collected, and worked out when the last one
+    /// arrives, for the operator to approve.
+    fn on_wavelog_resync_batch(&mut self, b: sdroxide_types::WavelogBatch) {
+        let Some((records, last)) = self.wavelog_resync_rx.as_mut() else {
+            // Nothing is collecting — the app restarted mid-resync, say — but
+            // the end still means nothing is running any more.
+            if b.done {
+                self.wavelog_sync_running = None;
+            }
+            return;
+        };
+        if !b.done {
+            records.extend(b.records);
+            let l = last.entry(b.station_id).or_insert(0);
+            *l = (*l).max(b.last_id);
+            return;
+        }
+        self.wavelog_sync_running = None;
+        let (records, last) = self.wavelog_resync_rx.take().unwrap_or_default();
+        if let Some(e) = b.error {
+            self.wavelog_sync_status =
+                Some(tr!("net-full-resync-stopped-nothing-changed", error = e.to_string()));
+            return;
+        }
+        if self.shared_log {
+            self.qso_log = crate::app::persist::after_shared_log(
+                std::mem::take(&mut self.qso_log),
+                crate::app::persist::reload_qso_log(None),
+            );
+        }
+        let plan = sdroxide_types::plan_resync(&self.qso_log, records);
+        if plan.is_empty() {
+            for (station, id) in &last {
+                self.wavelog_sync.advance(*station, *id);
+            }
+            crate::app::persist::persist_wavelog_sync(&self.wavelog_sync);
+            self.wavelog_sync_status = Some(tr!("net-full-resync-log-already-matches"));
+        } else {
+            self.wavelog_sync_status = Some(tr!("net-full-resync-review-changes-below"));
+            self.wavelog_resync = Some((plan, last));
+        }
+    }
+
+    /// Carry out — or drop — the resync the operator was shown.
+    fn answer_wavelog_resync(&mut self, apply: bool) {
+        let Some((plan, last)) = self.wavelog_resync.take() else { return };
+        if !apply {
+            self.wavelog_sync_status = Some(tr!("net-full-resync-discarded-nothing-changed"));
+            return;
+        }
+        // Another tab may have appended to the shared log while the plan sat
+        // waiting for an answer, and writing this copy back would lose its
+        // QSOs. Re-reading is safe: tabs only append, and a plan names
+        // existing records by id and adds new ones under fresh ids.
+        if self.shared_log {
+            self.qso_log = crate::app::persist::after_shared_log(
+                std::mem::take(&mut self.qso_log),
+                crate::app::persist::reload_qso_log(None),
+            );
+        }
+        let (add, update, remove, mark) =
+            (plan.add.len(), plan.update.len(), plan.remove.len(), plan.mark.len());
+        let next = self.next_log_id();
+        sdroxide_types::apply_resync(&mut self.qso_log, plan, next);
+        persist_qso_log(&self.qso_log);
+        self.log_content_changed();
+        for (station, id) in &last {
+            self.wavelog_sync.advance(*station, *id);
+        }
+        crate::app::persist::persist_wavelog_sync(&self.wavelog_sync);
+        let line = tr!(
+            "net-full-resync-applied-added-updated",
+            add = add,
+            update = update,
+            remove = remove,
+            mark = mark
+        );
+        self.push_net_log(tr!("net-wavelog-3", line = line));
+        self.wavelog_sync_status = Some(line);
     }
 
     pub(in crate::app) fn push_net_log(&mut self, line: String) {
@@ -244,7 +504,7 @@ impl SdroxideApp {
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(e) => {
-                self.push_net_log(format!("ADIF import failed: {e}"));
+                self.push_net_log(tr!("net-adif-import-failed", error = e.to_string()));
                 return;
             }
         };
@@ -252,38 +512,16 @@ impl SdroxideApp {
         let parsed =
             catch_unwind(AssertUnwindSafe(|| sdroxide_types::adif_to_qso_log_counting_swl(&text)));
         let Ok((records, swl)) = parsed else {
-            self.push_net_log("ADIF import failed: the file could not be parsed".to_string());
+            self.push_net_log(tr!("net-adif-import-failed-file-could").to_string());
             return;
         };
-        // One pass to index the existing log by call and band, so the duplicate
-        // check only looks at the QSOs that could match rather than at all of
-        // them. A full logbook is tens of thousands of records and this runs
-        // inside a single frame.
-        let mut by_call_band: HashMap<(String, String), Vec<i64>> = HashMap::new();
-        for q in &self.qso_log {
-            by_call_band
-                .entry((q.call.to_ascii_uppercase(), q.band.to_ascii_uppercase()))
-                .or_default()
-                .push(q.start_utc);
-        }
+        let (fresh, skipped) = new_import_records(&self.qso_log, records);
         let mut next_id = self.next_log_id();
-        let mut added = 0usize;
-        let mut skipped = 0usize;
-        for mut r in records {
-            if r.call.trim().is_empty() {
-                continue;
-            }
-            let key = (r.call.to_ascii_uppercase(), r.band.to_ascii_uppercase());
-            let starts = by_call_band.entry(key).or_default();
-            if starts.iter().any(|&t| (t - r.start_utc).abs() < 120) {
-                skipped += 1;
-                continue;
-            }
-            starts.push(r.start_utc);
+        let added = fresh.len();
+        for mut r in fresh {
             r.id = next_id;
             next_id += 1;
             self.qso_log.push(r);
-            added += 1;
         }
         if added > 0 {
             persist_qso_log(&self.qso_log);
@@ -292,17 +530,21 @@ impl SdroxideApp {
         // name that came out as nonsense is then a code page to report, not a
         // decoder to doubt.
         let assumed = match loaded.assumed {
-            Some(enc) => format!(" (not Unicode; read as {enc})"),
+            Some(enc) => tr!("net-not-unicode-read", enc = enc),
             None => String::new(),
         };
         // A file of received reports — the decode list's own ADIF export —
         // adds nothing, and saying why beats reporting an empty import.
         let reports = match swl {
             0 => String::new(),
-            n => format!(", {n} received reports (SWL) left out"),
+            n => tr!("net-received-reports-swl-left-out", n = n),
         };
-        self.push_net_log(format!(
-            "ADIF import: {added} added, {skipped} duplicates skipped{reports}{assumed}"
+        self.push_net_log(tr!(
+            "net-adif-import-added-duplicates-skipped",
+            added = added,
+            skipped = skipped,
+            reports = reports,
+            assumed = assumed
         ));
     }
 
@@ -322,7 +564,7 @@ impl SdroxideApp {
         let loaded = match loaded {
             Ok(loaded) => loaded,
             Err(e) => {
-                self.push_net_log(format!("Channel import failed: {e}"));
+                self.push_net_log(tr!("net-channel-import-failed", error = e.to_string()));
                 return;
             }
         };
@@ -330,30 +572,126 @@ impl SdroxideApp {
         let parsed =
             catch_unwind(AssertUnwindSafe(|| sdroxide_types::chirp_csv_to_memories(&text)));
         let Ok((channels, skipped)) = parsed else {
-            self.push_net_log("Channel import failed: the file could not be read".to_string());
+            self.push_net_log(tr!("net-channel-import-failed-file-could").to_string());
             return;
         };
         if channels.is_empty() {
             // The commonest way to get here is a file that is not a CHIRP
             // export at all, so say what was expected rather than "0 imported".
-            self.push_net_log(
-                "Channel import: nothing to read — a CHIRP CSV file starts with a header                  row naming its columns, one of which must be Frequency"
-                    .to_string(),
-            );
+            self.push_net_log(tr!("net-channel-import-nothing-read-chirp").to_string());
             return;
         }
         let n = channels.len();
         cmds.push(Command::ImportMemories(channels));
         let skipped = match skipped {
             0 => String::new(),
-            n => format!(", {n} line(s) skipped"),
+            n => tr!("net-line-s-skipped", n = n),
         };
         let assumed = match loaded.assumed {
-            Some(enc) => format!(" (not Unicode; read as {enc})"),
+            Some(enc) => tr!("net-not-unicode-read-2", enc = enc),
             None => String::new(),
         };
         // "read", not "added": the engine drops the channels already stored,
         // and the memory list itself is what shows the result.
-        self.push_net_log(format!("Channel import: {n} channel(s) read{skipped}{assumed}"));
+        self.push_net_log(tr!(
+            "net-channel-import-channel-s-read",
+            n = n,
+            skipped = skipped,
+            assumed = assumed
+        ));
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qso(call: &str, band: &str, start_utc: i64) -> sdroxide_types::QsoRecord {
+        sdroxide_types::QsoRecord {
+            call: call.into(),
+            band: band.into(),
+            mode: "FT8".into(),
+            start_utc,
+            ..Default::default()
+        }
+    }
+
+    /// **A contact already in the log is not imported a second time, and the
+    /// band is not part of how that is decided.**
+    ///
+    /// The sequencer logs a QSO with the frequency and an empty band; the same
+    /// contact re-imported from an ADIF carries the ADIF's band. Keying on both
+    /// let a whole file back in as duplicates of itself — 65 pairs of the same
+    /// call at the same second, one row with a band and one without (reported
+    /// from the bench, 2026-11-02).
+    #[test]
+    fn an_import_does_not_readd_what_the_log_already_has() {
+        let existing = vec![qso("13WF01", "", 1_789_281_763)];
+        let parsed = vec![
+            // The same contact, as the ADIF spells it: a band, not an empty one.
+            qso("13WF01", "11m", 1_789_281_763),
+            // A different station, and the same station five minutes later: both
+            // are contacts the log does not have.
+            qso("19AT168", "11m", 1_789_281_763),
+            qso("13WF01", "11m", 1_789_281_763 + 300),
+        ];
+        let (fresh, skipped) = new_import_records(&existing, parsed);
+        assert_eq!(skipped, 1, "the bandless copy in the log is the same contact");
+        let calls: Vec<&str> = fresh.iter().map(|q| q.call.as_str()).collect();
+        assert_eq!(calls, vec!["19AT168", "13WF01"]);
+    }
+
+    /// The same file twice in a row adds nothing the second time — the bug above
+    /// is the import disagreeing with *itself*, so this is the plain case.
+    #[test]
+    fn importing_the_same_file_twice_adds_nothing() {
+        let file = vec![qso("19JV75", "11m", 1_789_279_546), qso("13WF01", "11m", 1_789_281_763)];
+        let (first, skipped) = new_import_records(&[], file);
+        assert_eq!((first.len(), skipped), (2, 0));
+        let (second, skipped) = new_import_records(
+            &first,
+            vec![qso("19JV75", "11m", 1_789_279_546), qso("13WF01", "11m", 1_789_281_763)],
+        );
+        assert_eq!((second.len(), skipped), (0, 2));
+    }
+}
+
+/// Which of an imported ADIF's contacts this log does not already have, and how
+/// many it does.
+///
+/// **The match is call and time, never band.** The log is not consistent about
+/// band: a contact logged by a digital sequencer carries the frequency and an
+/// empty band, while the same contact re-imported from an ADIF carries the
+/// ADIF's own band — so keying on band let a whole file back in as duplicates
+/// of itself, and the operator was left with 65 pairs of the same call at the
+/// same second, one row with a band and one without (reported 2026-11-02).
+///
+/// Two minutes is the window, and it is call-only because nothing is worked
+/// twice on two different bands inside two minutes. The existing log is indexed
+/// once by call so the check stays linear: this runs inside a single frame and a
+/// full logbook is tens of thousands of records.
+fn new_import_records(
+    existing: &[sdroxide_types::QsoRecord],
+    parsed: Vec<sdroxide_types::QsoRecord>,
+) -> (Vec<sdroxide_types::QsoRecord>, usize) {
+    let mut starts_by_call: HashMap<String, Vec<i64>> = HashMap::new();
+    for q in existing {
+        starts_by_call.entry(q.call.trim().to_ascii_uppercase()).or_default().push(q.start_utc);
+    }
+    let mut fresh = Vec::with_capacity(parsed.len());
+    let mut skipped = 0usize;
+    for r in parsed {
+        let call = r.call.trim().to_ascii_uppercase();
+        if call.is_empty() {
+            continue;
+        }
+        let starts = starts_by_call.entry(call).or_default();
+        if starts.iter().any(|&t| (t - r.start_utc).abs() < 120) {
+            skipped += 1;
+            continue;
+        }
+        starts.push(r.start_utc);
+        fresh.push(r);
+    }
+    (fresh, skipped)
 }

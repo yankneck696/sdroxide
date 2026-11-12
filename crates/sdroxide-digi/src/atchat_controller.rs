@@ -154,6 +154,8 @@ fn build_status(cfg: &DigiConfig, session: &AtChatSession) -> DigiStatus {
         tx_refused: None,
         transcript: Vec::<TranscriptLine>::new(),
         config: cfg.clone(),
+        jtty: None,
+        tnc: None,
         text_rx: String::new(),
         tx_sent: 0,
         fsq_heard: Vec::new(),

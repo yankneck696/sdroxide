@@ -449,6 +449,11 @@ pub enum SmeterStyle {
     /// on transmit, how SWR behaved across the over) the way neither of the
     /// instantaneous faces can.
     Trace,
+    /// S/N in the receive passband from the panadapter's S/N guide, as a bar
+    /// over the noise floor — only in the click cycle while the guide runs.
+    // Why: HDZ 2026-11-09: "wenn wir S/N haben, da ein eigenes Instrument
+    //      haben, die werden ja mit Linksklick durchgeschaltet".
+    Snr,
     /// Analog moving-coil instrument with a swinging needle.
     ///
     /// Declared last because serde demands the catch-all be the final variant:
@@ -466,8 +471,24 @@ impl SmeterStyle {
         match self {
             SmeterStyle::Needle => SmeterStyle::Bar,
             SmeterStyle::Bar => SmeterStyle::Trace,
-            SmeterStyle::Trace => SmeterStyle::Needle,
+            SmeterStyle::Trace => SmeterStyle::Snr,
+            SmeterStyle::Snr => SmeterStyle::Needle,
         }
+    }
+
+    /// The next face, skipping the S/N face while there is no S/N to show.
+    pub fn next_with(self, snr: bool) -> Self {
+        let next = self.next();
+        if next == SmeterStyle::Snr && !snr { next.next() } else { next }
+    }
+
+    /// [`Self::next_compact`] with the same skip as [`Self::next_with`].
+    pub fn next_compact_with(self, snr: bool) -> Self {
+        let mut next = self.next_compact();
+        while next == SmeterStyle::Snr && !snr {
+            next = next.next_compact();
+        }
+        next
     }
 
     /// The face for a box wider than it is tall — the shape the compact strip
@@ -506,6 +527,244 @@ pub struct Solar3dWindow {
     /// Outer (top-left, including decorations) position in points.
     #[serde(default)]
     pub pos: Option<[f32; 2]>,
+    /// The same position in screen pixels. Points don't survive a second
+    /// monitor at a different display scale: a new window starts with the
+    /// main screen's scale, so the same points land somewhere else. Pixels
+    /// are the same on every screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos_px: Option<[f32; 2]>,
+}
+
+/// A module pulled out into its **own OS window**: where it last was, so
+/// reopening it — or the next start — puts it back rather than at a built-in
+/// size.
+///
+/// The same shape and the same Wayland caveat as [`Solar3dWindow`]: a client is
+/// given no absolute window position, so `pos` is `None` there and the
+/// compositor places the window. The **app-id** the window carries
+/// ([`DetachableModule::app_id`]) is what a compositor rule matches on to float
+/// it and pin it to a monitor.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DetachedWindow {
+    /// Inner (drawing-area) size in points.
+    pub size: [f32; 2],
+    /// Outer (top-left) position in points; `None` on Wayland.
+    #[serde(default)]
+    pub pos: Option<[f32; 2]>,
+}
+
+/// A module that can be pulled out of the main window into its own OS window —
+/// **undocked** — in the SDRuno mould: the spectrum on one monitor, the decoder
+/// on another. An enum keyed in [`UiSettings::detached`] rather than a field
+/// pair per module, so a new detachable module is a variant here plus its UI,
+/// nothing else. **Append only**: the variant's [`Self::index`] is its slot in
+/// the saved settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum DetachableModule {
+    /// The spectrum and waterfall.
+    Panadapter,
+    /// The mode's operating panel — the decoder list, the transcript and the
+    /// controls under the panadapter.
+    Panel,
+    /// The top control strip — the frequency readout, the S-meter and the
+    /// receiver and transmitter controls (SDRuno's "RX control").
+    Controls,
+    /// A **second** spectrum and waterfall — SDRuno's AUX SP. A second view of
+    /// the same receiver, with its own zoom and layers, not a second receiver.
+    AuxPanadapter,
+    /// The **band/mode selector** in a window of its own, where it can be as
+    /// wide as the operator likes without squeezing the operating panel.
+    BandMenu,
+}
+
+impl DetachableModule {
+    /// How many detachable modules there are — the length of
+    /// [`UiSettings::detached`], which is an array so `UiSettings` stays `Copy`.
+    pub const COUNT: usize = 5;
+
+    /// Every module, so a settings list or a test can walk them all.
+    pub const ALL: [DetachableModule; DetachableModule::COUNT] = [
+        DetachableModule::Panadapter,
+        DetachableModule::Panel,
+        DetachableModule::Controls,
+        DetachableModule::AuxPanadapter,
+        DetachableModule::BandMenu,
+    ];
+
+    /// This module's slot in [`UiSettings::detached`].
+    pub fn index(self) -> usize {
+        match self {
+            DetachableModule::Panadapter => 0,
+            DetachableModule::Panel => 1,
+            DetachableModule::Controls => 2,
+            DetachableModule::AuxPanadapter => 3,
+            DetachableModule::BandMenu => 4,
+        }
+    }
+
+    /// The window's **application id** — the handle a Wayland compositor rule
+    /// matches on to float this window and pin it to a monitor. A public
+    /// contract with the operator: change it and their rules stop matching.
+    pub fn app_id(self) -> &'static str {
+        match self {
+            DetachableModule::Panadapter => "sdroxide-panadapter",
+            DetachableModule::Panel => "sdroxide-panel",
+            DetachableModule::Controls => "sdroxide-controls",
+            DetachableModule::AuxPanadapter => "sdroxide-panadapter-aux",
+            DetachableModule::BandMenu => "sdroxide-bandmenu",
+        }
+    }
+}
+
+/// Whether one [`DetachableModule`] is undocked, and where its window last was.
+/// See [`UiSettings::detached`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct DetachedState {
+    /// True when the module is drawn in its own window instead of the main one.
+    pub detached: bool,
+    /// Where its window last was; `None` until it has been open once.
+    #[serde(default)]
+    pub window: Option<DetachedWindow>,
+}
+
+/// A named window arrangement — SDRuno's **workspace**: which modules are in
+/// their own OS windows, and where those windows are. SDRuno keeps up to ten and
+/// recalls them by name; so does this.
+///
+/// A **list of its own**, not a field in [`UiSettings`], because `UiSettings` is
+/// `Copy` and the whole UI passes it around by value. The list lives in
+/// `workspaces.json`, beside the memories and the logbook. A workspace is the
+/// arrangement only — where the furniture is, not what is switched on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Workspace {
+    /// What the operator called it. Not an index: a name survives a reorder.
+    pub name: String,
+    /// One slot per [`DetachableModule`] in `index()` order **at save time**. A
+    /// `Vec` rather than the fixed array, so a workspace written by a build with
+    /// a module this one has not heard of still loads and applies the modules it
+    /// does know — the same tolerance [`UiSettings::detached`]'s reader has.
+    pub slots: Vec<DetachedState>,
+}
+
+/// How many workspaces may be saved — SDRuno's ten, and the ten number keys
+/// that recall them.
+pub const WORKSPACE_MAX: usize = 10;
+
+impl Workspace {
+    /// Snapshot the arrangement in `settings` under `name`.
+    pub fn capture(name: impl Into<String>, settings: &UiSettings) -> Self {
+        Self { name: name.into(), slots: settings.detached.to_vec() }
+    }
+
+    /// Put this arrangement back into `settings`, leaving any module the
+    /// workspace does not mention — a slot a newer or older build wrote —
+    /// docked.
+    pub fn apply(&self, settings: &mut UiSettings) {
+        let mut out = default_detached();
+        for (slot, saved) in out.iter_mut().zip(self.slots.iter()) {
+            *slot = *saved;
+        }
+        settings.detached = out;
+    }
+}
+
+fn default_detached() -> [DetachedState; DetachableModule::COUNT] {
+    [DetachedState::default(); DetachableModule::COUNT]
+}
+
+/// Read [`UiSettings::detached`] at any length. A config written by a build with
+/// fewer (or more) modules carries a shorter (or longer) list, and a derived
+/// array deserializer would reject the whole file over it — which would reset
+/// every other setting along with the window geometry. A short list leaves the
+/// modules it does not reach docked; a long one drops what this build does not
+/// know.
+fn detached_slots<'de, D>(d: D) -> Result<[DetachedState; DetachableModule::COUNT], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let list = Vec::<DetachedState>::deserialize(d)?;
+    let mut out = default_detached();
+    for (slot, state) in out.iter_mut().zip(list) {
+        *slot = state;
+    }
+    Ok(out)
+}
+
+/// The language the interface is drawn in: a BCP 47 tag such as `es` or
+/// `pt-BR`, or none to follow the operating system's.
+///
+/// A tag rather than an enum of the languages there are, because the list is
+/// whatever translations the client carries, and this crate knows none of
+/// them. A tag the client has no translation for is not an error: it falls
+/// back to the nearest it has, and to English last, the same as a system
+/// language it has never heard of. Held inline so [`UiSettings`] stays `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct UiLanguage {
+    tag: [u8; UiLanguage::MAX_LEN],
+    len: u8,
+}
+
+impl UiLanguage {
+    /// The longest tag held. Language, script and region come to eleven
+    /// (`zh-Hant-TW`); the rest is room for a variant.
+    pub const MAX_LEN: usize = 23;
+
+    /// Follow the operating system's language — the default.
+    pub const SYSTEM: UiLanguage = UiLanguage { tag: [0; Self::MAX_LEN], len: 0 };
+
+    /// A language picked by tag. `None` for an empty tag, one too long to
+    /// hold, or one with a character no language tag has.
+    pub fn from_tag(tag: &str) -> Option<UiLanguage> {
+        let tag = tag.trim();
+        if tag.is_empty()
+            || tag.len() > Self::MAX_LEN
+            || !tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return None;
+        }
+        let mut out = Self::SYSTEM;
+        out.tag[..tag.len()].copy_from_slice(tag.as_bytes());
+        out.len = tag.len() as u8;
+        Some(out)
+    }
+
+    /// The picked tag, or `None` for the system's language.
+    pub fn tag(&self) -> Option<&str> {
+        // Only ever filled from a `&str` of ASCII, so this cannot fail.
+        (self.len > 0).then(|| std::str::from_utf8(&self.tag[..self.len as usize]).unwrap_or(""))
+    }
+
+    pub fn is_system(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl std::fmt::Debug for UiLanguage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.tag() {
+            Some(tag) => write!(f, "UiLanguage({tag})"),
+            None => f.write_str("UiLanguage(system)"),
+        }
+    }
+}
+
+/// Written as the bare tag, and as an empty string for the system's language,
+/// so `config.toml` reads `language = "es"`.
+impl Serialize for UiLanguage {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.tag().unwrap_or(""))
+    }
+}
+
+/// Anything that is not a tag it can hold — hand-edited nonsense, or a longer
+/// tag from some later build — reads as the system's language rather than
+/// failing the whole `[ui]` table, which would lose the theme and the layout
+/// along with it.
+impl<'de> Deserialize<'de> for UiLanguage {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let tag = String::deserialize(d)?;
+        Ok(UiLanguage::from_tag(&tag).unwrap_or(UiLanguage::SYSTEM))
+    }
 }
 
 /// User display preferences. All have defaults so a missing `[ui]` table loads.
@@ -514,6 +773,13 @@ pub struct Solar3dWindow {
 pub struct UiSettings {
     /// GUI repaint + spectrum frame rate, in frames per second.
     pub frame_rate_fps: u32,
+    /// How long the pointer rests on a control before its tooltip shows, in
+    /// seconds. egui's own half second unless the operator sets another.
+    pub tooltip_delay_s: f32,
+    /// Once a tooltip has shown, how long the next control's shows without
+    /// waiting, in seconds (egui's grace time). 0: every tooltip waits its
+    /// delay.
+    pub tooltip_grace_s: f32,
     /// How fast the waterfall scrolls.
     pub waterfall_speed: Speed,
     /// How fast the spectrum line reacts (averaging; slower = smoother).
@@ -595,6 +861,9 @@ pub struct UiSettings {
     pub bandplan_colors: [[u8; 3]; BandplanKind::COUNT],
     /// Which layout the window wears, or `Auto` to pick from the viewport.
     pub layout: LayoutMode,
+    /// The language the interface is drawn in — see [`UiLanguage`]. This
+    /// screen's preference, like the theme: a remote client picks its own.
+    pub language: UiLanguage,
     /// Colour theme for the UI chrome.
     pub theme: UiTheme,
     /// The shape buttons wear.
@@ -622,11 +891,40 @@ pub struct UiSettings {
     /// Cycled by clicking the meter; see [`SmeterStyle`] for why it is a
     /// screen preference rather than part of a radio's view.
     pub smeter_style: SmeterStyle,
+    /// How fast the trace face scrolls, on the waterfall's five steps and in
+    /// the same proportion as the waterfall's rows (see
+    /// [`Self::smeter_trace_hz`]). `Fast` is the quarter-minute the trace
+    /// has always shown.
+    // Why: HDZ 2026-11-09: "S-Meter … auf Rechtsklick die Richtung umdrehen,
+    //      die Geschwindigkeit an den Waterfall ausrichten, die verschiedenen
+    //      Speed-Stufen einfach frech übernehmen".
+    pub smeter_trace_speed: Speed,
+    /// Put the newest sample of the trace at the left edge instead of the
+    /// right, so the plot flows the other way.
+    pub smeter_trace_newest_left: bool,
+    /// The trace face's level range, as stops on the S scale (S0…S9 =
+    /// 0…9, then S9+10 … S9+60 = 10…15): the bottom and top of the plot, so a band that
+    /// lives between S3 and S9 can fill the height. Receive only; the
+    /// transmit meters keep their own scales.
+    // Why: HDZ 2026-11-09: "einen Regler, der unten und oben anpassbar ist,
+    //      low level in S-Stufen und high level — ich will von low 3–9 oder
+    //      6..9 spreizen können".
+    pub smeter_trace_lo: u8,
+    pub smeter_trace_hi: u8,
     /// Ask sdroxide.com once per start whether a newer release has been
     /// published, and say so in the notice banner above the panadapter. In
     /// `[ui]` because it is this screen's preference, like the theme — the
     /// native client checks for its own build, wherever its radio is.
     pub update_check: bool,
+    /// Download HAMQSL.com's HF band-conditions forecast (at most hourly) to
+    /// colour the band menu. A switch because it is one of the requests the
+    /// app makes on its own, and every one of those can be turned off. The 3D
+    /// view's own feed is not covered: opening that window asks for its data.
+    pub band_conditions_download: bool,
+    /// Download the EiBi broadcast schedule from eibispace.de when a new
+    /// broadcasting season starts. Off, the compiled-in schedule (or the last
+    /// one cached) stays in use, and the REFRESH button still fetches on demand.
+    pub broadcast_schedule_download: bool,
     /// How the memory channel window orders its list. This screen's
     /// preference, not the station's: the store keeps its own order and every
     /// client reads it whichever way its operator asked for.
@@ -684,6 +982,12 @@ pub struct UiSettings {
     /// operator's. The 3D globe is untouched — its cities are night-side lights
     /// rather than markers, and nothing is written across a contact there.
     pub map_cities: bool,
+    /// Whose licence-free channel plans the waterfall marks — see
+    /// [`Country`](crate::region::Country). This screen's preference: it
+    /// follows the computer's country unless the operator picks one.
+    pub country: crate::region::Country,
+    /// The UTC + local wall clock at the panadapter's top-right (#655).
+    pub panadapter_clock: bool,
     /// Where the solar-system 3D window last was — see [`Solar3dWindow`].
     ///
     /// Here rather than in the operator's view state because window geometry is
@@ -691,6 +995,46 @@ pub struct UiSettings {
     /// its own.
     #[serde(default)]
     pub solar3d_window: Option<Solar3dWindow>,
+    /// The AMP window in a window of its own rather than inside the main one,
+    /// as the solar-system window is. Desktop only; the browser keeps it in.
+    #[serde(default)]
+    pub amp_popped: bool,
+    /// Whether the AMP window was open, so it comes back as it was closed.
+    #[serde(default)]
+    pub amp_open: bool,
+    /// Where the popped-out AMP window was, as for the solar-system window.
+    #[serde(default)]
+    pub amp_window: Option<Solar3dWindow>,
+    /// Where the docked AMP window was inside the main one.
+    #[serde(default)]
+    pub amp_docked: Option<AmpDocked>,
+    /// The AMP window's meter picks: top and bottom of the left meter, then of
+    /// the right one, each as its place in the window's FWD, RFL, VDD, IDD, DRV
+    /// list, 255 for no bottom needle. `None` for the built-in picks.
+    #[serde(default)]
+    pub amp_meters: Option<[u8; 4]>,
+    /// Which modules are undocked into their own windows, and where those
+    /// windows last were — one [`DetachedState`] per [`DetachableModule`], in
+    /// `module.index()` order. An array rather than a map so `UiSettings` stays
+    /// `Copy`; read at any length, see [`detached_slots`].
+    ///
+    /// **Native only.** The browser has no second window and keeps every module
+    /// in-window, so the flags are ignored there. Machine-local: where a window
+    /// sits is a property of this screen.
+    #[serde(default = "default_detached", deserialize_with = "detached_slots")]
+    pub detached: [DetachedState; DetachableModule::COUNT],
+    /// The first-start welcome has been answered with "done", so it is not
+    /// shown again. It only ever appears to a station with no callsign, which
+    /// is why an existing installation needs no migration to keep quiet.
+    pub welcomed: bool,
+}
+
+/// The docked AMP window's place: its top-left corner and width, in points.
+/// Its height follows the width.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AmpDocked {
+    pub pos: [f32; 2],
+    pub width: f32,
 }
 
 /// Default for [`UiSettings::spot_colors`] — every kind on its stock tint.
@@ -746,6 +1090,15 @@ where
     Ok(out)
 }
 
+/// egui's own tooltip delay, the default for [`UiSettings::tooltip_delay_s`].
+pub const TOOLTIP_DELAY_DEFAULT_S: f32 = 0.5;
+/// The range the tooltip delay is set in.
+pub const TOOLTIP_DELAY_RANGE_S: std::ops::RangeInclusive<f32> = 0.0..=1.5;
+/// egui's own grace time, the default for [`UiSettings::tooltip_grace_s`].
+pub const TOOLTIP_GRACE_DEFAULT_S: f32 = 0.2;
+/// The range the tooltip grace time is set in.
+pub const TOOLTIP_GRACE_RANGE_S: std::ops::RangeInclusive<f32> = 0.0..=1.0;
+
 impl Default for UiSettings {
     fn default() -> Self {
         UiSettings {
@@ -754,6 +1107,8 @@ impl Default for UiSettings {
             // reading differently from the rig beside it.
             cw_qrg: false,
             frame_rate_fps: 60,
+            tooltip_delay_s: TOOLTIP_DELAY_DEFAULT_S,
+            tooltip_grace_s: TOOLTIP_GRACE_DEFAULT_S,
             waterfall_speed: Speed::Medium,
             spectrum_speed: Speed::Medium,
             spectrum_3d_speed: Speed::Medium,
@@ -771,6 +1126,7 @@ impl Default for UiSettings {
             spot_colors: default_spot_colors(),
             bandplan_colors: default_bandplan_colors(),
             layout: LayoutMode::Auto,
+            language: UiLanguage::SYSTEM,
             theme: UiTheme::Default,
             button_style: ChromeStyle::Angled,
             window_style: ChromeStyle::Angled,
@@ -779,7 +1135,15 @@ impl Default for UiSettings {
             menu_font_size: FontSize::Medium,
             ui_zoom: 1.0,
             smeter_style: SmeterStyle::Needle,
+            smeter_trace_speed: Speed::Fast,
+            smeter_trace_newest_left: false,
+            smeter_trace_lo: 0,
+            // The top stop, S9+60: the whole scale (see the S-meter widget's
+            // `STOPS`).
+            smeter_trace_hi: 15,
             update_check: true,
+            band_conditions_download: true,
+            broadcast_schedule_download: true,
             memory_sort: crate::MemorySort::Stored,
             memory_sort_desc: false,
             decode_sort: crate::DecodeSort::None,
@@ -790,12 +1154,38 @@ impl Default for UiSettings {
             decode_cq_only: false,
             decode_new_only: false,
             map_cities: true,
+            country: Default::default(),
+            panadapter_clock: true,
             solar3d_window: None,
+            amp_popped: false,
+            amp_open: false,
+            amp_window: None,
+            amp_docked: None,
+            amp_meters: None,
+            detached: default_detached(),
+            welcomed: false,
         }
     }
 }
 
 impl UiSettings {
+    /// One module's undocked state, or the docked default if it has never been
+    /// touched.
+    pub fn detached_state(&self, module: DetachableModule) -> DetachedState {
+        self.detached[module.index()]
+    }
+
+    /// Whether a module is undocked.
+    pub fn is_detached(&self, module: DetachableModule) -> bool {
+        self.detached[module.index()].detached
+    }
+
+    /// Set (or clear) a module's undocked flag, leaving its remembered window
+    /// geometry alone.
+    pub fn set_detached(&mut self, module: DetachableModule, on: bool) {
+        self.detached[module.index()].detached = on;
+    }
+
     /// The steps the tuning buttons cycle through, in hertz — from the 10 Hz
     /// that trims a carrier onto zero-beat up to the 25 kHz of an FM channel,
     /// by way of the AM broadcast spacings (9 kHz in Regions 1 and 3, 10 kHz in
@@ -837,6 +1227,16 @@ impl UiSettings {
     /// Frame rate clamped to a sane range (guards a hand-edited config).
     pub fn fps(self) -> u32 {
         self.frame_rate_fps.clamp(5, 240)
+    }
+
+    /// Samples a second the S-meter's trace face takes: the waterfall's rate
+    /// for the same step, scaled so `Fast` keeps the trace's 16 Hz — 240
+    /// samples, fifteen seconds. `Slow` then holds 168 s, `Medium` 30 s,
+    /// `Faster` 7.5 s and `Fastest` 3.75 s.
+    pub fn smeter_trace_hz(self) -> f64 {
+        const FAST_HZ: f64 = 16.0;
+        let rows = |s: Speed| UiSettings { waterfall_speed: s, ..self }.waterfall_rows_per_sec();
+        FAST_HZ * f64::from(rows(self.smeter_trace_speed)) / f64::from(rows(Speed::Fast))
     }
 
     /// Waterfall scroll rate in rows per second. Absolute (independent of the
@@ -974,5 +1374,61 @@ mod serde_tests {
         // order: it is written out, not derived.
         assert!(LayoutMode::ALL.contains(&LayoutMode::Auto));
         assert_eq!(LayoutMode::ALL.len(), 5);
+    }
+
+    /// The language is written as the bare tag, the system's as an empty
+    /// string, and anything that is not a tag reads back as the system's
+    /// rather than costing the rest of `[ui]`.
+    #[test]
+    fn the_language_round_trips_as_a_bare_tag() {
+        let es = UiLanguage::from_tag("es").unwrap();
+        assert_eq!(serde_json::to_string(&es).unwrap(), "\"es\"");
+        assert_eq!(serde_json::to_string(&UiLanguage::SYSTEM).unwrap(), "\"\"");
+        let back: UiLanguage = serde_json::from_str("\"pt-BR\"").unwrap();
+        assert_eq!(back.tag(), Some("pt-BR"));
+        let none: UiLanguage = serde_json::from_str("\"\"").unwrap();
+        assert!(none.is_system());
+        let junk: UiLanguage = serde_json::from_str("\"<script>\"").unwrap();
+        assert!(junk.is_system());
+        let long: UiLanguage = serde_json::from_str(&format!("\"{}\"", "a".repeat(40))).unwrap();
+        assert!(long.is_system());
+        // A config written before the field existed loads with the system's.
+        let ui: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(ui.language.is_system());
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+
+    /// A workspace puts back exactly the arrangement it captured, and one saved
+    /// by a build with fewer modules leaves the rest docked.
+    #[test]
+    fn a_workspace_round_trips_and_tolerates_another_builds_length() {
+        let mut ui = UiSettings::default();
+        ui.set_detached(DetachableModule::Panadapter, true);
+        ui.detached[DetachableModule::Panel.index()].window =
+            Some(DetachedWindow { size: [500.0, 400.0], pos: Some([10.0, 20.0]) });
+        let ws = Workspace::capture("Contest", &ui);
+        let mut other = UiSettings::default();
+        other.set_detached(DetachableModule::Controls, true);
+        ws.apply(&mut other);
+        assert_eq!(other.detached, ui.detached);
+
+        let short = Workspace {
+            name: "Old".into(),
+            slots: vec![DetachedState { detached: true, window: None }],
+        };
+        let mut target = UiSettings::default();
+        target.set_detached(DetachableModule::BandMenu, true);
+        short.apply(&mut target);
+        assert!(target.is_detached(DetachableModule::Panadapter));
+        assert!(
+            !target.is_detached(DetachableModule::BandMenu),
+            "a slot the workspace never had stays docked"
+        );
+        let json = serde_json::to_string(&ws).unwrap();
+        assert_eq!(serde_json::from_str::<Workspace>(&json).unwrap(), ws);
     }
 }

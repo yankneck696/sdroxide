@@ -1516,7 +1516,192 @@ use sdroxide_types::{
 /// `DigiStatus` whole, so a v172 peer reads the extra byte as the start of the
 /// next field and fails to decode every config — the same break as v172's
 /// appended message buttons.
-pub const PROTO_VERSION: u16 = 173;
+///
+/// v174: `NetworkConfig` gains `eqsl_qth_nickname` (`String`) on its tail — the
+/// eQSL QTH profile an upload is filed into, which eQSL requires when an account
+/// owns more than one (issue #647). `NetworkConfig` rides
+/// `Command::SetNetworkConfig` whole, so a v173 peer reads the extra bytes as
+/// the start of the next field and fails to decode the config — the same break
+/// as every appended field before it.
+///
+/// v175: decoded CW over UDP. [`sdroxide_types::WsjtxConfig`] gains `cw_text`
+/// ([`sdroxide_types::CwTextConfig`]) on its tail, beside the N1MM broadcast it
+/// sits with. `WsjtxConfig` rides `Command::SetWsjtxConfig` whole, so a v174
+/// peer handed one reads the extra bytes as the start of the next message.
+///
+/// v176: [`sdroxide_types::RadioConfig`] gains `s_meter_cal_db` (`f32`) on its
+/// tail — a per-radio S-meter calibration, settable from the UI (issue #642).
+/// `RadioConfig` rides `ServerMsg::RadioConfig` and `Command::SetRadioConfig`
+/// whole, so a v175 peer reads the extra bytes as the start of the next field.
+///
+/// v177: [`sdroxide_types::RadioConfig`] gains `audio_route`
+/// ([`sdroxide_types::AudioRoute`], a unit enum) on its tail — which speaker
+/// channels the radio plays to (issue #654). Same break as v176.
+///
+/// v178: [`sdroxide_types::RadioConfig`] gains `same_gain_all_bands` (`bool`)
+/// on its tail — the switch for remembering receive gain per band (issue #605).
+/// Same break as v176.
+///
+/// v179: [`sdroxide_types::RotatorConfig`] gains `protocol`
+/// ([`sdroxide_types::RotatorProtocol`], a unit enum) on its tail — rotctld or
+/// PSTRotator's UDP control (issue #638). It rides `Command::SetRotatorConfig`
+/// and `StationConfig::rotator` whole, so a v178 peer reads it out of step.
+///
+/// v180: the TCI client. [`sdroxide_types::TciServerConfig`] gains `client`
+/// and `client_address` on its tail — dial out and push this radio's VFO to
+/// another TCI server, control only. It rides `Command::SetTciServerConfig`
+/// and `StationConfig::tci_server` whole, so a v179 peer reads the extra
+/// bytes as the start of the next field. [`ServerMsg::TciServerStatus`] also
+/// gains `client_connected` and `client_error`, the same break for that one
+/// message.
+/// v181: [`sdroxide_types::DeviceCaps`] gains `agc_off_unavailable` (`bool`)
+/// on its tail — the AGC control drives a radio whose AGC has no Off, so the
+/// client stops offering it. `DeviceCaps` rides every capabilities message, so
+/// a v180 peer reads the extra byte out of step.
+/// v182: received pictures to an FTP/FTPS server. `StationConfig` gains
+/// `picture_upload` (`PictureUploadConfig`) on its tail, `Command` gains
+/// `SetPictureUploadConfig` and `TestPictureUpload`, and `ServerMsg` gains
+/// `PictureUpload` — the outcome of an upload or of a test, which a remote
+/// screen needs because the station, not the screen, is what connects.
+/// `StationConfig` rides whole, so a v181 peer fails to decode it.
+/// v183: the transmit voice chain. `TxState::eq` became `TxState::voice`
+/// ([`sdroxide_types::TxVoiceState`]: gate, EQ, de-esser, compressor, output),
+/// with the EQ itself gaining a high-pass, a second peak and a low-pass, and
+/// `TxState` gaining `voice_test` and `voice_test_len_s`. `Command::SetTxEq`
+/// became `Command::SetTxVoice` in the same position, carrying the whole
+/// chain; `Command::TxVoiceTestRecord`, `Command::TxVoiceTestPlay` and
+/// `Command::TxVoiceTestLive` are appended. `Meters` gains `voice` on its tail. Every state broadcast and
+/// every meter frame changes layout, so both ends have to agree.
+/// v184: Wavelog, the operator's own web logbook, as a logging service built
+/// in rather than reached through WaveLogGate. All of it appended, none of it
+/// separable — a v183 peer handed any one of these reads the tail of the
+/// message carrying it out of step.
+///
+/// * [`sdroxide_types::NetworkConfig`] gains `wavelog`
+///   ([`sdroxide_types::WavelogConfig`]: address, key, pinned certificate,
+///   default station location, auto-upload, which locations to download and
+///   how often, and the live radio status). It rides whole inside
+///   `Command::SetNetworkConfig`.
+/// * [`sdroxide_types::DigiConfig`] gains `wavelog_station_id` on its tail —
+///   the location is part of the operating identity, since Wavelog refuses a
+///   QSO whose station callsign is not the location's. It rides
+///   `Command::SetDigiConfig` and `DigiStatus` whole.
+/// * [`sdroxide_types::QsoRecord`] gains `wavelog_sent` and `wavelog_origin`
+///   (the location a downloaded contact came from), and
+///   [`sdroxide_types::UploadResult`] gains `retryable`, which drives the
+///   Wavelog retry queue. Both ride inside `RadioEvent`s that cross the link.
+/// * `UploadTarget` and `LoginTarget` each gain `Wavelog`, appended, so no
+///   surviving discriminant moved — but a v183 peer handed one has nowhere to
+///   put it.
+/// * [`sdroxide_types::Command`] gains `WavelogSync`, appended. Its answers,
+///   `RadioEvent::WavelogBatch` and `RadioEvent::WavelogProbe`, stay on the
+///   machine the engine runs on and have no `ServerMsg`.
+///
+/// v185: the Hardrock amplifier. `Command` gains `SetAmpConfig`, `Amp` and
+/// `SetRigPowerStep`, `ServerMsg` gains `AmpStatus`, `StationConfig` gains
+/// `amp` on its tail, and `AmpAlerts` carries `from_amp`, for the amplifier's
+/// own lights — all appended, so a v184 peer reads them out of step.
+///
+/// v186: JTTY, the WSJT-X 3.2 asynchronous RTTY-like text mode. `Mode::Jtty`
+/// is appended to that enum, so no surviving discriminant moves, and
+/// `DigiStatus` gains `jtty` (`Option<JttyStatus>`) on its tail — the messages
+/// decoded and the smoothed audio level. `DigiStatus` rides `RadioState` whole,
+/// so a v185 peer reads the extra bytes as the start of the next field and
+/// fails to decode every digital status, the same break as every appended field
+/// before it.
+///
+/// v187: a band-plan sub-segment carries an optional `label` (the operator's
+/// own name for it on the waterfall strip), so the `band_plan` in
+/// `StationConfig` changes layout and both ends have to agree.
+///
+/// v188: a radio's built-in antenna tuner. [`sdroxide_types::Command`] gains
+/// `AtuTune` and `AtuBypass`, [`sdroxide_types::DeviceCaps`] gains `has_atu`
+/// and [`sdroxide_types::RadioState`] gains `atu`
+/// ([`sdroxide_types::AtuState`]), each on its tail. `DeviceCaps` and
+/// `RadioState` ride whole, so a v187 peer reads the extra bytes out of step.
+///
+/// v189: [`sdroxide_types::Command`] gains `ClearMemories`, appended; a v188
+/// peer has no variant to decode it into.
+///
+/// v190: a digital mode, its Winlink lane, commands, status and settings,
+/// each appended on its tail, so a v189 peer reads digital status out of step.
+///
+/// v191: that mode removed. Everything v190 appended for it is gone again, so
+/// the layout is v189's — but a v190 peer still sends and expects the extra
+/// fields.
+///
+/// v192: Mercury and Data2G. `Mode::Mercury`, `Mode::Data2g`,
+/// `WinlinkLane::Mercury` and `WinlinkLane::Data2g` are appended to their
+/// enums; [`sdroxide_types::Command`] gains the `Tnc*` commands; `DigiStatus`
+/// gains `tnc` (`Option<TncStatus>`) and `DigiConfig` the `tnc_*`, `mercury_*`
+/// and `data2g_bw` settings, each on its tail. The same positions v190 used,
+/// with other contents, so neither a v190 nor a v191 peer can talk to a v192
+/// one.
+///
+/// v193: [`sdroxide_types::Command`] gains `SetHumFilter`, `SetSkFilter` and
+/// `SetViewUncovered`, appended; `RxState` gains `hum_filter` and the
+/// `sk_filter*` settings, and `RadioConfig` gains `dwell_recentre_off`, each
+/// on its tail. `RxState` rides whole in `RadioState`, so a v192 peer reads
+/// receiver state out of step.
+///
+/// v194: Wavelog's connection check reaches a remote screen.
+/// `ServerMsg` gains `WavelogProbe` (the station locations and any untrusted
+/// certificate), appended, so a v193 peer has no variant to decode it into. The
+/// v184 note saying the probe has no `ServerMsg` is superseded by this.
+///
+/// v195: the public-SDR map's receiver check.
+/// [`sdroxide_types::DeviceProbe`] gains `PublicSdrCheck { network, address }`
+/// and [`sdroxide_types::ProbeAnswer`] gains `PublicSdrCheck`, which carries
+/// the address back so several checks in flight each find their row. Both
+/// appended last; a v194 peer has no name for either.
+///
+/// v196: JS8 group auto-responses and station info. `DigiConfig` gains
+/// `js8_info`, `js8_auto_rules_on` and `js8_auto_rules` (`Vec<Js8AutoRule>`)
+/// after `js8_groups`. `Js8Status` gains `auto_pending`
+/// (`Vec<Js8AutoPending>`) on its tail. Both ride `DigiStatus`, so a v195 peer
+/// misreads every digital status.
+///
+/// v197: playing a recording back into the decoders. `Command` gains
+/// `Playback(PlaybackCommand)` and `ListRecordings`, both last; `ServerMsg`
+/// gains `Recordings(RecordingListing)` last; and `RadioState` gains
+/// `playback: Option<PlaybackStatus>` at its tail, which changes the layout of
+/// every state frame.
+///
+/// v198: the weather-satellite decoder (NOAA APT and Meteor LRPT).
+/// `Command` gains `SetWxsatConfig(WxsatSettings)` last; `ServerMsg` gains
+/// `WxsatStatus(Box<WxsatStatus>)` last, carrying the picture lines (APT) and
+/// rows (LRPT) new since the previous one; and `RadioState` gains
+/// `wxsat: WxsatSettings` at its tail, which changes the layout of every state
+/// frame.
+///
+/// v199: the radiosonde decoder. `Command` gains `SetSondeConfig(SondeSettings)`
+/// last; `ServerMsg` gains `SondeStatus(Box<SondeStatus>)` last, carrying the
+/// level and the sondes heard with their tracks; and `RadioState` gains
+/// `sonde: SondeSettings` at its tail, which changes the layout of every state
+/// frame.
+///
+/// v200: MT63. `Mode::Mt63` appended, and `DigiConfig` gains `mt63_mode` at its
+/// tail, which changes the layout of every digital status and config.
+///
+/// v201: MFSK. `Mode::Mfsk` appended, and `DigiConfig` gains `mfsk_mode` and
+/// `mfsk_reverse` at its tail.
+///
+/// v202: DominoEX. `Mode::DominoEx` appended, and `DigiConfig` gains
+/// `domino_mode` and `domino_reverse` at its tail.
+///
+/// v203: PSK's families. `DigiConfig` gains `psk_speed`, `psk_modulation` and
+/// `psk_coded` at its tail: PSK31's six speeds, BPSK or 8PSK, and fldigi's
+/// coded single- and multi-carrier families.
+///
+/// v204: Contestia. `Mode::Contestia` appended; it shares Olivia's tones and
+/// bandwidth fields, so `DigiConfig` is unchanged.
+///
+/// v205: FM-DECRACKLE and the waterfall's looks. `Command` gains
+/// `SetFmDecrackle` after `SetAutoNotch` (every later variant shifts),
+/// `RxState` gains `fm_decrackle`, `fm_deemph` and `fm_decrackle_dip`, and
+/// `SpectrumConfig` gains `smooth`, `reassign`, `reassign_floor_db` and
+/// `reassign_dim_db` at its tail.
+pub const PROTO_VERSION: u16 = 205;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1727,6 +1912,10 @@ pub enum ServerMsg {
         addr: String,
         clients: usize,
         error: Option<String>,
+        /// Outbound TCI client socket is up. See [`sdroxide_types::TciServerConfig::client`].
+        client_connected: bool,
+        /// Why that client is down. `None` when it is off, connecting, or up.
+        client_error: Option<String>,
     },
     /// Built-in rigctld server status, so the settings dialog on a remote
     /// client can show what the engine's listener is doing.
@@ -1975,6 +2164,53 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     Pi4Spots(Vec<sdroxide_types::Pi4Spot>),
+    /// `RadioEvent::PictureUpload`: how a received-picture FTP upload, or a
+    /// test of its settings, went. Forwarded, unlike `LoginTest`: the settings
+    /// are edited from whichever screen, but only the station connects, so a
+    /// remote screen has no other way to learn whether they work. It names
+    /// the server and the certificate it presented, nothing of the account.
+    ///
+    /// Appended last, for the usual reason.
+    PictureUpload(sdroxide_types::PictureUploadStatus),
+    /// `RadioEvent::AmpStatus`: the Hardrock amplifier's readings, tuner and
+    /// link state. Replayed on connect for the T/R switch's reason.
+    ///
+    /// Appended last, for the usual reason.
+    AmpStatus(Box<sdroxide_types::AmpStatus>),
+    /// `RadioEvent::WavelogProbe`: what a connection check found out about the
+    /// Wavelog server — the station locations to choose from, and a certificate
+    /// it presented that nothing vouches for. Forwarded for the picture upload's
+    /// reason: the settings are edited from whichever screen, but only the
+    /// station connects, so a remote screen could not list the locations or
+    /// pick one. It carries no key. Sent with a `LoginTest` in the same breath,
+    /// which the remote screen is given from it, so the Test row can say how it
+    /// went.
+    ///
+    /// Not cached: an answer to a test, like `PictureUpload`.
+    ///
+    /// Appended last, for the usual reason.
+    WavelogProbe(Box<sdroxide_types::WavelogProbe>),
+
+    /// `RadioEvent::Recordings`: the station's recordings directory, answering
+    /// a `Command::ListRecordings`. Sent once per question — the files are on
+    /// the station, so this is the only way a browser can see them.
+    ///
+    /// Appended last, for the usual reason.
+    Recordings(sdroxide_types::RecordingListing),
+
+    /// `RadioEvent::WxsatStatus`: the weather-satellite decoder's state and the
+    /// picture lines (APT) or rows (LRPT) new since the previous message; the
+    /// client builds the image.
+    ///
+    /// Appended last, for the usual reason.
+    WxsatStatus(Box<sdroxide_types::WxsatStatus>),
+
+    /// `RadioEvent::SondeStatus`: the radiosonde decoder's level and the sondes
+    /// it has heard, with their tracks. A whole snapshot each time, kept by the
+    /// station and replayed to a client that attaches late.
+    ///
+    /// Appended last, for the usual reason.
+    SondeStatus(Box<sdroxide_types::SondeStatus>),
 }
 
 /// One radio in a station's roster, as a client sees it.
@@ -2048,6 +2284,183 @@ mod tests {
         assert_eq!(back, m);
 
         let m = ServerMsg::Profiles(vec!["Contest".into(), "DX".into()]);
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+
+        // Playback: every control, the listing question and its answer, and a
+        // state carrying a playback at its tail. All appended, so a
+        // discriminant or field-order slip shows here.
+        for c in [
+            sdroxide_types::PlaybackCommand::Open { name: "pass.mp3".into() },
+            sdroxide_types::PlaybackCommand::Pause(true),
+            sdroxide_types::PlaybackCommand::Seek(12.5),
+            sdroxide_types::PlaybackCommand::Loop(true),
+            sdroxide_types::PlaybackCommand::Stop,
+            sdroxide_types::PlaybackCommand::Delete { name: "old.mp3".into() },
+        ] {
+            let cmd = Command::Playback(c);
+            assert_eq!(decode::<Command>(&encode(&cmd).unwrap()).unwrap(), cmd);
+        }
+        let ask_list = Command::ListRecordings;
+        assert_eq!(decode::<Command>(&encode(&ask_list).unwrap()).unwrap(), ask_list);
+        let listing = ServerMsg::Recordings(sdroxide_types::RecordingListing {
+            dir: "/home/op/Music/sdroxide".into(),
+            files: vec![sdroxide_types::RecordingFile {
+                name: "sdroxide_2026-10-06_10-00-05Z_14.230000MHz_SSTV.mp3".into(),
+                bytes: 1_234_567,
+                modified_unix: 1_791_280_900,
+                iq: false,
+            }],
+            error: None,
+        });
+        assert_eq!(decode::<ServerMsg>(&encode(&listing).unwrap()).unwrap(), listing);
+        let mut state = RadioState::default();
+        state.playback = Some(sdroxide_types::PlaybackStatus {
+            name: "pass.mp3".into(),
+            position_s: 3.25,
+            duration_s: Some(120.0),
+            paused: false,
+            looping: true,
+            ended: false,
+            rate_hz: 48_000,
+            channels: 2,
+            stamp: sdroxide_types::playback::parse_recording_name(
+                "sdroxide_2026-10-06_10-00-05Z_14.230000MHz_SSTV.mp3",
+            ),
+            fault: None,
+        });
+        let frame = ServerMsg::State(state);
+        assert_eq!(decode::<ServerMsg>(&encode(&frame).unwrap()).unwrap(), frame);
+
+        // The weather-satellite decoder: its settings both ways (the command,
+        // and the state's tail), and a status carrying APT lines and LRPT rows.
+        let wx = sdroxide_types::WxsatSettings {
+            enabled: true,
+            frequency_hz: 137_900_000.0,
+            kind: sdroxide_types::WxsatKind::Lrpt,
+        };
+        let cmd = Command::SetWxsatConfig(wx);
+        assert_eq!(decode::<Command>(&encode(&cmd).unwrap()).unwrap(), cmd);
+        let state = RadioState { wxsat: wx, ..Default::default() };
+        let frame = ServerMsg::State(state);
+        assert_eq!(decode::<ServerMsg>(&encode(&frame).unwrap()).unwrap(), frame);
+        let st = ServerMsg::WxsatStatus(Box::new(sdroxide_types::WxsatStatus {
+            running: true,
+            level_dbfs: -31.5,
+            locked: true,
+            quality: 0.8,
+            pass: 3,
+            total_lines: 5,
+            first_line: 4,
+            new_lines: vec![vec![9; sdroxide_types::WXSAT_LINE_PIXELS]],
+            kind: sdroxide_types::WxsatKind::Lrpt,
+            frames_ok: 41,
+            carrier_hz: -812.5,
+            rows: vec![sdroxide_types::WxsatRow {
+                apid: 65,
+                row: 7,
+                lines: vec![
+                    3;
+                    sdroxide_types::WXSAT_LRPT_WIDTH * sdroxide_types::WXSAT_LRPT_ROW_LINES
+                ],
+            }],
+        }));
+        assert_eq!(decode::<ServerMsg>(&encode(&st).unwrap()).unwrap(), st);
+
+        // The radiosonde decoder: its settings both ways (set away from the
+        // default, so a field that decoded into its default fails here), and a
+        // status carrying a sonde with its track.
+        let sonde = sdroxide_types::SondeSettings {
+            enabled: true,
+            frequency_hz: 404_500_000.0,
+            scan: true,
+        };
+        let cmd = Command::SetSondeConfig(sonde);
+        assert_eq!(decode::<Command>(&encode(&cmd).unwrap()).unwrap(), cmd);
+        let state = RadioState { sonde, ..Default::default() };
+        let frame = ServerMsg::State(state);
+        assert_eq!(decode::<ServerMsg>(&encode(&frame).unwrap()).unwrap(), frame);
+        assert_ne!(sonde, sdroxide_types::SondeSettings::default());
+        let st = ServerMsg::SondeStatus(Box::new(sdroxide_types::SondeStatus {
+            running: true,
+            level_dbfs: -40.0,
+            frames: 3,
+            sondes: vec![sdroxide_types::SondeTrack {
+                model: "RS41".into(),
+                serial: "N1234567".into(),
+                freq_hz: 403.0e6,
+                frame: 77,
+                lat: Some(48.8),
+                lon: Some(2.3),
+                alt_m: Some(1234.5),
+                speed_ms: Some(5.0),
+                course_deg: Some(90.0),
+                climb_ms: Some(5.2),
+                num_sv: Some(9),
+                battery_v: Some(2.7),
+                temp_c: Some(-12.5),
+                humidity_pct: Some(61.0),
+                pressure_hpa: Some(850.0),
+                last_unix: 1,
+                frames: 3,
+                track: vec![sdroxide_types::SondePoint {
+                    lat: 48.8,
+                    lon: 2.3,
+                    alt_m: 1234.5,
+                    unix: 1,
+                    temp_c: Some(-12.5),
+                    humidity_pct: None,
+                    pressure_hpa: Some(850.0),
+                }],
+            }],
+        }));
+        assert_eq!(decode::<ServerMsg>(&encode(&st).unwrap()).unwrap(), st);
+
+        // The picture upload: both commands, the answer, and the settings
+        // riding the station bundle's tail.
+        let cfg = sdroxide_types::PictureUploadConfig {
+            enabled: true,
+            host: "ftp.example.org".into(),
+            verify: sdroxide_types::TlsVerify::Pinned,
+            pinned_sha256: "ab".repeat(32),
+            ..Default::default()
+        };
+        for c in [
+            ClientMsg::Command(Command::SetPictureUploadConfig(Box::new(cfg.clone()))),
+            ClientMsg::Command(Command::TestPictureUpload(Box::new(cfg.clone()))),
+        ] {
+            let back: ClientMsg = decode(&encode(&c).unwrap()).unwrap();
+            assert_eq!(back, c);
+        }
+        let m = ServerMsg::PictureUpload(sdroxide_types::PictureUploadStatus {
+            ok: false,
+            message: "login: 530".into(),
+            unix: 1_700_000_000,
+            fingerprint: Some("cd".repeat(32)),
+            is_test: true,
+        });
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let m = ServerMsg::WavelogProbe(Box::new(sdroxide_types::WavelogProbe {
+            ok: true,
+            message: "Wavelog 2.x, key reads and writes".into(),
+            read_write: Some(true),
+            version: "2.x".into(),
+            stations: vec![sdroxide_types::WavelogStation {
+                id: 3,
+                name: "Home".into(),
+                callsign: "EA5ABC".into(),
+                grid: "IM99".into(),
+                active: false,
+            }],
+            untrusted_cert: Some("ef".repeat(32)),
+        }));
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let m = ServerMsg::StationConfig(Box::new(sdroxide_types::StationConfig {
+            picture_upload: cfg,
+            ..Default::default()
+        }));
         let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
         assert_eq!(back, m);
 
@@ -2396,6 +2809,31 @@ mod tests {
         assert_eq!(back, cmd);
     }
 
+    /// The rotator's program choice (#638) survives the wire, both ways, with
+    /// the park position before it off its default.
+    #[test]
+    fn roundtrip_rotator_config() {
+        use sdroxide_types::{RotatorConfig, RotatorProtocol, StationConfig};
+
+        let rotator = RotatorConfig {
+            enabled: true,
+            host: "shack-pc".into(),
+            port: 12000,
+            park: Some((180.0, 10.0)),
+            protocol: RotatorProtocol::PstRotator,
+            ..RotatorConfig::default()
+        };
+        let m = ServerMsg::StationConfig(Box::new(StationConfig {
+            rotator: rotator.clone(),
+            ..no_station()
+        }));
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        let cmd = ClientMsg::Command(Command::SetRotatorConfig(rotator));
+        let back: ClientMsg = decode(&encode(&cmd).unwrap()).unwrap();
+        assert_eq!(back, cmd);
+    }
+
     /// Every orbit-ring position survives the wire, including the one a bare
     /// index would land on by accident if the mapping ever slipped.
     #[test]
@@ -2521,6 +2959,11 @@ mod tests {
                 sdroxide_types::BandDriveTrim { band: sdroxide_types::Band::M6, db: 2.0 },
             ],
             converter_offset_hz: 125_000_000.0,
+            // The new tail field, off its default so a peer one version behind
+            // cannot pass this by reading zeros.
+            s_meter_cal_db: -42.5,
+            audio_route: sdroxide_types::AudioRoute::Right,
+            same_gain_all_bands: true,
             // The transmit converter is an enum with a payload on one variant
             // only — the shape a self-describing format forgives and postcard
             // does not, so it is carried here rather than left at its default.
@@ -2709,6 +3152,49 @@ mod tests {
             assert_eq!(s.config.fst4_period, Fst4Period::P300);
             assert_eq!(s.config.q65_mode, Q65Mode::D120);
             assert_eq!(s.config.fsk441_period, Fsk441Period::P15);
+        }
+    }
+
+    /// The fldigi-family keyboard modes' settings and the modes themselves,
+    /// set away from their defaults: a field appended in the wrong place, or a
+    /// `Mode` discriminant that moved, decodes into the wrong setting rather
+    /// than failing.
+    #[test]
+    fn roundtrip_fldigi_keyboard_modes() {
+        use sdroxide_types::{
+            DigiConfig, DominoMode, MfskMode, Mode, Mt63Mode, PskCoded, PskModulation, PskSpeed,
+        };
+
+        let cfg = DigiConfig {
+            mt63_mode: Mt63Mode::Mt6500S,
+            mfsk_mode: MfskMode::Mfsk64L,
+            mfsk_reverse: true,
+            domino_mode: DominoMode::Dom88,
+            domino_reverse: true,
+            psk_speed: PskSpeed::Bps250,
+            psk_modulation: PskModulation::Psk8,
+            psk_coded: PskCoded::Psk1000Rc2,
+            ..DigiConfig::default()
+        };
+        let m = ClientMsg::Command(Command::SetDigiConfig(cfg.clone()));
+        assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+
+        for mode in [Mode::Mt63, Mode::Mfsk, Mode::DominoEx, Mode::Psk, Mode::Contestia] {
+            let mut status = DigiStatus::idle(cfg.clone());
+            status.mode = mode;
+            let m = ServerMsg::Ft8Status(status);
+            let back = decode::<ServerMsg>(&encode(&m).unwrap()).unwrap();
+            assert_eq!(back, m, "{mode:?}");
+            let ServerMsg::Ft8Status(s) = back else { panic!("not a status") };
+            assert_eq!(s.mode, mode);
+            assert_eq!(s.config.mt63_mode, Mt63Mode::Mt6500S);
+            assert_eq!(s.config.mfsk_mode, MfskMode::Mfsk64L);
+            assert!(s.config.mfsk_reverse);
+            assert_eq!(s.config.domino_mode, DominoMode::Dom88);
+            assert!(s.config.domino_reverse);
+            assert_eq!(s.config.psk_speed, PskSpeed::Bps250);
+            assert_eq!(s.config.psk_modulation, PskModulation::Psk8);
+            assert_eq!(s.config.psk_coded, PskCoded::Psk1000Rc2);
         }
     }
 

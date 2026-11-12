@@ -18,7 +18,10 @@
 mod auth;
 mod probe;
 mod session;
+mod session_cookie;
+mod signin;
 mod solar;
+mod sonde_online;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -163,6 +166,15 @@ pub struct ServerParams {
     pub radio_power: Option<RadioPowerFn>,
 }
 
+/// How many receive-audio packets (20 ms each) the audio lane holds before the
+/// pump starts dropping the newest.
+///
+/// 8 was 160 ms: one large spectrum frame still being written to a slow link
+/// was enough to overflow it, and every packet dropped there is a hole in the
+/// audio that a digital-mode decoder cannot get back. 16 is 320 ms, enough to
+/// ride out one such frame without opening a hole.
+pub(crate) const AUDIO_LANE_DEPTH: usize = 16;
+
 pub(crate) struct SessionTx {
     pub reliable: mpsc::Sender<ServerMsg>,
     pub audio: mpsc::Sender<ServerMsg>,
@@ -229,6 +241,9 @@ pub(crate) struct Latest {
     /// answering, and "nothing has changed since you attached" must not read as
     /// "nothing is wrong".
     pub relay: Option<Box<sdroxide_types::RelayStatus>>,
+    /// The amplifier, replayed on connect for the relay's reason: a remote
+    /// operator has to know whether it is in line before they key.
+    pub amp: Option<Box<sdroxide_types::AmpStatus>>,
     /// What the RDS decoder has made of the station currently tuned. Replayed on
     /// connect for the same reason as `digi` and `voice`: which station is being
     /// listened to is a standing condition, and a client that attaches after the
@@ -259,6 +274,11 @@ pub(crate) struct Latest {
     /// every three minutes, so a client that attached without the table would
     /// show an empty sea for minutes in front of a working decoder.
     pub ais_status: Option<Box<sdroxide_types::AisStatus>>,
+    /// The radiosonde decoder's level and the sondes heard, with their tracks.
+    /// Replayed on connect like the vessel table: a sonde sends a frame a
+    /// second, but one that has landed or gone out of range sends nothing, and
+    /// a client that attached later would never see where it went.
+    pub sonde_status: Option<Box<sdroxide_types::SondeStatus>>,
     /// What the DRM decoder has made of the broadcast currently tuned. Replayed
     /// on connect for the same reason as `rds`: a station's label and the
     /// transmission's parameters are standing conditions, and a client that
@@ -306,6 +326,9 @@ pub(crate) struct Station {
     /// one at a time by itself (it awaits each one); this is what makes two
     /// sessions do the same.
     edit: Mutex<()>,
+    /// The relay behind `/sonde-online` and `/sonde-track`: SondeHub's list,
+    /// asked once for all clients, and only when a client asks for it.
+    pub(crate) sonde: Arc<sonde_online::SondeRelay>,
 }
 
 impl Station {
@@ -639,6 +662,7 @@ pub async fn serve(params: ServerParams) -> Result<(), ServerError> {
         rename: params.rename_radio,
         power: params.radio_power,
         edit: Mutex::new(()),
+        sonde: Arc::new(sonde_online::SondeRelay::default()),
     });
 
     // The roster the station started with, through the same path a radio added
@@ -679,6 +703,17 @@ pub async fn serve(params: ServerParams) -> Result<(), ServerError> {
         .route("/ws/{id}", get(session::ws_route_for))
         .route("/radios", get(radios_route))
         .route("/solar-ws", get(solar::ws_route))
+        // SondeHub's sondes near a place and one sonde's flight, asked by the
+        // station for its clients (a browser cannot reach SondeHub itself).
+        // Nothing goes out until a client's operator switches the layer on.
+        .route("/sonde-online", get(sonde_online::route))
+        .route("/sonde-track", get(sonde_online::track_route))
+        // Where a browser trades its password for a signed cookie, and gives
+        // it back. Both are plain HTTP because a cookie is a response header
+        // and the socket handshake's headers are spent before the sign-in
+        // conversation starts — see `signin`.
+        .route("/signin", axum::routing::post(signin::signin))
+        .route("/signout", axum::routing::post(signin::signout))
         .with_state(station);
     app = add_static_routes(app, params.web_root);
     // Outside the router rather than inside it: this one has to run *before*
@@ -689,7 +724,20 @@ pub async fn serve(params: ServerParams) -> Result<(), ServerError> {
     let addr: SocketAddr = format!("{}:{}", params.bind, params.port)
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], params.port)));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // TCP_NODELAY on every accepted connection. The sockets carry a steady
+    // stream of small WebSocket messages (a 20 ms audio packet, meters, a
+    // spectrum row), each flushed on its own; with Nagle's algorithm on, a
+    // small write waits for the ACK of the previous one, and against a
+    // browser's delayed ACK that is up to 40 ms (200 ms on Windows) of
+    // stall followed by a burst. The client sees exactly what a lossy link
+    // looks like -- audio gaps, a waterfall that stutters -- on a network
+    // that is perfectly healthy.
+    use axum::serve::ListenerExt as _;
+    let listener = tokio::net::TcpListener::bind(addr).await?.tap_io(|tcp| {
+        if let Err(e) = tcp.set_nodelay(true) {
+            warn!("could not set TCP_NODELAY on a client connection: {e}");
+        }
+    });
     info!("server listening on http://{addr}/");
     axum::serve(listener, axum::ServiceExt::<axum::extract::Request>::into_make_service(app))
         .await?;
@@ -835,6 +883,11 @@ fn pump(
     let mut mono = Vec::<f32>::new();
     let mut opus_enc: Option<opus::Encoder> = None;
     let mut audio_seq = 0u32;
+    // Packets the audio lane refused, and when that was last reported. Dropping
+    // is the backpressure policy, but a silent one made "choppy audio on a good
+    // network" impossible to tell from a client-side fault.
+    let mut audio_dropped = 0u32;
+    let mut audio_dropped_at = std::time::Instant::now();
 
     loop {
         // Taken out of the roster: let go of the radio, so that the engine
@@ -919,11 +972,23 @@ fn pump(
                     audio_seq = audio_seq.wrapping_add(1);
                     if let Some(s) = shared.session.lock().unwrap().as_ref() {
                         // Bounded lane: dropping is the backpressure policy.
-                        let _ = s.audio.try_send(ServerMsg::RxAudio { seq: audio_seq, payload });
+                        if s.audio.try_send(ServerMsg::RxAudio { seq: audio_seq, payload }).is_err()
+                        {
+                            audio_dropped += 1;
+                        }
                     }
                     mono.drain(..960);
                 }
             }
+        }
+        if audio_dropped > 0 && audio_dropped_at.elapsed() >= Duration::from_secs(5) {
+            warn!(
+                radio = shared.id,
+                dropped = audio_dropped,
+                "audio lane full: the client is not draining its socket fast enough"
+            );
+            audio_dropped = 0;
+            audio_dropped_at = std::time::Instant::now();
         }
         // Bound the accumulator against pathological stalls.
         if mono.len() > 48_000 {
@@ -1122,6 +1187,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.ais_status = Some(st.clone());
                 Some(ServerMsg::AisStatus(st))
             }
+            RadioEvent::SondeStatus(st) => {
+                latest.sonde_status = Some(st.clone());
+                Some(ServerMsg::SondeStatus(st))
+            }
             // Native-only for now: every station this shipped for runs its
             // own hardware locally, so there is no `ServerMsg` variant for
             // this yet — see `RadioEvent::Qo100Status`'s own doc.
@@ -1129,6 +1198,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             // Native-only for the same reason as QO-100 above — the live HFDL
             // decode log is engine-internal, bridged nowhere yet.
             RadioEvent::HfdlStatus(_) => None,
+            // Not kept for replay: each carries only the lines new since the
+            // last, so a client that attaches late picks the picture up from
+            // the next ones.
+            RadioEvent::WxsatStatus(st) => Some(ServerMsg::WxsatStatus(st)),
             RadioEvent::SstvLine { image_id, y, rgb } => {
                 Some(ServerMsg::SstvLine { image_id, y, rgb })
             }
@@ -1166,9 +1239,21 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::RigctldStatus { running, addr, clients, error } => {
                 Some(ServerMsg::RigctldStatus { running, addr, clients, error })
             }
-            RadioEvent::TciServerStatus { running, addr, clients, error } => {
-                Some(ServerMsg::TciServerStatus { running, addr, clients, error })
-            }
+            RadioEvent::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            } => Some(ServerMsg::TciServerStatus {
+                running,
+                addr,
+                clients,
+                error,
+                client_connected,
+                client_error,
+            }),
             RadioEvent::ImagePresets(p) => {
                 latest.images = Some(p.clone());
                 Some(ServerMsg::ImagePresets(p))
@@ -1231,6 +1316,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.relay = Some(st.clone());
                 Some(ServerMsg::RelayStatus(st))
             }
+            RadioEvent::AmpStatus(st) => {
+                latest.amp = Some(st.clone());
+                Some(ServerMsg::AmpStatus(st))
+            }
             // Handled above, and deliberately not forwarded: the skimmer
             // firehose is a hundred times the spot list's traffic, and the
             // solar relay already carries what it adds up to. See
@@ -1242,10 +1331,23 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             // client's, and it is only ever asked for from the machine the
             // credentials live on. Same treatment as `RadioEvent::Notice`.
             RadioEvent::LoginTest(_) => None,
+            // The station locations and the certificate to trust. Forwarded,
+            // unlike the login's pass-or-fail: a remote screen cannot choose a
+            // Wavelog location without the list (issue #814). Not cached, as
+            // with `PictureUpload`: it answers a test the client asked for.
+            RadioEvent::WavelogProbe(p) => Some(ServerMsg::WavelogProbe(p)),
+            // A download's pages stay on the machine the logbook is on.
+            RadioEvent::WavelogBatch(_) => None,
+            // The recordings list: the files are this station's, and a
+            // browser has no other way to see them.
+            RadioEvent::Recordings(listing) => Some(ServerMsg::Recordings(listing)),
             RadioEvent::Profiles(p) => {
                 latest.profiles = p.clone();
                 Some(ServerMsg::Profiles(p))
             }
+            // Not cached: it is an answer to a test or news of one upload, and
+            // a screen attaching later has asked nothing.
+            RadioEvent::PictureUpload(st) => Some(ServerMsg::PictureUpload(st)),
         }
     };
     // The satellite half of the station config also drives this machine's own

@@ -18,12 +18,16 @@
 //! wheel and pinch zoom about the pointer, and a double-click hands the view
 //! back to the auto-fit.
 
+use crate::i18n::tr;
 use eframe::egui::{
     Align2, Color32, CursorIcon, FontId, PointerButton, Pos2, Response, Sense, Ui, Vec2, pos2, vec2,
 };
 use sdroxide_types::great_circle_points;
 
 use crate::theme;
+
+/// The links between other stations talking to each other.
+const LINK: Color32 = Color32::from_rgb(0xb4, 0x8c, 0xff);
 
 /// Below this height the map is not worth drawing — the caller should omit it
 /// entirely so the QSO controls keep the space.
@@ -64,6 +68,16 @@ impl Default for MapView {
 }
 
 impl MapView {
+    /// Start over from the auto-fit if the view has gone non-finite. NaN
+    /// survives every clamp and ease, so one bad input event — the kind a
+    /// resume from sleep can deliver — left the map dead for good, double-click
+    /// included (#656).
+    pub(crate) fn sanitize(&mut self) {
+        if !(self.clat.is_finite() && self.clon.is_finite() && self.lon_span.is_finite()) {
+            *self = MapView::default();
+        }
+    }
+
     /// The latitude window this zoom covers on a map of the given aspect
     /// (height/width) — the projection is linear in both axes.
     pub(crate) fn lat_span(&self, aspect: f64) -> f64 {
@@ -173,13 +187,13 @@ pub(crate) fn interact(ui: &Ui, view: &mut MapView, resp: &Response, aspect: f64
             touched = true;
         }
         let t = mt.translation_delta;
-        if t != Vec2::ZERO {
+        if t != Vec2::ZERO && t.is_finite() {
             view.pan((t.x / rect.width()) as f64, (t.y / rect.height()) as f64, aspect);
             touched = true;
         }
     } else if resp.dragged_by(PointerButton::Primary) {
         let d = resp.drag_delta();
-        if d != Vec2::ZERO {
+        if d != Vec2::ZERO && d.is_finite() {
             view.pan((d.x / rect.width()) as f64, (d.y / rect.height()) as f64, aspect);
             touched = true;
         }
@@ -194,7 +208,7 @@ pub(crate) fn interact(ui: &Ui, view: &mut MapView, resp: &Response, aspect: f64
         // Multiplicative, so a wheel click covers the same visual fraction at
         // any zoom — the same rate the panadapter uses.
         let factor = 0.998f64.powf(scroll as f64 * 2.0) / (zoom.max(0.01) as f64);
-        if (factor - 1.0).abs() > 1e-4 {
+        if factor.is_finite() && (factor - 1.0).abs() > 1e-4 {
             let (fx, fy) = frac(pos);
             view.zoom_about(factor, fx, fy, aspect);
             touched = true;
@@ -363,8 +377,24 @@ pub(crate) fn draw_base(
     lat_span: f64,
     map: &theme::MapPalette,
 ) -> f32 {
+    draw_base_cities(p, rect, clat, clon, lon_span, lat_span, map, theme::map_cities())
+}
+
+/// [`draw_base`] for a map with a cities switch of its own: `cities` instead
+/// of the shared setting.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_base_cities(
+    p: &eframe::egui::Painter,
+    rect: eframe::egui::Rect,
+    clat: f64,
+    clon: f64,
+    lon_span: f64,
+    lat_span: f64,
+    map: &theme::MapPalette,
+    cities: bool,
+) -> f32 {
     let dot_r = draw_ground(p, rect, clat, clon, lon_span, lat_span, map);
-    if theme::map_cities() {
+    if cities {
         draw_cities(p, rect, clat, clon, lon_span, lat_span, dot_r, map);
     }
     dot_r
@@ -582,6 +612,9 @@ pub fn show(
     stations: &[crate::digi_map::DigiStation],
     // Network spots with a known location: (lat, lon, rgb tint by kind).
     spots: &[(f64, f64, (u8, u8, u8))],
+    // Who is talking to whom: both ends of an exchange heard on the band, and
+    // how far it has faded (1.0 fresh → 0.0 gone). Empty draws nothing.
+    links: &[((f64, f64), (f64, f64), f32)],
     // Propagation heat, as an equirectangular RGBA image of the whole world
     // (see `crate::prop_map::PropHeat`). Painted under the continents, so the
     // coastline stays readable on top of it.
@@ -595,10 +628,15 @@ pub fn show(
     night: Option<eframe::egui::TextureId>,
     tx_active: bool,
     max_h: f32,
-) {
+    // The callsigns beside the station dots, fading with them.
+    labels: bool,
+    // The cities: the shared setting (`theme::map_cities`) for a map that has
+    // no switch of its own.
+    cities: bool,
+) -> Option<usize> {
     let avail_w = ui.available_width();
     if avail_w < MIN_HEIGHT {
-        return;
+        return None;
     }
     // Fill the caller's width and its (user-draggable) height budget. The map is
     // no longer aspect-locked to 2:1, so it can be dragged taller than half its
@@ -608,7 +646,7 @@ pub fn show(
     let w = avail_w;
     let (rect, resp) = ui.allocate_exact_size(vec2(w, h), Sense::click_and_drag());
     if !ui.is_rect_visible(rect) {
-        return;
+        return None;
     }
     let p = ui.painter_at(rect);
     let map = theme::map();
@@ -624,6 +662,7 @@ pub fn show(
         contacts.push(c);
     }
     let (t_clat, t_clon, t_span) = target_view(home, &contacts, aspect);
+    view.sanitize();
     if !view.initialized {
         view.clat = t_clat;
         view.clon = t_clon;
@@ -678,7 +717,7 @@ pub fn show(
         let tint = Color32::WHITE.gamma_multiply(strength);
         paint_world_texture(&p, rect, clat, clon, lon_span, lat_span, tex, tint);
     }
-    if theme::map_cities() {
+    if cities {
         draw_cities(&p, rect, clat, clon, lon_span, lat_span, dot_r, map);
     }
 
@@ -715,6 +754,16 @@ pub fn show(
         let c = project(d.lat, d.lon);
         p.circle_filled(c, 2.6, alpha(ink, 55.0 * d.fade));
         p.circle_filled(c, 1.7, alpha(ink, 255.0 * d.fade));
+        // Why: HDZ 2026-11-06: "in Karte noch Knopf Labels".
+        if labels && let Some(call) = d.call.as_deref() {
+            p.text(
+                c + vec2(4.0, -1.0),
+                Align2::LEFT_CENTER,
+                call,
+                FontId::monospace(9.0),
+                alpha(ink, 210.0 * d.fade),
+            );
+        }
     }
     // Keep the slow fade progressing even after the zoom has settled.
     if !stations.is_empty() {
@@ -728,6 +777,19 @@ pub fn show(
         let kind = theme::data_ink(rgb);
         p.circle_filled(c, dot_r + 2.0, alpha(kind, 55.0));
         p.circle_filled(c, 2.2, kind);
+    }
+
+    // Other stations' exchanges: a fainter dotted great circle between the
+    // two ends, fading with the exchange's age, under our own path; violet,
+    // a colour no other mark on this map wears (amber is the preview).
+    // Why: HDZ 2026-11-06: "dann connect (wer spricht mit wem)".
+    for (a, b, fade) in links {
+        if *fade <= 0.0 {
+            continue;
+        }
+        for (lat, lon) in great_circle_points(*a, *b, 60) {
+            p.circle_filled(project(lat, lon), dot_r.max(0.9) * 0.8, alpha(LINK, 130.0 * fade));
+        }
     }
 
     // Great-circle path as a dotted cyan trail (dots avoid antimeridian wrap).
@@ -796,7 +858,7 @@ pub fn show(
         p.text(
             pos2(rect.right() - 5.0, rect.bottom() - 4.0),
             Align2::RIGHT_BOTTOM,
-            "DOUBLE-CLICK TO REFRAME",
+            tr!("worldmap-double-click-reframe"),
             FontId::proportional(9.0),
             map.hint,
         );
@@ -804,11 +866,39 @@ pub fn show(
 
     // Frame (red-accent, matching the QSO section panels).
     crate::chrome::paint_cut_border(&p, rect.shrink(0.5), map.frame, map.shell);
+
+    // A click (not a drag) on or near a station dot picks it: the nearest
+    // within 10 points, by index into `stations`.
+    // Why: HDZ 2026-11-06: "beim Anklicken unten die Stationsinfo
+    //      runterplotten (Land und so weiter), was man über den Sender weiß".
+    if !resp.clicked() {
+        return None;
+    }
+    let at = resp.interact_pointer_pos()?;
+    stations
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.fade > 0.0)
+        .map(|(i, d)| (i, project(d.lat, d.lon).distance(at)))
+        .filter(|(_, dist)| *dist <= 10.0)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #656: a non-finite pan must not leave the map dead.
+    #[test]
+    fn a_non_finite_view_starts_over_from_the_auto_fit() {
+        let mut v = MapView { initialized: true, manual: true, ..MapView::default() };
+        v.pan(f64::NAN, 0.0, 0.5);
+        assert!(!v.clon.is_finite(), "NaN went in and should have stuck");
+        v.sanitize();
+        assert!(v.clat.is_finite() && v.clon.is_finite() && v.lon_span.is_finite());
+        assert!(!v.manual && !v.initialized, "the auto-fit should take the view back");
+    }
 
     /// Issue #312: the cities can be turned off, and turning them off takes the
     /// *names* with them — those are what get written across the dot somebody

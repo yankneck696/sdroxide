@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AgcMode, Band, DigiConfig, Direction, ImageKind, LoginTarget, Mode, NetworkConfig, NrLevel,
     QsoStep, RadioConfig, RigctldConfig, RotatorConfig, RxId, SatConfig, SatLockConfig,
-    SkimmerSettings, SpectrumConfig, SstvMode, TciServerConfig, TxEqState, UploadTarget, Vfo,
+    SkimmerSettings, SpectrumConfig, SstvMode, TciServerConfig, TxVoiceState, UploadTarget, Vfo,
     WsjtxConfig,
 };
 
@@ -85,6 +85,14 @@ pub enum Command {
         rx: RxId,
         on: bool,
     },
+    /// NFM FM-Decrackle (click eliminator), de-emphasis and the sensitivity
+    /// of the slip test (see `RxState::fm_decrackle_dip`).
+    SetFmDecrackle {
+        rx: RxId,
+        on: bool,
+        deemph: bool,
+        dip: f32,
+    },
     SetSubRx(bool),
     /// Park the sub receiver on an absolute frequency. The engine clamps it to
     /// the device passband — the sub is a DDC on the same IQ stream as the main
@@ -128,11 +136,11 @@ pub enum Command {
     SetTxDrive(f32),
     SetTuneDrive(f32),
     SetMicGain(f32),
-    /// Whole new state for the transmit parametric EQ (voice modes only),
-    /// sent as a full snapshot on every band/enable change, the same
-    /// "always whole, never a delta" way [`crate::RadioState`] itself is
-    /// broadcast.
-    SetTxEq(TxEqState),
+    /// Whole new state for the transmit voice chain (voice modes only), sent
+    /// as a full snapshot on every change, the same "always whole, never a
+    /// delta" way [`crate::RadioState`] itself is broadcast. Took the place of
+    /// `SetTxEq` when the EQ became one stage of the chain.
+    SetTxVoice(TxVoiceState),
 
     // Voice keyer (10 recorded messages; see [`crate::VoiceStatus`])
     /// Start recording the microphone into a slot (`Some`), or stop and store
@@ -1146,4 +1154,166 @@ pub enum Command {
     ResetModeDefaults {
         mode: Option<Mode>,
     },
+
+    /// Replace the received-picture FTP upload settings (`picupload.json`).
+    /// Boxed: the struct is large next to most commands.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetPictureUploadConfig(Box<crate::PictureUploadConfig>),
+    /// Try the given settings — connect, log in, change directory, put and
+    /// delete a small file — without saving them, and answer with
+    /// [`crate::RadioEvent::PictureUpload`]. The settings being edited are
+    /// tested, so a mistake is found before it is applied.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TestPictureUpload(Box<crate::PictureUploadConfig>),
+    /// Record a test phrase from the microphone for the TX Audio window
+    /// (`true`), or stop and keep it (`false`). Stored raw, before any
+    /// processing, so it can be played back through the chain again and again
+    /// while the operator adjusts it. Never keys the transmitter; refused while
+    /// transmitting.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TxVoiceTestRecord(bool),
+    /// Play the test phrase through the voice chain as it is set *now*, to
+    /// the speakers (`true`), or stop (`false`). Refused while transmitting.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TxVoiceTestPlay(bool),
+    /// Put the live microphone through the voice chain without keying: for
+    /// the meters alone, or for the meters and the speakers. Stops a test
+    /// recording or playback; refused while transmitting, and stopped by the
+    /// next key-down, because the transmitter needs the microphone.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TxVoiceTestLive(crate::TxVoiceLive),
+    /// Download QSOs from Wavelog: each `(station location, cursor)` from the
+    /// record after the cursor on, a page at a time. Each page comes back as
+    /// a [`crate::RadioEvent::WavelogBatch`]; the logbook and the cursors live
+    /// with the screen, so it is the screen that says where to start.
+    ///
+    /// `full` asks for everything (the cursors are ignored) for a resync the
+    /// operator will review before anything changes. Ignored while a download
+    /// is already running. Appended for the usual reason.
+    WavelogSync {
+        stations: Vec<(u32, u64)>,
+        full: bool,
+    },
+    /// Replace the amplifier settings, saved to `amp.json` and echoed back in
+    /// [`crate::RadioEvent::StationConfig`]. The engine closes the old port
+    /// before it opens the new one.
+    ///
+    /// Boxed for the reason [`Command::SetRelayConfig`] is. Appended for the
+    /// usual reason — postcard numbers variants by position.
+    SetAmpConfig(Box<crate::AmpConfig>),
+
+    /// Press one of the amplifier panel's buttons.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    Amp(crate::AmpAction),
+
+    /// Put the radio's own power setting on one of its numbered steps: the
+    /// ELAD FDM-DUO's menu 34 `TX POWER`, by its `TP` parameter (0 to 8 the
+    /// watt steps, 9 MAX), from the 1W / 3W / 5W / MAX buttons beside Drive.
+    /// What survives a restart is [`crate::CatConfig::elad_tx_power`], sent
+    /// separately with [`Command::SetRadioConfig`]; this is the live half.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetRigPowerStep(u8),
+
+    /// Start the radio's built-in antenna tuner. The radio keys itself with a
+    /// carrier for the length of the tune and reports the outcome in
+    /// [`crate::RadioState::atu`]; nothing of sdroxide's transmit chain runs.
+    ///
+    /// Ignored where [`crate::DeviceCaps::has_atu`] is false.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    AtuTune,
+
+    /// Take the radio's built-in antenna tuner out of circuit.
+    ///
+    /// Ignored where [`crate::DeviceCaps::has_atu`] is false.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    AtuBypass,
+
+    /// Delete every memory channel at once (issue #755). Folders stay.
+    ///
+    /// One command rather than a [`Command::DeleteMemory`] per channel, which
+    /// would rewrite the file and republish the list once for each.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    ClearMemories,
+
+    /// Mercury / Data2G: call a station from the operator's panel. Refused,
+    /// with a line in the transcript, while another host (Winlink, a TCP
+    /// program) holds the modem. Appended for the usual reason.
+    TncConnect {
+        call: String,
+    },
+    /// Mercury / Data2G: send one line to the connected station. A CR is added.
+    TncSend {
+        text: String,
+    },
+    /// Mercury / Data2G: hang up cleanly, waiting for the far end to agree.
+    TncDisconnect,
+    /// Mercury / Data2G: drop the link now, whoever holds the modem.
+    TncAbort,
+    /// Mercury: send (true) or stop (false) a tune tone for an antenna tuner.
+    TncTune {
+        on: bool,
+    },
+    /// Mercury / Data2G: empty the panel's transcript. The link is untouched.
+    TncTermClear,
+    /// Hum filter on a receiver's listener audio (see `RxState::hum_filter`).
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetHumFilter {
+        rx: RxId,
+        on: bool,
+    },
+    /// SK filter on a receiver's listener audio, and its time constant (see
+    /// `RxState::sk_filter`). Appended likewise.
+    SetSkFilter {
+        rx: RxId,
+        on: bool,
+        tau_s: f32,
+        open_s: f32,
+        close_s: f32,
+        width: u8,
+        after_nr: bool,
+    },
+    /// The panadapter shows (true) or no longer shows (false) a stretch outside
+    /// the I/Q window while it draws from the I/Q — a hole in the picture. A
+    /// client sends it when it changes. It gates centring the window on a
+    /// resting dial: that happens only while there is a hole to fill, so a
+    /// view inside the window is left where it is. An engine that is never
+    /// told (an older client) does not centre. Appended for the usual reason.
+    SetViewUncovered(bool),
+
+    /// Play a recording back into the decoders, or steer one that is playing.
+    /// See [`crate::playback`]: the radio is stood down for the length of it
+    /// and put back on [`crate::PlaybackCommand::Stop`].
+    ///
+    /// Appended last, for the usual reason — postcard numbers variants by
+    /// position.
+    Playback(crate::PlaybackCommand),
+
+    /// Ask which recordings the station has. A question, answered once with a
+    /// [`crate::RecordingListing`] — the files live where the engine runs, which
+    /// for a browser is not where the window is.
+    ///
+    /// Appended last, for the usual reason.
+    ListRecordings,
+
+    /// Whether the weather-satellite (NOAA APT / Meteor LRPT) decoder runs,
+    /// which signal it reads and which downlink channel it centres on. Kept in
+    /// `wxsat.json`, echoed back in [`crate::RadioState::wxsat`]. Appended last,
+    /// for the usual reason.
+    SetWxsatConfig(crate::WxsatSettings),
+
+    /// Whether the radiosonde decoder runs, which channel it centres on and
+    /// whether it scans the window for sondes instead. Kept in `sonde.json`,
+    /// echoed back in [`crate::RadioState::sonde`]. Appended last, for the
+    /// usual reason.
+    SetSondeConfig(crate::SondeSettings),
 }

@@ -4,6 +4,7 @@
 //! panels share, reachable from any of them. The identity half is the same
 //! store the Settings dialog's General tab edits.
 
+use crate::i18n::{Tr, tr};
 use eframe::egui::{self, RichText};
 use sdroxide_types::Command;
 
@@ -26,6 +27,241 @@ fn is_grid6(g: &str) -> bool {
         && (b'A'..=b'X').contains(&b[5])
 }
 
+/// The groups this station is in, edited as one line: "@EMCOMM @ARES".
+///
+/// The typed text is kept in egui's memory while the field has focus. Turning
+/// every keystroke straight into the list would eat a half-typed "@" or a
+/// trailing space. Returns whether the list changed.
+fn js8_groups_field(ui: &mut egui::Ui, groups: &mut Vec<String>) -> bool {
+    let id = ui.id().with("js8-groups-text");
+    let mut text: String = ui.data(|d| d.get_temp(id)).unwrap_or_else(|| groups.join(" "));
+    let mut changed = false;
+    ui.vertical(|ui| {
+        let resp = crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut text).hint_text("@EMCOMM @ARES"),
+        )
+        .on_hover_text(tr!("setup-js8-groups-hint"));
+        let parsed: Vec<String> = text
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .map(sdroxide_types::js8_group_normalize)
+            .filter(|g| !g.is_empty())
+            .collect();
+        let (good, bad): (Vec<String>, Vec<String>) =
+            parsed.into_iter().partition(|g| sdroxide_types::js8_group_valid(g));
+        let mut good_unique = Vec::new();
+        for g in good {
+            if !good_unique.contains(&g) {
+                good_unique.push(g);
+            }
+        }
+        if resp.changed() && good_unique != *groups {
+            *groups = good_unique;
+            changed = true;
+        }
+        if !bad.is_empty() {
+            ui.label(
+                RichText::new(tr!("setup-js8-not-a-group-name", names = bad.join(" ")))
+                    .size(10.5)
+                    .color(crate::theme::ALERT()),
+            );
+        }
+        if resp.has_focus() {
+            ui.data_mut(|d| d.insert_temp(id, text));
+        } else {
+            ui.data_mut(|d| d.remove::<String>(id));
+        }
+    });
+    changed
+}
+
+/// The group auto-response rules: the master switch, then one card per rule.
+/// Adds its own grid rows. Returns whether anything changed.
+fn js8_auto_rules_editor(ui: &mut egui::Ui, cfg: &mut sdroxide_types::DigiConfig) -> bool {
+    use sdroxide_types::{JS8_AUTO_REPEAT_MAX, JS8_AUTO_RULES_MAX, Js8AutoReplyTo, Js8AutoRule};
+    let mut changed = false;
+    ui.label(tr!("setup-js8-auto-response"));
+    changed |= ui
+        .checkbox(&mut cfg.js8_auto_rules_on, tr!("setup-js8-auto-response-on"))
+        .on_hover_text(tr!("setup-js8-auto-response-on-hint"))
+        .changed();
+    ui.end_row();
+
+    enum Act {
+        Up(usize),
+        Delete(usize),
+    }
+    let mut act = None;
+    let (my_call, my_grid) = (
+        if cfg.js8_call.is_empty() { cfg.my_call.clone() } else { cfg.js8_call.clone() },
+        cfg.my_grid.clone(),
+    );
+    let n = cfg.js8_auto_rules.len();
+    for (i, rule) in cfg.js8_auto_rules.iter_mut().enumerate() {
+        ui.label("");
+        ui.push_id(("js8-rule", i), |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    changed |= ui
+                        .checkbox(&mut rule.enabled, "")
+                        .on_hover_text(tr!("setup-js8-rule-on"))
+                        .changed();
+                    changed |= crate::chrome::field_sized(
+                        ui,
+                        [150.0, 18.0],
+                        egui::TextEdit::singleline(&mut rule.name)
+                            .hint_text(tr!("setup-js8-rule-name")),
+                    )
+                    .changed();
+                    if i > 0
+                        && crate::chrome::chip(ui, false, "↑")
+                            .on_hover_text(tr!("setup-js8-rule-move-up"))
+                            .clicked()
+                    {
+                        act = Some(Act::Up(i));
+                    }
+                    if crate::chrome::chip(ui, false, "✕")
+                        .on_hover_text(tr!("setup-js8-rule-delete"))
+                        .clicked()
+                    {
+                        act = Some(Act::Delete(i));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr!("setup-js8-rule-when"));
+                    if crate::chrome::field_sized(
+                        ui,
+                        [90.0, 18.0],
+                        egui::TextEdit::singleline(&mut rule.group).hint_text("@GROUP"),
+                    )
+                    .on_hover_text(tr!("setup-js8-rule-group-hint"))
+                    .changed()
+                    {
+                        rule.group = rule.group.trim().to_ascii_uppercase();
+                        changed = true;
+                    }
+                    ui.label(tr!("setup-js8-rule-hears"));
+                    changed |= crate::chrome::field_sized(
+                        ui,
+                        [140.0, 18.0],
+                        egui::TextEdit::singleline(&mut rule.contains)
+                            .hint_text(tr!("setup-js8-rule-any-message")),
+                    )
+                    .on_hover_text(tr!("setup-js8-rule-phrase-hint"))
+                    .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr!("setup-js8-rule-reply"));
+                    changed |= crate::chrome::field_sized(
+                        ui,
+                        [280.0, 18.0],
+                        egui::TextEdit::singleline(&mut rule.reply).hint_text("QRV @MYGRID"),
+                    )
+                    .on_hover_text(tr!("setup-js8-rule-reply-hint"))
+                    .changed();
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr!("setup-js8-rule-to"));
+                    for to in Js8AutoReplyTo::ALL {
+                        if crate::chrome::chip(ui, rule.reply_to == to, to.tr())
+                            .on_hover_text(match to {
+                                Js8AutoReplyTo::Sender => tr!("setup-js8-reply-to-sender-hint"),
+                                Js8AutoReplyTo::Group => tr!("setup-js8-reply-to-group-hint"),
+                                Js8AutoReplyTo::AsWritten => {
+                                    tr!("setup-js8-reply-to-as-written-hint")
+                                }
+                            })
+                            .clicked()
+                            && rule.reply_to != to
+                        {
+                            rule.reply_to = to;
+                            changed = true;
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(tr!("setup-js8-rule-send"));
+                    changed |= ui
+                        .add(egui::DragValue::new(&mut rule.repeat).range(1..=JS8_AUTO_REPEAT_MAX))
+                        .changed();
+                    ui.label(tr!("setup-js8-rule-times-every"));
+                    changed |= ui
+                        .add_enabled(
+                            rule.repeat > 1,
+                            egui::DragValue::new(&mut rule.gap_min)
+                                .range(1..=60)
+                                .suffix(tr!("setup-js8-rule-min-suffix")),
+                        )
+                        .changed();
+                });
+                // Its own row: beside the repeat controls it made the card
+                // wider than the dialog's 420 px.
+                ui.horizontal(|ui| {
+                    ui.label(tr!("setup-js8-rule-cooldown"));
+                    changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut rule.cooldown_min)
+                                .range(1..=240)
+                                .suffix(tr!("setup-js8-rule-min-suffix")),
+                        )
+                        .on_hover_text(tr!("setup-js8-rule-cooldown-hint"))
+                        .changed();
+                });
+                let group = sdroxide_types::js8_group_normalize(&rule.group);
+                let preview = rule.render_for("KN4CRD", &my_call, &my_grid);
+                ui.label(
+                    RichText::new(match &preview {
+                        Some(t) => tr!("setup-js8-rule-preview", text = t),
+                        None => tr!("setup-js8-rule-preview-empty"),
+                    })
+                    .monospace()
+                    .size(10.5)
+                    .weak(),
+                )
+                .on_hover_text(tr!("setup-js8-rule-preview-hint", call = "KN4CRD"));
+                let warn = |ui: &mut egui::Ui, text: &str| {
+                    ui.label(RichText::new(text).size(10.5).color(crate::theme::ALERT()));
+                };
+                if group.is_empty() {
+                    warn(ui, &tr!("setup-js8-rule-no-group"));
+                } else if !sdroxide_types::js8_group_valid(&group) {
+                    warn(ui, &tr!("setup-js8-rule-bad-group", group = group.as_str()));
+                }
+                if rule.self_retriggers() {
+                    warn(ui, &tr!("setup-js8-rule-self-retriggers"));
+                }
+            });
+        });
+        ui.end_row();
+    }
+    match act {
+        Some(Act::Up(i)) if i > 0 && i < n => {
+            cfg.js8_auto_rules.swap(i, i - 1);
+            changed = true;
+        }
+        Some(Act::Delete(i)) if i < n => {
+            cfg.js8_auto_rules.remove(i);
+            changed = true;
+        }
+        _ => {}
+    }
+    ui.label("");
+    if crate::chrome::chip_enabled(ui, n < JS8_AUTO_RULES_MAX, false, &tr!("setup-js8-add-rule"))
+        .clicked()
+        && n < JS8_AUTO_RULES_MAX
+    {
+        let group = cfg.js8_groups.first().cloned().unwrap_or_default();
+        cfg.js8_auto_rules.push(Js8AutoRule {
+            group,
+            reply: "QRV @MYGRID".into(),
+            ..Default::default()
+        });
+        changed = true;
+    }
+    ui.end_row();
+    changed
+}
+
 impl SdroxideApp {
     /// Own-call / grid / message-template editor (and RTTY parameters).
     pub(in crate::app) fn digi_settings_window(
@@ -38,17 +274,22 @@ impl SdroxideApp {
         // Per-mode parameters (RTTY/Olivia/THOR/FSQ) now live in each panel's
         // header, so this dialog only carries the shared identity + the
         // message templates the slotted QSO modes share.
-        let title = if mode.is_aprs() {
-            "APRS Setup".to_string()
+        // The window is keyed by its English title, which is what egui keyed
+        // it by before the title was translated: the position it was left
+        // at survives, and a change of language does not move it.
+        let (title, key) = if mode.is_aprs() {
+            (tr!("setup-aprs-setup"), "APRS Setup".to_string())
         } else if mode.is_packet() {
-            "Packet Setup".to_string()
+            (tr!("setup-packet-setup"), "Packet Setup".to_string())
+        } else if mode.is_tnc_modem() {
+            (tr!("setup-mode-setup", mode = mode.label()), format!("{} Setup", mode.label()))
         } else if mode.is_text_modem() || mode.is_hell() || mode.is_js8() {
-            format!("{} Setup", mode.label())
+            (tr!("setup-mode-setup", mode = mode.label()), format!("{} Setup", mode.label()))
         } else {
-            "FT8 / FT4 / FT2 Setup".to_string()
+            (tr!("setup-ft8-ft4-ft2-setup"), "FT8 / FT4 / FT2 Setup".to_string())
         };
-        let resp = egui::Window::new(title.clone())
-            .id(crate::layout::salted_id(ctx, &title))
+        let resp = egui::Window::new(title)
+            .id(crate::layout::salted_id(ctx, &key))
             .open(&mut open)
             .frame(crate::chrome::window_frame())
             .resizable(false)
@@ -60,7 +301,7 @@ impl SdroxideApp {
                 let cfg = &mut self.digi_cfg_edit;
                 let mut changed = false;
                 egui::Grid::new("digi-cfg").num_columns(2).show(ui, |ui| {
-                    ui.label("My callsign");
+                    ui.label(tr!("setup-my-callsign"));
                     if crate::chrome::field(ui, egui::TextEdit::singleline(&mut cfg.my_call))
                         .changed()
                     {
@@ -68,7 +309,7 @@ impl SdroxideApp {
                         changed = true;
                     }
                     ui.end_row();
-                    ui.label("My grid");
+                    ui.label(tr!("setup-my-grid"));
                     if crate::chrome::field(ui, egui::TextEdit::singleline(&mut cfg.my_grid))
                         .changed()
                     {
@@ -76,7 +317,7 @@ impl SdroxideApp {
                     }
                     ui.end_row();
                     if mode.is_packet() {
-                        ui.label("Station call");
+                        ui.label(tr!("setup-station-call"));
                         if crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.packet_mycall),
@@ -88,21 +329,14 @@ impl SdroxideApp {
                         }
                         ui.end_row();
                         ui.label("");
-                        ui.label(
-                            RichText::new(
-                                "With an SSID — OE3JJS-10. A packet station is conventionally \
-                                 a different SSID from the operator, and nothing transmits \
-                                 until this is set.",
-                            )
-                            .weak(),
-                        );
+                        ui.label(RichText::new(tr!("setup-ssid-oe3jjs-10-packet-station")).weak());
                         ui.end_row();
 
                         // Speed is VHF's choice only: HF packet runs at 300 and
                         // the controller clamps it, so offering 9600 on 40 m
                         // would be a control that does nothing.
                         if mode == sdroxide_types::Mode::Packet {
-                            ui.label("Speed");
+                            ui.label(tr!("setup-speed"));
                             ui.horizontal(|ui| {
                                 for b in [
                                     sdroxide_types::PacketBaud::Vhf1200,
@@ -117,18 +351,13 @@ impl SdroxideApp {
                             if cfg.packet_baud == sdroxide_types::PacketBaud::Vhf9600 {
                                 ui.label("");
                                 ui.label(
-                                    RichText::new(
-                                        "9600 needs the radio's data port. A microphone and \
-                                         speaker path destroys it at both ends — that is the \
-                                         radio, not sdroxide.",
-                                    )
-                                    .weak(),
+                                    RichText::new(tr!("setup-t-9600-needs-radio-s-data")).weak(),
                                 );
                                 ui.end_row();
                             }
                         }
 
-                        ui.label("TX delay");
+                        ui.label(tr!("setup-tx-delay"));
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
@@ -136,29 +365,20 @@ impl SdroxideApp {
                                         .range(50..=2000)
                                         .suffix(" ms"),
                                 )
-                                .on_hover_text(
-                                    "Flags sent before a frame, so the far end can hear us and \
-                                     lock its clock. On a CAT rig sdroxide alone spends 165–240 \
-                                     ms getting on the air, and the rig's own transmit-ready \
-                                     time is on top of that.",
-                                )
+                                .on_hover_text(tr!("setup-flags-sent-before-frame-so"))
                                 .changed();
                         });
                         ui.end_row();
 
-                        ui.label("Packet length");
+                        ui.label(tr!("setup-packet-length"));
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
                                     egui::DragValue::new(&mut cfg.packet_paclen)
                                         .range(16..=256)
-                                        .suffix(" bytes"),
+                                        .suffix(tr!("setup-bytes")),
                                 )
-                                .on_hover_text(
-                                    "The most a single frame carries. Shorter frames survive a \
-                                     marginal path — only the frame that was hit is resent — and \
-                                     cost more overhead. 128 on HF, 256 where the path is solid.",
-                                )
+                                .on_hover_text(tr!("setup-most-single-frame-carries-shorter"))
                                 .changed();
                             ui.label(RichText::new("window").weak());
                             let window_max = if cfg.packet_ext_seq { 127 } else { 7 };
@@ -167,67 +387,51 @@ impl SdroxideApp {
                                     egui::DragValue::new(&mut cfg.packet_maxframe)
                                         .range(1..=window_max),
                                 )
-                                .on_hover_text(
-                                    "Frames sent before waiting for an acknowledgement. More \
-                                     fills a good path; on a bad one it is more to resend.",
-                                )
+                                .on_hover_text(tr!(
+                                    "setup-frames-sent-before-waiting-acknowledgement"
+                                ))
                                 .changed();
                         });
                         ui.end_row();
 
-                        ui.label("Extended");
+                        ui.label(tr!("setup-extended"));
                         changed |= ui
-                            .checkbox(&mut cfg.packet_ext_seq, "Ask for mod-128")
-                            .on_hover_text(
-                                "Extended sequence numbers, for a window bigger than seven. Many \
-                                 nodes refuse the request with a DM, which looks exactly like a \
-                                 station that would not talk to you — so leave it off unless you \
-                                 know the far end wants it.",
-                            )
+                            .checkbox(&mut cfg.packet_ext_seq, tr!("setup-ask-mod-128"))
+                            .on_hover_text(tr!("setup-extended-sequence-numbers-window-bigger"))
                             .changed();
                         ui.end_row();
 
-                        ui.label("Answer calls");
+                        ui.label(tr!("setup-answer-calls"));
                         changed |= ui
-                            .checkbox(&mut cfg.packet_accept_incoming, "Accept connections")
-                            .on_hover_text(
-                                "Off for a Winlink client, which dials out and has no reason to \
-                                 answer. On to be reachable as a peer: a call arrives in the \
-                                 terminal pane and you talk to whoever made it. A station whose \
-                                 link is already busy with a Winlink session refuses calls until \
-                                 that finishes.",
+                            .checkbox(
+                                &mut cfg.packet_accept_incoming,
+                                tr!("setup-accept-connections"),
                             )
+                            .on_hover_text(tr!("setup-off-winlink-client-which-dials"))
                             .changed();
                         ui.end_row();
 
-                        ui.label("Connect text");
+                        ui.label(tr!("setup-connect-text"));
                         changed |= crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.packet_connect_text)
-                                .hint_text("what a caller is greeted with"),
+                                .hint_text(tr!("setup-what-caller-greeted")),
                         )
-                        .on_hover_text(
-                            "Sent to a station that connects to us, once the link is up. Empty \
-                             sends nothing — which looks broken to whoever called.",
-                        )
+                        .on_hover_text(tr!("setup-sent-station-connects-us-once"))
                         .changed();
                         ui.end_row();
 
-                        ui.label("Default via");
+                        ui.label(tr!("setup-default-via"));
                         changed |= crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.packet_connect_via)
-                                .hint_text("OE3XLR-1,OE3XMS-1"),
+                                .hint_text(tr!("setup-oe3xlr-1-oe3xms-1")),
                         )
-                        .on_hover_text(
-                            "The digipeater path the terminal starts with. The path to your \
-                             local node is the same every time, and retyping it is how a hop \
-                             gets left off.",
-                        )
+                        .on_hover_text(tr!("setup-digipeater-path-terminal-starts-path"))
                         .changed();
                         ui.end_row();
 
-                        ui.label("Beacon");
+                        ui.label(tr!("setup-beacon"));
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
@@ -235,25 +439,22 @@ impl SdroxideApp {
                                         .range(0..=120)
                                         .suffix(" min"),
                                 )
-                                .on_hover_text("0 disables the timer")
+                                .on_hover_text(tr!("setup-t-0-disables-timer"))
                                 .changed();
                             changed |= crate::chrome::field(
                                 ui,
                                 egui::TextEdit::singleline(&mut cfg.packet_beacon_text)
-                                    .hint_text("beacon text"),
+                                    .hint_text(tr!("setup-beacon-text")),
                             )
                             .changed();
                         });
                         ui.end_row();
 
-                        ui.label("KISS server");
+                        ui.label(tr!("setup-kiss-server"));
                         ui.horizontal(|ui| {
                             changed |= ui
-                                .checkbox(&mut cfg.packet_kiss_server, "Serve")
-                                .on_hover_text(
-                                    "Offer this modem as a KISS TNC on a socket, so Pat, an \
-                                     APRS client or the Linux AX.25 stack can use the radio.",
-                                )
+                                .checkbox(&mut cfg.packet_kiss_server, tr!("setup-serve"))
+                                .on_hover_text(tr!("setup-offer-modem-kiss-tnc-socket"))
                                 .changed();
                             changed |= ui
                                 .add(
@@ -265,17 +466,94 @@ impl SdroxideApp {
                         ui.end_row();
                     }
 
+                    if mode.is_tnc_modem() {
+                        ui.label(tr!("setup-station-call"));
+                        if crate::chrome::field(
+                            ui,
+                            egui::TextEdit::singleline(&mut cfg.tnc_mycall)
+                                .hint_text(cfg.my_call.clone()),
+                        )
+                        .on_hover_text(tr!("setup-tnc-call-hint"))
+                        .changed()
+                        {
+                            cfg.tnc_mycall = cfg.tnc_mycall.to_uppercase();
+                            changed = true;
+                        }
+                        ui.end_row();
+
+                        ui.label(tr!("setup-tnc-bandwidth"));
+                        ui.horizontal(|ui| {
+                            let bw = if mode == sdroxide_types::Mode::Data2g {
+                                &mut cfg.data2g_bw
+                            } else {
+                                &mut cfg.mercury_bw
+                            };
+                            for b in sdroxide_types::TncBw::offered(mode) {
+                                changed |= ui.selectable_value(bw, *b, b.label()).changed();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(tr!("setup-tnc-lead"));
+                        ui.horizontal(|ui| {
+                            let mut auto = cfg.tnc_ptt_lead_ms.is_none();
+                            if ui
+                                .checkbox(&mut auto, tr!("setup-tnc-lead-auto"))
+                                .on_hover_text(tr!("setup-tnc-lead-hint"))
+                                .changed()
+                            {
+                                cfg.tnc_ptt_lead_ms = if auto { None } else { Some(150) };
+                                changed = true;
+                            }
+                            if let Some(ms) = cfg.tnc_ptt_lead_ms.as_mut() {
+                                changed |= ui
+                                    .add(egui::DragValue::new(ms).range(0..=1000).suffix(" ms"))
+                                    .changed();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label(tr!("setup-tnc-listen"));
+                        changed |= ui
+                            .checkbox(&mut cfg.tnc_listen, tr!("setup-tnc-listen-check"))
+                            .on_hover_text(tr!("setup-tnc-listen-hint"))
+                            .changed();
+                        ui.end_row();
+
+                        ui.label(tr!("setup-tnc-host"));
+                        ui.horizontal(|ui| {
+                            changed |= ui
+                                .checkbox(&mut cfg.tnc_host_server, tr!("setup-serve"))
+                                .on_hover_text(tr!("setup-tnc-host-hint"))
+                                .changed();
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut cfg.tnc_host_port)
+                                        .range(1024..=65534),
+                                )
+                                .changed();
+                        });
+                        ui.end_row();
+
+                        if mode == sdroxide_types::Mode::Mercury {
+                            ui.label(tr!("setup-mercury-port"));
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut cfg.mercury_port).range(1024..=65533),
+                                )
+                                .on_hover_text(tr!("setup-mercury-port-hint"))
+                                .changed();
+                            ui.end_row();
+                        }
+                    }
+
                     if mode.is_aprs() {
-                        ui.label("APRS call");
+                        ui.label(tr!("setup-aprs-call"));
                         if crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.aprs_mycall),
                         )
-                        .on_hover_text(
-                            "The callsign this station beacons under, with its SSID — \
-                             OE3JJS-9 for a car, -10 for an I-gate, -5 for a phone. Leave it \
-                             empty to use the callsign above.",
-                        )
+                        .on_hover_text(tr!("setup-callsign-station-beacons-under-ssid"))
                         .changed()
                         {
                             cfg.aprs_mycall = cfg.aprs_mycall.to_uppercase();
@@ -288,18 +566,17 @@ impl SdroxideApp {
                         // above is blank.
                         let call = cfg.aprs_call();
                         ui.label(if call.is_empty() {
-                            RichText::new(
-                                "No callsign: this station will not transmit at all — not a \
-                                 beacon, not a message, not an acknowledgement.",
-                            )
-                            .size(10.0)
-                            .color(crate::theme::ALERT())
+                            RichText::new(tr!("setup-no-callsign-station-will-not"))
+                                .size(10.0)
+                                .color(crate::theme::ALERT())
                         } else {
-                            RichText::new(format!("Transmits as {call}")).size(10.0).weak()
+                            RichText::new(tr!("setup-transmits-as", call = call.to_string()))
+                                .size(10.0)
+                                .weak()
                         });
                         ui.end_row();
 
-                        ui.label("Symbol");
+                        ui.label(tr!("setup-symbol"));
                         ui.horizontal(|ui| {
                             // A picker over the whole 190-entry table would be
                             // a dialog of its own. These are the ones an
@@ -331,12 +608,7 @@ impl SdroxideApp {
                                         .char_limit(2)
                                         .font(egui::TextStyle::Monospace),
                                 )
-                                .on_hover_text(
-                                    "The two characters as the protocol carries them: a table \
-                                     (`/` or `\\`) and a symbol code. A digit or a letter in \
-                                     the first position is an overlay, drawn on top of the \
-                                     alternate table's icon.",
-                                )
+                                .on_hover_text(tr!("setup-two-characters-protocol-carries-them"))
                                 .changed()
                             {
                                 let mut c = text.chars();
@@ -348,20 +620,15 @@ impl SdroxideApp {
                         });
                         ui.end_row();
 
-                        ui.label("Path");
+                        ui.label(tr!("setup-path"));
                         ui.horizontal(|ui| {
                             changed |= crate::chrome::field(
                                 ui,
                                 egui::TextEdit::singleline(&mut cfg.aprs_path)
-                                    .hint_text("WIDE1-1,WIDE2-1")
+                                    .hint_text(tr!("setup-wide1-1-wide2-1"))
                                     .desired_width(150.0),
                             )
-                            .on_hover_text(
-                                "How far you ask to be repeated. This is the single most \
-                                 consequential setting on the channel: every hop multiplies \
-                                 the transmissions the whole network makes on one shared \
-                                 frequency.",
-                            )
+                            .on_hover_text(tr!("setup-how-far-you-ask-repeated"))
                             .changed();
                         });
                         ui.end_row();
@@ -386,17 +653,12 @@ impl SdroxideApp {
                         // that they could, and no way to see what was going
                         // out instead.
                         let from_grid = sdroxide_aprs::position_from_grid(&cfg.my_grid);
-                        ui.label("Position");
+                        ui.label(tr!("setup-position"));
                         ui.horizontal(|ui| {
                             let was = cfg.aprs_use_grid;
                             changed |= ui
-                                .checkbox(&mut cfg.aprs_use_grid, "From my grid")
-                                .on_hover_text(
-                                    "Beacon the centre of the locator above, reported with the \
-                                     ambiguity a locator actually has — a six-character one is \
-                                     a couple of kilometres across, and saying so is honest. \
-                                     Untick to give exact coordinates instead.",
-                                )
+                                .checkbox(&mut cfg.aprs_use_grid, tr!("setup-my-grid-2"))
+                                .on_hover_text(tr!("setup-beacon-centre-locator-above-reported"))
                                 .changed();
                             // Taking the coordinates over starts from where the
                             // locator had you, rather than from Null Island.
@@ -417,7 +679,7 @@ impl SdroxideApp {
                         // has to be discovered to be typeable at all.
                         for (label, value, buf, shown, limit, hemi) in [
                             (
-                                "Latitude",
+                                tr!("setup-latitude"),
                                 &mut cfg.aprs_lat,
                                 &mut self.aprs_lat_buf,
                                 grid_lat,
@@ -425,7 +687,7 @@ impl SdroxideApp {
                                 "south",
                             ),
                             (
-                                "Longitude",
+                                tr!("setup-longitude"),
                                 &mut cfg.aprs_lon,
                                 &mut self.aprs_lon_buf,
                                 grid_lon,
@@ -445,7 +707,7 @@ impl SdroxideApp {
                                         false,
                                         egui::TextEdit::singleline(buf).desired_width(96.0),
                                     );
-                                    ui.label(RichText::new("from the locator").size(9.5).weak());
+                                    ui.label(RichText::new(tr!("setup-locator")).size(9.5).weak());
                                     return;
                                 }
                                 // Seed once, so the box is never blank.
@@ -461,9 +723,9 @@ impl SdroxideApp {
                                     .desired_width(96.0)
                                     .text_color_opt(parsed.is_none().then(crate::theme::ALERT));
                                 if crate::chrome::field(ui, edit)
-                                    .on_hover_text(format!(
-                                        "Decimal degrees, negative for {hemi}. Paste one \
-                                         straight off a map."
+                                    .on_hover_text(tr!(
+                                        "setup-decimal-degrees",
+                                        hemisphere = hemi.to_string()
                                     ))
                                     .changed()
                                     && let Some(d) = parsed
@@ -474,7 +736,7 @@ impl SdroxideApp {
                                 }
                                 if parsed.is_none() {
                                     ui.label(
-                                        RichText::new("not a coordinate")
+                                        RichText::new(tr!("setup-not-coordinate"))
                                             .size(9.5)
                                             .color(crate::theme::ALERT()),
                                     );
@@ -483,17 +745,17 @@ impl SdroxideApp {
                             ui.end_row();
                         }
 
-                        ui.label("Comment");
+                        ui.label(tr!("setup-comment"));
                         changed |= crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.aprs_comment)
-                                .hint_text("sent with every beacon")
+                                .hint_text(tr!("setup-sent-every-beacon"))
                                 .char_limit(43),
                         )
                         .changed();
                         ui.end_row();
 
-                        ui.label("Beacon");
+                        ui.label(tr!("setup-beacon"));
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
@@ -501,47 +763,34 @@ impl SdroxideApp {
                                         .range(0..=120)
                                         .suffix(" min"),
                                 )
-                                .on_hover_text(
-                                    "0 — the default — never beacons on a timer. Thirty minutes \
-                                     is the convention for a fixed station; a moving one \
-                                     beacons oftener, but every beacon is somebody else's \
-                                     channel time.",
-                                )
+                                .on_hover_text(tr!("setup-t-0-default-never-beacons-timer"))
                                 .changed();
                             changed |= ui
-                                .checkbox(&mut cfg.aprs_compressed, "Compressed")
-                                .on_hover_text(
-                                    "The compressed position format: a third of the air time \
-                                     and more precise. Every receiver since the 1990s reads it.",
-                                )
+                                .checkbox(&mut cfg.aprs_compressed, tr!("setup-compressed"))
+                                .on_hover_text(tr!("setup-compressed-position-format-third-air"))
                                 .changed();
                         });
                         ui.end_row();
                         if cfg.aprs_beacon_minutes > 0 {
                             ui.label("");
                             ui.label(
-                                RichText::new(
-                                    "The first goes out one interval from now, not immediately.",
-                                )
-                                .size(10.0)
-                                .weak(),
+                                RichText::new(tr!("setup-first-goes-out-one-interval"))
+                                    .size(10.0)
+                                    .weak(),
                             );
                             ui.end_row();
                         }
 
-                        ui.label("Messages");
+                        ui.label(tr!("setup-messages"));
                         changed |= ui
-                            .checkbox(&mut cfg.aprs_ack_messages, "Acknowledge")
-                            .on_hover_text(
-                                "Answer messages addressed to you. An acknowledgement is a \
-                                 transmission this station makes without being asked, so a \
-                                 receive-only setup should turn it off — and the beacon then \
-                                 stops claiming to be reachable too.",
-                            )
+                            .checkbox(&mut cfg.aprs_ack_messages, tr!("setup-acknowledge"))
+                            .on_hover_text(tr!(
+                                "setup-answer-messages-addressed-you-acknowledgement"
+                            ))
                             .changed();
                         ui.end_row();
 
-                        ui.label("TX delay");
+                        ui.label(tr!("setup-tx-delay"));
                         ui.horizontal(|ui| {
                             changed |= ui
                                 .add(
@@ -549,60 +798,45 @@ impl SdroxideApp {
                                         .range(50..=2000)
                                         .suffix(" ms"),
                                 )
-                                .on_hover_text(
-                                    "Flags sent ahead of every frame, so the far end's modem \
-                                     hears the carrier and locks its clock before the data \
-                                     starts. It has to outlast everything between pressing \
-                                     transmit and radiating: sdroxide alone spends 165–240 ms \
-                                     of it on a CAT rig, and a radio taking audio over a \
-                                     network buffers more on top. Too little and the far end \
-                                     never locks — the transmission is there and nothing \
-                                     decodes it.",
-                                )
+                                .on_hover_text(tr!("setup-flags-sent-ahead-every-frame"))
                                 .changed();
-                            ui.label(RichText::new("shared with the packet mode").size(9.5).weak());
+                            ui.label(
+                                RichText::new(tr!("setup-shared-packet-mode")).size(9.5).weak(),
+                            );
                         });
                         ui.end_row();
 
-                        ui.label("Keep stations");
+                        ui.label(tr!("setup-keep-stations"));
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut cfg.aprs_station_ttl_min)
                                     .range(5..=1440)
                                     .suffix(" min"),
                             )
-                            .on_hover_text(
-                                "How long a station stays on the map after it was last heard. \
-                                 Also what the map's fade is measured against, so a short \
-                                 window shows only what is live.",
-                            )
+                            .on_hover_text(tr!("setup-how-long-station-stays-map"))
                             .changed();
                         ui.end_row();
                     }
 
                     if mode.is_js8() {
                         let turbo = cfg.js8_speed == sdroxide_types::Js8Speed::Turbo;
-                        ui.label("Auto-reply");
+                        ui.label(tr!("setup-auto-reply"));
                         changed |= ui
-                            .checkbox(&mut cfg.js8_auto_reply, "Answer SNR? / GRID? / STATUS?")
-                            .on_hover_text(
-                                "Answer a direct question addressed to you or to @ALLCALL, with \
-                                 the answer rather than an acknowledgement. Never answers another \
-                                 station's traffic, and never answers itself.",
-                            )
+                            .checkbox(&mut cfg.js8_auto_reply, tr!("setup-answer-snr-grid-status"))
+                            .on_hover_text(tr!("setup-answer-direct-question-addressed-you"))
                             .changed();
                         ui.end_row();
-                        ui.label("Heartbeat");
+                        ui.label(tr!("setup-heartbeat"));
                         ui.horizontal(|ui| {
                             // The intervals JS8Call offers, plus off. A beacon
                             // is a commitment of air time, so the choice is a
                             // few sensible ones rather than a free number.
                             for (mins, label) in [
-                                (0u32, "Off"),
-                                (10, "10 min"),
-                                (15, "15 min"),
-                                (30, "30 min"),
-                                (60, "60 min"),
+                                (0u32, tr!("setup-off")),
+                                (10, String::from("10 min")),
+                                (15, String::from("15 min")),
+                                (30, String::from("30 min")),
+                                (60, String::from("60 min")),
                             ] {
                                 if crate::chrome::chip(ui, cfg.js8_heartbeat_min == mins, label)
                                     .clicked()
@@ -620,38 +854,27 @@ impl SdroxideApp {
                         // operator never chose.
                         ui.label(
                             RichText::new(if turbo {
-                                "Turbo does not beacon — it is the local and VHF speed."
+                                tr!("setup-turbo-does-not-beacon-local")
                             } else {
-                                "Sends your callsign and grid so others know you are receivable. \
-                                 The first goes out one interval from now, not immediately."
+                                tr!("setup-sends-your-callsign-grid-so")
                             })
                             .size(10.5)
                             .weak(),
                         );
                         ui.end_row();
-                        ui.label("Beacon frequency");
+                        ui.label(tr!("setup-beacon-frequency"));
                         ui.horizontal(|ui| {
                             let sub_band = !cfg.js8_hb_anywhere;
-                            if crate::chrome::chip(ui, sub_band, "500–1000 Hz")
-                                .on_hover_text(
-                                    "Move each beacon to a free slot in the heartbeat sub-band, \
-                                     the way JS8Call does: it is where stations watching for \
-                                     beacons look, and it keeps an unattended transmitter off \
-                                     somebody else's QSO. The slot is chosen when the beacon \
-                                     actually goes out, clear of everything being decoded.",
-                                )
+                            if crate::chrome::chip(ui, sub_band, tr!("setup-t-500-1000-hz"))
+                                .on_hover_text(tr!("setup-move-each-beacon-free-slot"))
                                 .clicked()
                                 && !sub_band
                             {
                                 cfg.js8_hb_anywhere = false;
                                 changed = true;
                             }
-                            if crate::chrome::chip(ui, !sub_band, "Working freq")
-                                .on_hover_text(
-                                    "Beacon where you are working instead. Against the band \
-                                     convention, but it keeps everything you transmit in one \
-                                     place.",
-                                )
+                            if crate::chrome::chip(ui, !sub_band, tr!("setup-working-freq"))
+                                .on_hover_text(tr!("setup-beacon-where-you-are-working"))
                                 .clicked()
                                 && sub_band
                             {
@@ -660,31 +883,50 @@ impl SdroxideApp {
                             }
                         });
                         ui.end_row();
-                        ui.label("Heartbeat reply");
+                        ui.label(tr!("setup-heartbeat-reply"));
                         ui.add_enabled_ui(cfg.js8_auto_reply && !turbo, |ui| {
                             changed |= ui
                                 .checkbox(
                                     &mut cfg.js8_hb_ack,
-                                    "Answer heartbeats with a signal report",
+                                    tr!("setup-answer-heartbeats-signal-report"),
                                 )
-                                .on_hover_text(
-                                    "Tell a station that beaconed how well you copied them. Off \
-                                     by default: a busy band carries a heartbeat every slot, and \
-                                     answering all of them would flood exactly the band \
-                                     heartbeats exist to keep quiet. Rate-limited to one answer \
-                                     per station every 15 minutes, and never while a message is \
-                                     still arriving or while you have something queued to send.",
-                                )
+                                .on_hover_text(tr!("setup-tell-station-beaconed-how-well"))
                                 .changed();
                         });
                         ui.end_row();
-                        ui.label("Status message");
+                        ui.label(tr!("setup-status-message"));
                         changed |= crate::chrome::field(
                             ui,
                             egui::TextEdit::singleline(&mut cfg.js8_status),
                         )
                         .changed();
                         ui.end_row();
+                        ui.label(tr!("setup-js8-station-info"));
+                        changed |= crate::chrome::field(
+                            ui,
+                            egui::TextEdit::singleline(&mut cfg.js8_info)
+                                .hint_text(tr!("setup-js8-station-info-example")),
+                        )
+                        .on_hover_text(tr!("setup-js8-station-info-hint"))
+                        .changed();
+                        ui.end_row();
+                        ui.label(tr!("setup-js8-callsign"));
+                        let hint = tr!("setup-js8-callsign-same", call = cfg.my_call.as_str());
+                        if crate::chrome::field(
+                            ui,
+                            egui::TextEdit::singleline(&mut cfg.js8_call).hint_text(hint),
+                        )
+                        .on_hover_text(tr!("setup-js8-callsign-hint"))
+                        .changed()
+                        {
+                            cfg.js8_call = cfg.js8_call.trim().to_ascii_uppercase();
+                            changed = true;
+                        }
+                        ui.end_row();
+                        ui.label(tr!("setup-js8-groups"));
+                        changed |= js8_groups_field(ui, &mut cfg.js8_groups);
+                        ui.end_row();
+                        changed |= js8_auto_rules_editor(ui, cfg);
                     }
                     // Everything from here down belongs to the QSO modes: a
                     // transmit period, a sequencer, a watchdog and the message
@@ -698,126 +940,104 @@ impl SdroxideApp {
                     // every setting the operator typed is discarded the moment
                     // the window closes — which is what happened when this
                     // was written the other way (issue #150).
-                    if !mode.is_aprs() {
-                        ui.label("TX period");
-                        ui.horizontal(|ui| {
-                            changed |=
-                                ui.selectable_value(&mut cfg.tx_even, true, "Even").changed();
-                            changed |=
-                                ui.selectable_value(&mut cfg.tx_even, false, "Odd").changed();
-                        });
-                        ui.end_row();
-                        ui.label("Auto-sequence");
-                        changed |= crate::chrome::checkbox(ui, &mut cfg.auto_seq, "").changed();
-                        ui.end_row();
+                    if !mode.is_aprs() && !mode.is_tnc_modem() {
+                        // JS8 has no even/odd period and no sequencer: a
+                        // station transmits when it has something to say.
+                        if !mode.is_js8() {
+                            ui.label(tr!("setup-tx-period"));
+                            ui.horizontal(|ui| {
+                                changed |= ui
+                                    .selectable_value(&mut cfg.tx_even, true, tr!("setup-even"))
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(&mut cfg.tx_even, false, tr!("setup-odd"))
+                                    .changed();
+                            });
+                            ui.end_row();
+                            ui.label(tr!("setup-auto-sequence"));
+                            changed |= crate::chrome::checkbox(ui, &mut cfg.auto_seq, "").changed();
+                            ui.end_row();
+                        }
                         if mode == sdroxide_types::Mode::Ft8 {
-                            ui.label("Decode depth");
+                            ui.label(tr!("setup-decode-depth"));
                             let row = ui.horizontal(|ui| {
                                 let mut c = false;
                                 c |= ui
                                     .selectable_value(
                                         &mut cfg.ft8_depth,
                                         sdroxide_types::Ft8Depth::Fast,
-                                        "Fast",
+                                        tr!("setup-fast"),
                                     )
                                     .changed();
                                 c |= ui
                                     .selectable_value(
                                         &mut cfg.ft8_depth,
                                         sdroxide_types::Ft8Depth::Normal,
-                                        "Normal",
+                                        tr!("setup-normal"),
                                     )
                                     .changed();
                                 c |= ui
                                     .selectable_value(
                                         &mut cfg.ft8_depth,
                                         sdroxide_types::Ft8Depth::Deep,
-                                        "Deep",
+                                        tr!("setup-deep"),
                                     )
                                     .changed();
                                 c
                             });
                             changed |= row.inner;
-                            row.response.on_hover_text(
-                                "How hard the FT8 decoder works for weak signals.\n\n\
-                                 Fast — one pass, no signal subtraction: quickest, fewest \
-                                 decodes.\n\
-                                 Normal — flat multi-pass subtraction: a little quicker than \
-                                 Deep, a little less thorough.\n\
-                                 Deep — the checkpointed multi-pass: the most decodes, and \
-                                 ~1.2 s on a busy slot.",
-                            );
+                            row.response.on_hover_text(tr!("setup-how-hard-ft8-decoder-works"));
                             ui.end_row();
                         }
-                        ui.label("Auto TX frequency");
+                        ui.label(tr!("setup-auto-tx-frequency"));
                         changed |= ui
                             .checkbox(&mut cfg.auto_tx_freq, "")
-                            .on_hover_text(
-                                "Choose the transmit frequency automatically: the quietest spot in \
-                             the period you transmit in, rather than the frequency of the \
-                             station you are answering. Off does NOT hold it — it answers on \
-                             the frequency of the station being called. To hold, use Hold TX.",
-                            )
+                            .on_hover_text(tr!(
+                                "setup-choose-transmit-frequency-automatically-quietest"
+                            ))
                             .changed();
                         ui.end_row();
-                        ui.label("Hold TX frequency");
+                        ui.label(tr!("setup-hold-tx-frequency"));
                         changed |= ui
                             .checkbox(&mut cfg.hold_tx_freq, "")
-                            .on_hover_text(
-                                "Pin the transmit tone where it is. Nothing moves it: not \
-                             answering a station, not the call queue, not calling CQ, not a \
-                             click on a decode or the waterfall. Overrides Auto TX frequency. \
-                             Changing band is the one exception: the offset you last set on \
-                             the new band comes back with it. For where your licence is \
-                             narrower than the band plan — on a UK 60 m dial of 5357 kHz the \
-                             allocation ends at 5358.0, so the tone must stay under 1000 Hz.",
-                            )
+                            .on_hover_text(tr!("setup-pin-transmit-tone-where-nothing"))
                             .changed();
                         ui.end_row();
-                        ui.label("TX watchdog");
+                        ui.label(tr!("setup-tx-watchdog"));
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut cfg.tx_watchdog_min)
                                     .range(0..=60)
                                     .suffix(" min"),
                             )
-                            .on_hover_text(
-                                "Stop transmitting after this long with no reply and no action \
-                             from you. 0 disables it.",
-                            )
+                            .on_hover_text(tr!("setup-stop-transmitting-after-long-no"))
                             .changed();
                         ui.end_row();
-                        ui.label("Give up after");
+                        ui.label(tr!("setup-give-up-after"));
                         changed |= ui
                             .add(
                                 egui::DragValue::new(&mut cfg.max_tx_repeats)
                                     .range(0..=30)
-                                    .suffix(" calls"),
+                                    .suffix(tr!("setup-calls")),
                             )
-                            .on_hover_text(
-                                "Unanswered calls to one station before moving on. Calling CQ is \
-                             exempt. 0 disables it.",
-                            )
+                            .on_hover_text(tr!("setup-unanswered-calls-one-station-before"))
                             .changed();
                         ui.end_row();
                         // Special operating activity (issue #223). Above the
                         // DXpedition roles because it changes what every
                         // message in the exchange says, where those change who
                         // sends them.
-                        ui.label("Contest");
+                        ui.label(tr!("setup-contest"));
                         ui.horizontal(|ui| {
                             for m in sdroxide_types::ContestMode::ALL {
                                 changed |= ui
-                                    .selectable_value(&mut cfg.contest, m, m.label())
+                                    .selectable_value(&mut cfg.contest, m, m.tr())
                                     .on_hover_text(match m {
                                         sdroxide_types::ContestMode::None => {
-                                            "The everyday exchange: grid, report, RR73."
+                                            tr!("setup-everyday-exchange-grid-report-rr73")
                                         }
                                         sdroxide_types::ContestMode::EuVhf => {
-                                            "European VHF contests: send a signal report, a \
-                                             serial number and your SIX-character locator, in \
-                                             the message layout WSJT-X calls EU VHF Contest. \
-                                             CQ goes out as CQ TEST."
+                                            tr!("setup-european-vhf-contests-send-signal")
                                         }
                                     })
                                     .changed();
@@ -825,7 +1045,7 @@ impl SdroxideApp {
                         });
                         ui.end_row();
                         if cfg.contest == sdroxide_types::ContestMode::EuVhf {
-                            ui.label("Serial");
+                            ui.label(tr!("setup-serial"));
                             ui.horizontal(|ui| {
                                 // Straight out as its own command, never
                                 // through this window's `changed` flag: the
@@ -838,13 +1058,7 @@ impl SdroxideApp {
                                         egui::DragValue::new(&mut cfg.contest_serial)
                                             .range(1..=sdroxide_types::CONTEST_SERIAL_MAX),
                                     )
-                                    .on_hover_text(
-                                        "The serial number the next exchange will carry. It \
-                                         advances by itself as each contact is logged and is \
-                                         remembered between sessions — set it by hand only to \
-                                         start a contest, or to pick up where a paper log got \
-                                         to.",
-                                    );
+                                    .on_hover_text(tr!("setup-serial-number-next-exchange-will"));
                                 if n.changed() {
                                     cmds.push(Command::SetContestSerial(cfg.contest_serial));
                                 }
@@ -855,54 +1069,45 @@ impl SdroxideApp {
                                 // leaving the operator to wonder.
                                 if !is_grid6(&cfg.my_grid) {
                                     ui.label(
-                                        RichText::new("⚠ needs a 6-character grid")
+                                        RichText::new(tr!("setup-needs-6-character-grid"))
                                             .size(11.0)
                                             .color(crate::theme::ALERT()),
                                     )
-                                    .on_hover_text(
-                                        "EU VHF Contest messages carry a six-character locator \
-                                         (JN88DD, not JN88). Until My grid has one, the ordinary \
-                                         exchange is sent instead.",
-                                    );
+                                    .on_hover_text(tr!("setup-eu-vhf-contest-messages-carry"));
                                 }
                             });
                             ui.end_row();
                         }
-                        ui.label("DXpedition");
+                        ui.label(tr!("setup-dxpedition"));
                         ui.horizontal(|ui| {
                             for m in sdroxide_types::DxpedMode::ALL {
                                 changed |= ui
-                                .selectable_value(&mut cfg.dxped_mode, m, m.label())
-                                .on_hover_text(match m {
-                                    sdroxide_types::DxpedMode::Normal => "Ordinary FT8 operation.",
-                                    sdroxide_types::DxpedMode::Hound => {
-                                        "Calling a DXpedition running Fox mode: call from above \
-                                         1000 Hz, move down onto the Fox when it answers, and \
-                                         log on its RR73 without sending 73."
-                                    }
-                                    sdroxide_types::DxpedMode::Fox => {
-                                        "Run the pile-up: several signals at once, a queue of \
-                                         callers, worked strongest and rarest first. CALL CQ \
-                                         starts it, STOP QSO stands it down."
-                                    }
-                                })
-                                .changed();
+                                    .selectable_value(&mut cfg.dxped_mode, m, m.tr())
+                                    .on_hover_text(match m {
+                                        sdroxide_types::DxpedMode::Normal => {
+                                            tr!("setup-ordinary-ft8-operation")
+                                        }
+                                        sdroxide_types::DxpedMode::Hound => {
+                                            tr!("setup-calling-dxpedition-running-fox-mode")
+                                        }
+                                        sdroxide_types::DxpedMode::Fox => {
+                                            tr!("setup-run-pile-up-several-signals")
+                                        }
+                                    })
+                                    .changed();
                             }
                         });
                         ui.end_row();
                         if cfg.dxped_mode == sdroxide_types::DxpedMode::Fox {
-                            ui.label("Fox signals");
+                            ui.label(tr!("setup-fox-signals"));
                             changed |= ui
-                            .add(
-                                egui::DragValue::new(&mut cfg.fox_slots)
-                                    .range(1..=sdroxide_types::FOX_MAX_SLOTS)
-                                    .suffix(" at once"),
-                            )
-                            .on_hover_text(
-                                "Simultaneous transmissions, spaced 60 Hz apart. They share the \
-                                 transmitter's power, so more signals means each is weaker.",
-                            )
-                            .changed();
+                                .add(
+                                    egui::DragValue::new(&mut cfg.fox_slots)
+                                        .range(1..=sdroxide_types::FOX_MAX_SLOTS)
+                                        .suffix(tr!("setup-once")),
+                                )
+                                .on_hover_text(tr!("setup-simultaneous-transmissions-spaced-60-hz"))
+                                .changed();
                             ui.end_row();
                         }
                     }
@@ -921,7 +1126,7 @@ impl SdroxideApp {
                     // would be ignored. One write route, and the rail on the
                     // transmit strip is the other end of it.
                     let fm = mode.is_fm_carrier();
-                    ui.label("TX audio");
+                    ui.label(tr!("setup-tx-audio"));
                     ui.horizontal(|ui| {
                         let mut db = sdroxide_types::tx_level_db(cfg.tx_level_for(mode)).round();
                         if ui
@@ -931,31 +1136,9 @@ impl SdroxideApp {
                                     .suffix(" dB"),
                             )
                             .on_hover_text(if fm {
-                                "How loud this mode's burst is handed to a radio that \
-                                 modulates it itself — and on FM that is the deviation, \
-                                 because an FM transmitter turns audio level into frequency \
-                                 swing and has no ALC to catch it. 1200 baud packet wants \
-                                 about 3 kHz where voice wants 5, so full scale into a data \
-                                 input set for voice over-deviates — which sounds completely \
-                                 normal to a listener and decodes for nobody. Turn it down \
-                                 until other stations report you, or set the level at the \
-                                 radio.\n\nThis level belongs to this mode alone. A mode you \
-                                 have never set starts from the FM figure, and the sideband \
-                                 modes start from their own — so a deviation set for 1200 \
-                                 baud never lands on FT8."
+                                tr!("setup-how-loud-mode-s-burst")
                             } else {
-                                "How loud this mode's over is handed to a radio that \
-                                 modulates it itself — a CAT rig on its sound card, a FLEX, \
-                                 an Icom on its network port. On sideband this is drive into \
-                                 the modulator: bring it down until the rig's ALC is barely \
-                                 moving and set the power at the radio, because ALC riding \
-                                 on a constant-envelope mode is what splatters. Drive \
-                                 reaches the rig's power register here, not its audio, so \
-                                 this is the level.\n\nThis level belongs to this mode \
-                                 alone: FT8, RTTY, PSK and MCW each keep their own, because \
-                                 they do not load a modulator the same way. The same rail is \
-                                 on the transmit strip, where you can reach it while you are \
-                                 transmitting."
+                                tr!("setup-how-loud-mode-s-over")
                             })
                             .changed()
                         {
@@ -964,14 +1147,18 @@ impl SdroxideApp {
                             cmds.push(Command::SetDigiTxLevel { mode, level });
                         }
                         ui.label(
-                            RichText::new(if fm { "deviation, on FM" } else { "drive, on SSB" })
-                                .size(9.5)
-                                .weak(),
+                            RichText::new(if fm {
+                                tr!("setup-deviation-fm")
+                            } else {
+                                tr!("setup-drive-ssb")
+                            })
+                            .size(9.5)
+                            .weak(),
                         );
                     });
                     ui.end_row();
                 });
-                if !mode.is_aprs() {
+                if !mode.is_aprs() && !mode.is_tnc_modem() {
                     ui.separator();
                     ui.label(
                         RichText::new("Message templates  {MYCALL} {MYGRID} {DX} {REPORT}")
@@ -981,9 +1168,9 @@ impl SdroxideApp {
                     egui::Grid::new("digi-msgs").num_columns(2).show(ui, |ui| {
                         for (label, field) in [
                             ("CQ", &mut cfg.msg_cq),
-                            ("Grid", &mut cfg.msg_grid),
-                            ("Report", &mut cfg.msg_report),
-                            ("R+Report", &mut cfg.msg_rreport),
+                            (&tr!("setup-grid"), &mut cfg.msg_grid),
+                            (&tr!("setup-report"), &mut cfg.msg_report),
+                            (&tr!("setup-r-report"), &mut cfg.msg_rreport),
                             ("RR73", &mut cfg.msg_rr73),
                             ("73", &mut cfg.msg_73),
                         ] {

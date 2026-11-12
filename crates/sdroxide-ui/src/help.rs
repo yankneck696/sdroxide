@@ -13,6 +13,7 @@
 //! a term that appears in one chapter out of eleven is visible before any
 //! scrolling happens.
 
+use crate::i18n::tr;
 use std::collections::HashMap;
 
 use eframe::egui::{
@@ -39,6 +40,7 @@ const PAGE_FRACTION: f32 = 0.88;
 fn embedded_image(path: &str) -> Option<&'static [u8]> {
     let name = path.rsplit('/').next().unwrap_or(path);
     Some(match name {
+        "amp-window.png" => &include_bytes!("../../../docs/images/amp-window.png")[..],
         "01-main-window.jpg" => &include_bytes!("../../../docs/images/01-main-window.jpg")[..],
         "02-top-bar.jpg" => &include_bytes!("../../../docs/images/02-top-bar.jpg")[..],
         "03-panadapter-tuning.png" => {
@@ -366,6 +368,12 @@ impl Find<'_> {
     }
 }
 
+/// How much of the viewport the manual opens over, each way, centred.
+const HELP_OPEN_FRACTION: f32 = 0.85;
+/// The widest the manual opens: its contents column and a text column a
+/// screenshot fits in.
+const HELP_MAX_W: f32 = 1200.0;
+
 impl Help {
     /// Jump the outline (and content) to a heading slug over the next few frames.
     fn go_to(&mut self, slug: String) {
@@ -540,7 +548,7 @@ impl Help {
             ui.spacing_mut().item_spacing.x = 6.0;
             // Spelled out rather than drawn: the bundled fonts have no
             // magnifier glyph (nor ⌕), and a tofu box is worse than a word.
-            ui.label(RichText::new("FIND").color(theme::CYAN_DIM()).size(10.0).strong());
+            ui.label(RichText::new(tr!("help-find")).color(theme::CYAN_DIM()).size(10.0).strong());
 
             // The buttons and the tally are budgeted first so the field takes
             // what is left: on a phone that is a stub, but it is still a field.
@@ -551,7 +559,7 @@ impl Help {
                 ui,
                 egui::TextEdit::singleline(&mut self.search)
                     .desired_width(w)
-                    .hint_text("find in manual")
+                    .hint_text(tr!("help-find-manual"))
                     .text_color(theme::TEXT_STRONG()),
             );
             if std::mem::take(&mut self.focus_find) {
@@ -579,13 +587,13 @@ impl Help {
 
             let any = self.hits > 0;
             if crate::chrome::chip_enabled(ui, any, false, "◀")
-                .on_hover_text("Previous match  (Shift+Enter, Shift+F3)")
+                .on_hover_text(tr!("help-previous-match-shift-enter-shift"))
                 .clicked()
             {
                 self.step_hit(-1);
             }
             if crate::chrome::chip_enabled(ui, any, false, "▶")
-                .on_hover_text("Next match  (Enter, F3)")
+                .on_hover_text(tr!("help-next-match-enter-f3"))
                 .clicked()
             {
                 self.step_hit(1);
@@ -593,7 +601,7 @@ impl Help {
             let (tally, color) = if self.needle().is_empty() {
                 (String::new(), theme::CYAN_DIM())
             } else if self.hits == 0 {
-                ("no matches".to_string(), theme::ALERT())
+                (tr!("help-no-matches").to_string(), theme::ALERT())
             } else {
                 (format!("{} / {}", self.hit + 1, self.hits), theme::CYAN())
             };
@@ -604,7 +612,7 @@ impl Help {
             // heavier ✕ is one of the glyphs the bundled fonts lack.)
             if !self.search.is_empty()
                 && crate::chrome::chip(ui, false, "×")
-                    .on_hover_text("Clear the search  (Esc)")
+                    .on_hover_text(tr!("help-clear-search-esc"))
                     .clicked()
             {
                 self.clear_search();
@@ -654,7 +662,7 @@ impl Help {
         let mut counted: Option<usize> = None;
 
         let mut open = self.open;
-        let win = egui::Window::new("SDROXIDE MANUAL")
+        let win = egui::Window::new(tr!("help-sdroxide-manual"))
             .id(crate::layout::salted_id(ctx, "SDROXIDE MANUAL"))
             .open(&mut open)
             .frame(crate::chrome::window_frame())
@@ -669,7 +677,22 @@ impl Help {
         // `Resize` clamps its remembered size into [min, max], and fixed_size
         // sets both to the size we pass. Every frame after this one is
         // resizable again, starting from a full-screen window.
-        let full = ctx.content_rect().shrink(8.0);
+        // Not the whole viewport: a manual over all of it looks like the
+        // program itself, and the close box it is mistaken for is the
+        // program's. Centred, with the program showing round it.
+        // Why: HDZ 2026-11-07: "das Hilfe-Fenster, das Schließfeld war aber
+        //      das Programm als Ganzes".
+        let view = ctx.content_rect();
+        // As tall as most of the viewport, but no wider than a page reads
+        // well: the contents column and a text column with room for the
+        // screenshots, rather than lines that run across a 27" screen.
+        // Why: HDZ 2026-11-07: "passe das Hilfefenster mal besser ein, noch ist
+        //      es schlecht, … zu breit".
+        let size = egui::vec2(
+            (view.width() * HELP_OPEN_FRACTION).min(HELP_MAX_W),
+            view.height() * HELP_OPEN_FRACTION,
+        );
+        let full = egui::Rect::from_center_size(view.center(), size);
         let win = if std::mem::replace(&mut self.shown, true) {
             win.resizable(true)
                 .default_width(crate::layout::window_w(ctx, 940.0))
@@ -734,7 +757,7 @@ impl Help {
                                     ui.set_min_height(full_h - 16.0);
                                     ui.set_width(NAV_W - 16.0);
                                     ui.label(
-                                        RichText::new("CONTENTS")
+                                        RichText::new(tr!("help-contents"))
                                             .color(theme::CYAN_DIM())
                                             .size(10.0)
                                             .strong(),
@@ -1079,7 +1102,7 @@ fn draw_block(
                         });
                 }
                 None => {
-                    ui.colored_label(theme::ALERT(), format!("[missing image: {path}]"));
+                    ui.colored_label(theme::ALERT(), tr!("help-missing-image", path = path));
                 }
             }
             if !alt.is_empty() {
@@ -1109,7 +1132,14 @@ fn draw_table(
     pass: &mut Pass,
 ) {
     let cols = header.len().max(1);
-    let total = ui.available_width();
+    // The border is drawn inside the frame and adds its width on each side
+    // (egui >= 0.31), so the table's content gets the available width less
+    // two strokes. Given all of it, every table came out 2 pt wider than its
+    // column; the next table measured from that edge, and over the manual's
+    // tables the window grew ~170 pt a frame until it was wider than the
+    // screen (the resizable window keeps its widest content, see `SLACK`).
+    let stroke = Stroke::new(1.0, theme::LINE_LIT());
+    let total = ui.available_width() - 2.0 * stroke.width;
     let spacing = 10.0;
     let inner = total - 16.0 - spacing * (cols as f32 - 1.0);
     let col_w: Vec<f32> = if cols == 2 {
@@ -1119,7 +1149,7 @@ fn draw_table(
         vec![(inner / cols as f32).max(80.0); cols]
     };
 
-    egui::Frame::new().stroke(Stroke::new(1.0, theme::LINE_LIT())).inner_margin(0).show(ui, |ui| {
+    egui::Frame::new().stroke(stroke).inner_margin(0).show(ui, |ui| {
         ui.set_width(total);
         // Header row.
         table_row(ui, header, &col_w, spacing, theme::FILL(), true, pass, idx);
@@ -1927,6 +1957,63 @@ mod tests {
         assert!(matches!(blocks[3], Block::Table { ref rows, .. } if rows.len() == 1));
     }
 
+    /// A table takes the width it is given and no more: the border counts.
+    #[test]
+    fn a_table_takes_the_width_it_is_given() {
+        let blocks = parse_blocks("| a | b |\n| --- | --- |\n| one | two |\n");
+        let Block::Table { header, rows } = &blocks[0] else { panic!("not a table") };
+        let three = parse_blocks("| a | b | c |\n| --- | --- | --- |\n| 1 | 2 | 3 |\n");
+        let Block::Table { header: h3, rows: r3 } = &three[0] else { panic!("not a table") };
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1000.0, 800.0))),
+            ..Default::default()
+        });
+        egui::Area::new(egui::Id::new("table")).fixed_pos(pos2(0.0, 0.0)).show(&ctx, |ui| {
+            ui.set_width(700.0);
+            let mut pass =
+                Pass { link: None, find: Find { needle: "", sel: 0, seen: 0, rect: None } };
+            for (h, r) in [(header, rows), (h3, r3)] {
+                let top = ui.cursor().min.y;
+                draw_table(ui, 0, h, r, &mut pass);
+                let used = ui.min_rect().width();
+                assert!(used <= 700.0 + 0.5, "a table {} columns wide took {used} of 700", h.len());
+                assert!(ui.min_rect().bottom() > top, "and it drew something");
+            }
+        });
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    /// The real manual, with its tables, settles at the width it opened at.
+    /// Before the table border was counted it grew ~170 pt a frame until it
+    /// was wider than the viewport, and dragged by its title the text column
+    /// ran on past the window's border. What is left is a few points in the
+    /// first frames from wrapped paragraphs that end a point or two past
+    /// their column; it stops there.
+    #[test]
+    fn the_manual_settles_at_the_width_it_opened_at() {
+        let mut help = Help { open: true, ..Help::default() };
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let id = crate::layout::salted_id(&ctx, "SDROXIDE MANUAL");
+        let mut widths = Vec::new();
+        for _ in 0..20 {
+            ctx.begin_pass(egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0))),
+                ..Default::default()
+            });
+            help.ui(&ctx);
+            ctx.end_pass().drop_without_applying_deltas();
+            widths.push(ctx.memory(|m| m.area_rect(id)).expect("the manual is on screen").width());
+        }
+        let (first, last) = (widths[0], widths[widths.len() - 1]);
+        assert!(last - first < 16.0, "the manual grew from {first} to {last}: {widths:?}");
+        assert!(last <= 1600.0, "wider than the viewport: {widths:?}");
+        let tail = &widths[widths.len() - 3..];
+        assert!(tail.iter().all(|w| *w == last), "still growing at the end: {widths:?}");
+    }
+
     /// The shipped manual must parse, because it is parsed on the way to the
     /// first frame. This is the test that would have caught the broken table
     /// row before it ever reached a running program.
@@ -2172,15 +2259,16 @@ Nothing to see here.
         assert_eq!(help.hit, 2, "and back off the first to the last");
     }
 
-    /// F1 opens the manual filling the viewport, however small the window was
-    /// left last time — and hands it back resizable.
+    /// F1 opens the manual over 85 % of the viewport's height and at most a
+    /// page's width, centred, however small
+    /// the window was left last time — and hands it back resizable.
     ///
     /// This is the one behaviour here built on an egui internal (`Resize`
     /// clamping its remembered size into the min/max a `fixed_size` window
     /// sets), so it is worth a test that would notice the day that changes and
     /// the manual starts coming back at whatever size it was closed at.
     #[test]
-    fn the_manual_opens_filling_the_viewport() {
+    fn the_manual_opens_over_most_of_the_viewport() {
         // A short manual: this is about the window, and decoding forty
         // screenshots to find that out would be a slow way to ask.
         let doc = Doc::parse("# Manual\n\n## 1. One\n\nText.\n\n## 2. Two\n\nMore text.\n");
@@ -2213,19 +2301,40 @@ Nothing to see here.
         pass(&mut help, 1600.0, 1000.0);
         help.open = true;
         let rect = pass(&mut help, 1600.0, 1000.0);
-        // Within a couple of points of the viewport less its margin: the
+        // Within a couple of points of 85 % of the viewport each way: the
         // window's own frame rounds to the pixel grid.
         assert!(
-            (rect.width() - 1584.0).abs() < 6.0 && (rect.height() - 984.0).abs() < 6.0,
-            "opened at {:?}, wanted the 1600x1000 viewport less its margin",
+            (rect.width() - HELP_MAX_W).abs() < 6.0 && (rect.height() - 850.0).abs() < 6.0,
+            "opened at {:?}, wanted the widest page by 85 % of the 1600x1000 viewport",
             rect.size()
         );
-        assert!(rect.min.x < 12.0 && rect.min.y < 12.0, "and in the corner, not at {:?}", rect.min);
+        // Inside the viewport with the program showing round it. (Reopened on
+        // a bigger screen it keeps the place it had; the first open of a
+        // session is centred, below.)
+        assert!(rect.min.x > 8.0 && rect.min.y > 8.0, "flush with the corner at {:?}", rect.min);
+        assert!(rect.max.x < 1592.0 && rect.max.y < 992.0, "past the edge at {:?}", rect.max);
 
         // The frames after it leave the size alone rather than re-forcing it,
         // so the operator can drag the manual smaller again.
         let again = pass(&mut help, 1600.0, 1000.0);
         assert_eq!(again.size(), rect.size(), "a settled manual keeps its size");
+        // A first open in a fresh session: centred on the viewport.
+        let doc = Doc::parse("# Manual\n\n## 1. One\n\nText.\n");
+        let mut fresh = Help { doc, open: true, ..Help::default() };
+        let ctx2 = egui::Context::default();
+        crate::theme::apply(&ctx2);
+        ctx2.begin_pass(egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1600.0, 1000.0))),
+            ..Default::default()
+        });
+        fresh.ui(&ctx2);
+        ctx2.end_pass().drop_without_applying_deltas();
+        let first = ctx2.memory(|m| m.area_rect(id)).expect("the manual is on screen");
+        assert!(
+            (first.center().x - 800.0).abs() < 6.0 && (first.center().y - 500.0).abs() < 6.0,
+            "a first open is centred, not at {:?}",
+            first.center()
+        );
     }
 
     /// Ctrl+F and F3 are claimed even while the find field owns the keyboard —

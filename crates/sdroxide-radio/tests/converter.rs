@@ -34,6 +34,8 @@ struct Hardware {
     landed: Arc<Mutex<f64>>,
     /// Where the transmitter was keyed, in the hardware's own domain.
     keyed: Arc<Mutex<Option<f64>>>,
+    /// The dial an accessory board was last told, if any.
+    dial: Arc<Mutex<Option<f64>>>,
 }
 
 impl Hardware {
@@ -44,6 +46,7 @@ impl Hardware {
             lo_offset_hz: 0.0,
             landed: Arc::new(Mutex::new(center_hz)),
             keyed: Arc::new(Mutex::new(None)),
+            dial: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -71,6 +74,9 @@ impl IqSource for Hardware {
     }
     fn describe(&self) -> String {
         "test front end".into()
+    }
+    fn set_dial_hz(&mut self, hz: f64) {
+        *self.dial.lock().unwrap() = Some(hz);
     }
     fn tx_begin(&mut self, center_hz: f64, rate: f64) -> Result<f64> {
         *self.keyed.lock().unwrap() = Some(center_hz);
@@ -511,7 +517,13 @@ impl IqSource for Recorder {
     }
     fn tx_telemetry(&mut self) -> Option<sdroxide_types::TxTelemetry> {
         self.calls.note("tx_telemetry");
-        Some(sdroxide_types::TxTelemetry { fwd_w: Some(5.0), swr: Some(1.2), alc: None, po: None })
+        Some(sdroxide_types::TxTelemetry {
+            fwd_w: Some(5.0),
+            swr: Some(1.2),
+            alc: None,
+            po: None,
+            rfl_w: None,
+        })
     }
     fn set_if_offset(&mut self, _hz: f64) {
         self.calls.note("set_if_offset");
@@ -992,15 +1004,111 @@ fn a_source_opened_on_an_intermediate_frequency_comes_up_on_the_band() {
         tx_drive: Some(0.02),
     }]);
     // Opened where `converter_open_hz` would have put it for a 144.300 dial.
-    let source = ConvertedSource::with_plan(Box::new(Hardware::new(28_300_000.0)), plan.clone());
+    let hw = Hardware::new(28_300_000.0);
+    let dial = Arc::clone(&hw.dial);
+    let source = ConvertedSource::with_plan(Box::new(hw), plan.clone());
     assert!(
         (source.center_hz() - 144_300_000.0).abs() < 1.0,
         "came up on {} rather than on 2 m",
         source.center_hz()
     );
+    // Issue #444: and the band decoder is told 2 m before anything retunes.
+    assert!(dial.lock().unwrap().is_some_and(|d| (d - 144_300_000.0).abs() < 1.0));
 
     // An I.F. no transverter can account for is the radio's own frequency and
     // is left alone — that is 10 m, not a mis-seeded 2 m.
     let source = ConvertedSource::with_plan(Box::new(Hardware::new(14_200_000.0)), plan);
     assert!((source.center_hz() - 14_200_000.0).abs() < 1.0);
+}
+
+#[test]
+fn opening_a_shared_if_uses_the_requested_band_and_keeps_direct_hf() {
+    use sdroxide_radio::{ConverterPlan, ConverterStep};
+
+    let plan = ConverterPlan::from_steps([
+        ConverterStep {
+            band: Some((50_000_000.0, 54_000_000.0)),
+            rx_offset_hz: -22_000_000.0,
+            tx_offset_hz: Some(-22_000_000.0),
+            tx_drive: Some(0.05),
+        },
+        ConverterStep {
+            band: Some((144_000_000.0, 148_000_000.0)),
+            rx_offset_hz: -116_000_000.0,
+            tx_offset_hz: Some(-116_000_000.0),
+            tx_drive: Some(0.02),
+        },
+    ]);
+
+    for (dial_hz, offset, ceiling) in [
+        (50_191_530.0, -22_000_000.0, Some(0.05)),
+        (144_191_530.0, -116_000_000.0, Some(0.02)),
+        (28_191_530.0, 0.0, None),
+    ] {
+        let hw = Hardware::new(dial_hz + offset);
+        let reported_dial = Arc::clone(&hw.dial);
+        let source = ConvertedSource::with_plan_at_dial(Box::new(hw), plan.clone(), dial_hz);
+        assert_eq!(source.center_hz(), dial_hz);
+        assert_eq!(source.tx_drive_ceiling(), ceiling);
+        if offset != 0.0 {
+            assert_eq!(*reported_dial.lock().unwrap(), Some(dial_hz));
+        }
+    }
+
+    // A front end that lands away from its requested IF still reports the
+    // actual landing frequency in the requested transverter's band.
+    let source = ConvertedSource::with_plan_at_dial(
+        Box::new(Hardware::new(28_200_000.0)),
+        plan,
+        144_191_530.0,
+    );
+    assert_eq!(source.center_hz(), 144_200_000.0);
+}
+
+#[test]
+fn linking_a_radio_with_shared_if_preserves_the_saved_two_meter_dial() {
+    use sdroxide_radio::{ConverterPlan, ConverterStep, plan_caps};
+
+    let plan = ConverterPlan::from_steps([
+        ConverterStep {
+            band: Some((50_000_000.0, 54_000_000.0)),
+            rx_offset_hz: -22_000_000.0,
+            tx_offset_hz: Some(-22_000_000.0),
+            tx_drive: Some(0.05),
+        },
+        ConverterStep {
+            band: Some((144_000_000.0, 148_000_000.0)),
+            rx_offset_hz: -116_000_000.0,
+            tx_offset_hz: Some(-116_000_000.0),
+            tx_drive: Some(0.02),
+        },
+    ]);
+    let saved_dial = 144_191_530.0;
+    let reported_dial = Arc::new(Mutex::new(None));
+    let reported = Arc::clone(&reported_dial);
+    let reopen: ReopenFn = Box::new(move |dial_hz: f64| {
+        let hw_hz = converter_open_hz(dial_hz, plan.offset_for(dial_hz));
+        let hw = Hardware { dial: Arc::clone(&reported), ..Hardware::new(hw_hz) };
+        let caps = plan_caps(hardware_caps(), &plan, &[], &[]);
+        Ok((
+            Box::new(ConvertedSource::with_plan_at_dial(Box::new(hw), plan.clone(), dial_hz))
+                as Box<dyn IqSource>,
+            caps,
+        ))
+    });
+
+    let cfg = EngineConfig { reopen: Some(reopen), ..Default::default() };
+    let mut h = start_engine(Box::new(Hardware::new(saved_dial)), hardware_caps(), cfg);
+    let thread = h.thread.take();
+    h.swap_tx.send(EngineSwap::ReopenSource).unwrap();
+    let (notices, dial, center) = drain(&h.event_rx, 1.5);
+    assert!(notices.is_empty(), "unexpected notices: {notices:?}");
+    assert_eq!(dial, saved_dial);
+    assert_eq!(center, saved_dial);
+    assert_eq!(*reported_dial.lock().unwrap(), Some(saved_dial));
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        t.join().unwrap();
+    }
 }

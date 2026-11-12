@@ -1,7 +1,7 @@
 //! Digital-mode engines for sdroxide: the slotted FT8/FT4 and JS8 modes, the
 //! keyboard modems, and the image and voice modes.
 //!
-//! **Licensing:** this crate links `mfsk-core` (GPL-3.0-or-later) and carries
+//! **Licensing:** this crate links `mfsk-core` (GPL-3.0-only since 0.13.1) and carries
 //! the JS8 protocol tables transcribed from JS8Call (also GPL-3.0-or-later).
 //! It is the only crate in the workspace that does either, and it is used only
 //! in the native binary — the wasm remote client links none of it (all
@@ -28,7 +28,15 @@ pub mod ft8_eu;
 pub mod hell_controller;
 pub mod js8;
 pub mod js8_controller;
+/// JS8Call's own output from the generated golden vectors, for the unit tests
+/// that check private framing code against it. The integration tests read the
+/// same file.
+#[cfg(test)]
+#[path = "../tests/js8_varicode_vectors/mod.rs"]
+#[allow(dead_code)]
+mod js8_vectors;
 pub mod jt_controller;
+pub mod jtty_controller;
 pub mod modem;
 pub mod msk144_controller;
 pub mod navtex_controller;
@@ -46,6 +54,7 @@ pub mod scheduler;
 pub mod squelch;
 pub mod sstv_controller;
 pub mod text_modem;
+pub mod tnc_controller;
 pub mod wefax_controller;
 pub mod wspr;
 pub mod wspr_controller;
@@ -63,6 +72,7 @@ pub use fst4_controller::Fst4Controller;
 pub use hell_controller::HellController;
 pub use js8_controller::Js8Controller;
 pub use jt_controller::JtController;
+pub use jtty_controller::JttyController;
 pub use modem::{
     ApHints, Ft8Modem, decode_fsk441_slot, decode_fst4_slot, decode_jt_slot, decode_msk144_slot,
     decode_q65_slot,
@@ -80,6 +90,7 @@ pub use rifp_controller::RifpController;
 pub use scheduler::SlotScheduler;
 pub use sstv_controller::SstvController;
 pub use text_modem::TextModemController;
+pub use tnc_controller::TncController;
 pub use wefax_controller::WefaxController;
 pub use wspr_controller::WsprController;
 
@@ -206,6 +217,14 @@ pub trait DigiEngine: Send {
     /// else implements either: a straight key only exists on the CW panel.
     fn set_straight(&mut self, _on: bool) {}
     fn key_down(&mut self, _down: bool) {}
+    /// CW: the operator's PTT, held (true) or released. Returns whether the
+    /// mode took it. Held, the transmitter stays keyed with no carrier — the
+    /// T/R switching a keyer's PTT line asks for — and the key or the keyer
+    /// sends inside it; released, the over ends there and then (#625). A mode
+    /// that declines leaves PTT to the voice path.
+    fn set_ptt_hold(&mut self, _on: bool) -> bool {
+        false
+    }
     /// Throw away what has been copied so far, so the operator can start a
     /// fresh page. Only the received text goes: the decoder keeps running, an
     /// over in progress is untouched, and nothing already logged is lost. Inert
@@ -254,6 +273,28 @@ pub trait DigiEngine: Send {
 
     /// Packet: empty the terminal transcript, leaving the link alone.
     fn packet_term_clear(&mut self) {}
+
+    /// Whether this mode needs the receive audio in small blocks. An ARQ mode
+    /// does: after every over the far end answers at once, and a sound-card
+    /// rig delivering 16384-sample blocks leaves the station deaf for a third
+    /// of a second just when the answer starts. The engine reads in ~20 ms
+    /// blocks while this is true.
+    fn low_latency_rx(&self) -> bool {
+        false
+    }
+
+    // --- Mercury / Data2G --- the operator's panel; inert in every other mode.
+
+    /// TNC modem: call a station from the panel.
+    fn tnc_connect(&mut self, _call: String) {}
+    /// TNC modem: send a line to the connected station.
+    fn tnc_send(&mut self, _text: String) {}
+    /// TNC modem: hang up the panel's link cleanly.
+    fn tnc_disconnect(&mut self) {}
+    /// TNC modem: send or stop a tune tone.
+    fn tnc_tune(&mut self, _on: bool) {}
+    /// TNC modem: empty the panel's transcript.
+    fn tnc_term_clear(&mut self) {}
     /// APRS: send one position beacon now. Still subject to CSMA — the
     /// operator asks for the channel, they do not take it.
     fn aprs_beacon_now(&mut self) {}
@@ -353,6 +394,8 @@ mod dispatch_tests {
             "aprs"
         } else if mode.is_packet() {
             "packet"
+        } else if mode.is_tnc_modem() {
+            "tnc"
         } else if mode.is_rf_paint() {
             "rfpaint"
         } else if mode.is_fsq() {
@@ -388,6 +431,10 @@ mod dispatch_tests {
         // branch hands it an FT8 decoder and nothing downstream notices — no
         // error, no log line, just a receiver listening for another protocol.
         assert_eq!(pick(Mode::Js8), "js8");
+        // The TNC modems are neither slotted nor keyboard modes; under FT8's
+        // decoder they would sit in silence while a gateway called them.
+        assert_eq!(pick(Mode::Mercury), "tnc");
+        assert_eq!(pick(Mode::Data2g), "tnc");
         // WSPR is the same trap as JS8, and worse: it is slotted, it is 4-FSK
         // in the same passband, and a controller handed FT8's decoder would sit
         // there finding nothing for ever without a word.

@@ -23,7 +23,11 @@ use std::collections::HashMap;
 use sdroxide_types::{Js8Msg, Js8Speed};
 
 use super::decode::Js8Decode;
-use super::frame::{self, Js8Content, Js8Flags};
+use super::frame::{self, Js8Content, Js8Flags, Js8FrameType};
+
+/// What a directed frame carries in place of a compound callsign sent in the
+/// frame before it (`varicode.cpp:1555`).
+const PLACEHOLDER: &str = "<....>";
 
 /// How far a station may drift and still be recognised as the same one.
 ///
@@ -134,29 +138,70 @@ impl Js8Assembler {
 
         match content {
             Js8Content::Directed(dir) => {
-                p.from = dir.from.clone();
-                p.to = dir.to.clone();
+                // `<....>` stands for "the compound callsign in the frame
+                // before" (`packDirectedMessage`, `varicode.cpp:1552`). It is a
+                // placeholder, not a station, so it must not overwrite the
+                // callsign that frame already gave us.
+                if dir.from != PLACEHOLDER {
+                    p.from = dir.from.clone();
+                }
+                if dir.to != PLACEHOLDER {
+                    p.to = dir.to.clone();
+                }
                 p.cmd = frame::cmd_text(dir.cmd)
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty());
                 if let Some(n) = dir.num {
                     p.text = n.to_string();
                 }
-                self.heard.insert(dir.from, slot_utc);
-            }
-            Js8Content::Compound(c) => {
-                p.from = c.call.clone();
-                if c.is_cq() {
-                    p.to = "@ALLCALL".into();
-                    p.cmd = Some("CQ".into());
-                } else {
-                    p.cmd = Some("HB".into());
+                if dir.from != PLACEHOLDER {
+                    self.heard.insert(dir.from, slot_utc);
                 }
-                if let Some(g) = c.grid() {
-                    p.text = g;
-                }
-                self.heard.insert(c.call, slot_utc);
             }
+            // The three compound kinds share a layout but not a meaning, and
+            // reading them all as a heartbeat turned every message to a custom
+            // group into "HB from @EMCOMM".
+            Js8Content::Compound(c) => match c.kind {
+                // Who is addressed, and with what. The sender came in the
+                // frame before.
+                Js8FrameType::CompoundDirected => {
+                    p.to = c.call.clone();
+                    if let Some((cmd, num)) = c.command() {
+                        p.cmd = frame::cmd_text(cmd)
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty());
+                        if let Some(n) = num {
+                            p.text = n.to_string();
+                        }
+                    }
+                }
+                // Who is speaking, and from where. This opens a message whose
+                // addressee follows in a compound-directed frame. Alone, it is
+                // a station identifying itself. The grid it carries is not
+                // put into the text, as upstream does (`tryUnpackCompound`
+                // renders `CALL: `). Otherwise every message to a group would
+                // read "EM73HELLO".
+                Js8FrameType::Compound => {
+                    p.from = c.call.clone();
+                    self.heard.insert(c.call, slot_utc);
+                }
+                _ => {
+                    p.from = c.call.clone();
+                    if c.is_cq() {
+                        p.to = "@ALLCALL".into();
+                        p.cmd = Some("CQ".into());
+                    } else {
+                        // A heartbeat invites reports from everyone hearing it;
+                        // auto_reply rejects messages without a destination.
+                        p.to = "@ALLCALL".into();
+                        p.cmd = Some("HB".into());
+                    }
+                    if let Some(g) = c.grid() {
+                        p.text = g;
+                    }
+                    self.heard.insert(c.call, slot_utc);
+                }
+            },
             Js8Content::Text(t) => p.text.push_str(&t),
         }
 
@@ -245,11 +290,22 @@ impl Js8Assembler {
         !self.partials.is_empty()
     }
 
+    /// True while some station's message is still arriving *now*, meaning a
+    /// frame came in within the last `window_s` seconds.
+    ///
+    /// Narrower than [`Self::has_partials`]. A message whose LAST frame was
+    /// missed stays partial until the timeout, five minutes by default. A
+    /// station waiting for the band to be clear should not wait out that
+    /// stale entry too.
+    pub fn active_within(&self, now_utc: i64, window_s: i64) -> bool {
+        self.partials.iter().any(|p| now_utc - p.last_slot_utc <= window_s)
+    }
+
     /// Messages still arriving, for a live view of partial text.
     pub fn in_progress(&self) -> Vec<Js8Msg> {
         self.partials
             .iter()
-            .filter(|p| !p.text.is_empty())
+            .filter(|p| !p.text.is_empty() || !p.from.is_empty())
             .map(|p| p.to_msg(false, &self.my_call, &self.my_groups))
             .collect()
     }
@@ -284,6 +340,25 @@ mod tests {
         }
         .pack()
         .expect("packs")
+    }
+
+    #[test]
+    fn a_directed_header_is_visible_before_its_text_arrives() {
+        let mut a = Js8Assembler::new("N0JDS");
+        let head = decode(directed("KN4CRD", "N0JDS", " STATUS"), Js8Flags::FIRST, 1500.0);
+        assert!(a.push(&head, 1000).is_none());
+        let partial = a.in_progress();
+        assert_eq!(partial.len(), 1, "a header with no text must still be visible");
+        assert_eq!(partial[0].from, "KN4CRD");
+        assert_eq!(partial[0].to, "N0JDS");
+        assert_eq!(partial[0].cmd.as_deref(), Some("STATUS"));
+        assert!(partial[0].text.is_empty());
+        assert!(!partial[0].complete);
+        let (body, _) = pack_data("PORTABLE").expect("packs");
+        let msg = a.push(&decode(body, Js8Flags::LAST, 1500.0), 1015).expect("completes");
+        assert_eq!(msg.text.trim(), "PORTABLE");
+        assert!(msg.complete);
+        assert!(a.in_progress().is_empty());
     }
 
     #[test]
@@ -384,14 +459,20 @@ mod tests {
 
     #[test]
     fn a_heartbeat_is_a_complete_message_on_its_own() {
-        let mut a = Js8Assembler::new("N0JDS");
-        let hb = Compound::heartbeat("KN4CRD", Some("EM73")).pack().expect("packs");
-        let msg =
-            a.push(&decode(hb, Js8Flags::FIRST | Js8Flags::LAST, 1200.0), 2000).expect("completes");
-        assert_eq!(msg.from, "KN4CRD");
-        assert_eq!(msg.cmd.as_deref(), Some("HB"));
-        assert_eq!(msg.text, "EM73");
-        assert_eq!(a.heard().get("KN4CRD"), Some(&2000));
+        for grid in [Some("EM73"), None] {
+            let mut a = Js8Assembler::new("N0JDS");
+            let hb = Compound::heartbeat("KN4CRD", grid).pack().expect("packs");
+            let msg = a
+                .push(&decode(hb, Js8Flags::FIRST | Js8Flags::LAST, 750.0), 2000)
+                .expect("completes");
+            assert_eq!(msg.from, "KN4CRD");
+            assert_eq!(msg.cmd.as_deref(), Some("HB"));
+            assert_eq!(msg.to, "@ALLCALL");
+            assert!(msg.to_me, "a heartbeat invites a report from anyone hearing it");
+            assert!(msg.complete);
+            assert_eq!(msg.text, grid.unwrap_or_default());
+            assert_eq!(a.heard().get("KN4CRD"), Some(&2000));
+        }
     }
 
     #[test]
