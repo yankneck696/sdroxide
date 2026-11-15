@@ -1,7 +1,7 @@
 From 4729faa99f6ac92bfb971ca95b121752b7ff4bfa Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:00 -0400
-Subject: [PATCH 1/6] PlutoSDR: RX2 as a second aerial or PureSignal feedback
+Subject: [PATCH 1/7] PlutoSDR: RX2 as a second aerial or PureSignal feedback
  for the RX1 radio (#525)
 
 Adapted from the LimeSDR-USB's second-chain support: PlutoConfig gains aux,
@@ -1568,7 +1568,7 @@ index eef4db00..62230c56 100644
 From 2bb54d93ea5daac75d1b742a9ed005ba8fa32a21 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:11 -0400
-Subject: [PATCH 2/6] Two-tone test signal on TUNE, a movable TRANSMIT window,
+Subject: [PATCH 2/7] Two-tone test signal on TUNE, a movable TRANSMIT window,
  and keep up with fast receivers through a full-duplex over (#525)
 
 A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
@@ -2153,7 +2153,7 @@ index de30318d..15c71492 100644
 From 4d7402a262f73ad5e78a38ea2ea1bd36c6629693 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 06:43:20 -0500
-Subject: [PATCH 3/6] PureSignal: keep the feedback alignment cheap over a
+Subject: [PATCH 3/7] PureSignal: keep the feedback alignment cheap over a
  networked radio's long history (#525)
 
 The feedback is processed on the engine thread that feeds the
@@ -2602,7 +2602,7 @@ index 2d600bf7..56567236 100644
 From 2f5d6e8ac68877ed64f06200afd7f6c8c585de68 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 11:24:52 -0500
-Subject: [PATCH 4/6] PureSignal: take out what is left of the LO difference,
+Subject: [PATCH 4/7] PureSignal: take out what is left of the LO difference,
  and pin the table at the highest amplitude sent (#525)
 
 Two things found while chasing a table that sank to the floor on a
@@ -2876,7 +2876,7 @@ index 56567236..944152bb 100644
 From 8246caf23ec8dfa78994f490a0fa1d6433d93beb Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 12:32:01 -0500
-Subject: [PATCH 5/6] PureSignal: step each entry in proportion to its error,
+Subject: [PATCH 5/7] PureSignal: step each entry in proportion to its error,
  trusted by how clean its estimate is (#525)
 
 With its drive 10 dB down, a PlutoSky R2's feedback is 10 dB nearer
@@ -3047,10 +3047,186 @@ index 944152bb..dcb69e53 100644
 2.43.0
 
 
-From 78ef1064376a7dcce6fef0fdb00032ea1badd67c Mon Sep 17 00:00:00 2001
+From 699f683f4fae92f5c6603884c1107cebd0818475 Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 13:58:31 -0500
+Subject: [PATCH 6/7] PureSignal: learn only from blocks that line up well, and
+ distrust an impossible LO residual (#525)
+
+A transmit-level sweep on a PlutoSky R2 (two-tone, RX2 at 0 dB, a 46 dB
+tap) learned smooth, believable curves from -20 dB to -6 dB of TX gain:
+flat at -20 and -15, then -0.7, -1.5 and -2.0 dB of compression at -10, -7
+and -6, which is where the board's own amplifier starts to run out. At
+-2 dB and above the table scattered between the floor and the ceiling.
+Two things were feeding it:
+
+- The block after one of that link's 300 ms stalls read a leftover LO
+  difference of -1112 Hz, against the 0-10 Hz it reads otherwise, and was
+  rotated by it before learning. The residual is now only believed up to
+  250 Hz; a block reading more is misaligned, and is not learned from.
+- Blocks were learned from as long as the lock held, at an envelope match
+  of 0.5. A block that only just matches is usually one whose alignment
+  has slipped (each stall moves the delay), and a driven-hard amplifier
+  matches less well to begin with. The table now learns only from blocks
+  matching at 0.85 or better; the lock itself still holds down to 0.5.
+  Held alignments on the R2 match at 0.9 and up; with RX2's gain raised to
+  10 or 20 dB, which overloads it with that tap, the match fell to 0.7-0.8
+  and the table scattered the same way.
+
+A new test feeds back a two-tone 400 Hz further from the spun-out offset
+than it should be, and checks that the residual is read and the table is
+left alone; it fails without the limit. The two tests from the previous
+commits are retuned so they still test something with these limits: the
+residual test runs at 240 Hz, inside the limit, for longer, and the weak
+feedback test uses noise light enough for its blocks to clear 0.85 and runs
+twice as long. The old update still fails it, with 7.7 dB learned from
+noise against 0.2 dB now.
+---
+ crates/sdroxide-dsp/src/predistort.rs | 74 +++++++++++++++++++++++++--
+ 1 file changed, 69 insertions(+), 5 deletions(-)
+
+diff --git a/crates/sdroxide-dsp/src/predistort.rs b/crates/sdroxide-dsp/src/predistort.rs
+index dcb69e53..2e3d8d07 100644
+--- a/crates/sdroxide-dsp/src/predistort.rs
++++ b/crates/sdroxide-dsp/src/predistort.rs
+@@ -103,6 +103,20 @@ const MIN_BLOCK: usize = 1024;
+ /// amplifier and a receiver scores well above this.
+ const LOCK_THRESHOLD: f32 = 0.5;
+ 
++/// Envelope match a block needs before the table learns from it, higher than
++/// what holds the lock. A block that only just matches is usually one whose
++/// alignment has slipped (a gap in either stream moves the delay), and
++/// learning from it writes the misalignment into the table as a curve. Held
++/// alignments on a PlutoSky R2 match at 0.9 and up.
++const LEARN_THRESHOLD: f32 = 0.85;
++
++/// The most residual LO difference believed. A Pluto's two synthesisers come
++/// out within ten hertz of the offset spun out; a block reading hundreds is
++/// misaligned, and rotating it by that figure would write nonsense into the
++/// table. Seen on a PlutoSky R2: -1112 Hz on the block after a stall, and the
++/// table scattered.
++const MAX_RESIDUAL_HZ: f32 = 250.0;
++
+ /// How many samples of full-rate refinement either side of the coarse answer.
+ const REFINE: usize = ENV_DECIM;
+ 
+@@ -433,7 +447,7 @@ impl PureSignal {
+             self.offset = None;
+             return false;
+         }
+-        if self.frozen {
++        if self.frozen || score < LEARN_THRESHOLD {
+             return false;
+         }
+         self.learn(idx, m)
+@@ -568,6 +582,9 @@ impl PureSignal {
+         // Radians per sample; zero when there was too little to measure.
+         let w = if turn.norm() > 0.0 { f64::from(turn.arg()) / K_SLICE as f64 } else { 0.0 };
+         self.residual_hz = (w * self.sample_rate / std::f64::consts::TAU) as f32;
++        if self.residual_hz.abs() > MAX_RESIDUAL_HZ {
++            return false;
++        }
+         if w != 0.0 {
+             let spun = std::mem::take(&mut self.scratch);
+             derotate(&spun[..m], -w, &mut self.scratch);
+@@ -1035,7 +1052,7 @@ mod tests {
+     fn a_residual_lo_error_does_not_walk_the_table_down() {
+         let fs = 2.5e6f64;
+         let offset_hz = -625_000.0f64;
+-        let err_hz = 300.0f64;
++        let err_hz = 240.0f64;
+         let delay = 50_000usize;
+         let mut ps = PureSignal::with_history(32, 0.5, fs, 1.0);
+         let mut line: std::collections::VecDeque<Complex32> =
+@@ -1043,7 +1060,7 @@ mod tests {
+         let coupler = Complex32::from_polar(0.02, 0.7);
+         let mut hiss = source(16384 * 200, 31).into_iter();
+         let (mut t_tx, mut t_rx) = (0u64, 0u64);
+-        for _ in 0..150 {
++        for _ in 0..400 {
+             let mut x: Vec<Complex32> = (0..25_000u64)
+                 .map(|n| {
+                     let t = (t_tx + n) as f64 / fs;
+@@ -1108,7 +1125,7 @@ mod tests {
+             ((seed >> 40) as f32 / 8_388_608.0) - 1.0
+         };
+         let mut t_tx = 0u64;
+-        for _ in 0..1200 {
++        for _ in 0..2400 {
+             let mut x: Vec<Complex32> = (0..4096u64)
+                 .map(|n| {
+                     let t = (t_tx + n) as f64 / fs;
+@@ -1121,7 +1138,7 @@ mod tests {
+             ps.predistort(&mut x);
+             line.extend(x.iter().map(|s| *s * coupler));
+             let fb: Vec<Complex32> =
+-                line.drain(..4096).map(|s| s + Complex32::new(white(), white()) * 0.002).collect();
++                line.drain(..4096).map(|s| s + Complex32::new(white(), white()) * 0.0011).collect();
+             ps.feed_back(&fb, 0.0, fs);
+         }
+         assert!(ps.locked(), "never aligned (score {:.2})", ps.score());
+@@ -1129,6 +1146,53 @@ mod tests {
+         assert!(ps.correction_db() < 2.0, "noise was learned as a curve: {db:?}");
+     }
+ 
++    /// A block whose leftover LO difference reads far beyond what two
++    /// synthesisers on one reference can be apart is not learned from: on a
++    /// PlutoSky R2 such a figure (-1112 Hz) came from the block after a stall,
++    /// and rotating by it scattered the table (issue #525).
++    #[test]
++    fn an_impossible_residual_is_not_learned_from() {
++        let fs = 2.5e6f64;
++        let mut ps = PureSignal::with_history(32, 0.9, fs, 1.0);
++        let coupler = Complex32::from_polar(0.05, 0.3);
++        let mut line: std::collections::VecDeque<Complex32> =
++            std::iter::repeat_n(Complex32::new(0.0, 0.0), 50_000).collect();
++        let mut t = 0u64;
++        for _ in 0..400 {
++            let mut x: Vec<Complex32> = (0..16384u64)
++                .map(|n| {
++                    let s = (t + n) as f64 / fs;
++                    let a = Complex32::from_polar(0.3, (std::f64::consts::TAU * 700.0 * s) as f32);
++                    let b = Complex32::from_polar(0.3, (std::f64::consts::TAU * 1900.0 * s) as f32);
++                    a + b
++                })
++                .collect();
++            ps.predistort(&mut x);
++            line.extend(x.iter().map(|s| amplifier(*s) * coupler));
++            // 400 Hz further apart than the offset given: inside what the
++            // slices can measure, far outside what is believed.
++            let fb: Vec<Complex32> = line
++                .drain(..16384)
++                .enumerate()
++                .map(|(i, s)| {
++                    let ph = std::f64::consts::TAU * 400.0 * (t + i as u64) as f64 / fs;
++                    s * Complex32::from_polar(1.0, ph as f32)
++                })
++                .collect();
++            t += 16384;
++            ps.feed_back(&fb, 0.0, fs);
++        }
++        assert!(ps.locked(), "never aligned (score {:.2})", ps.score());
++        assert!(
++            (ps.residual_hz() - 400.0).abs() < 40.0,
++            "residual read {:.0} Hz",
++            ps.residual_hz()
++        );
++        for g in ps.table() {
++            assert_eq!(*g, Complex32::new(1.0, 0.0), "learned from an impossible residual");
++        }
++    }
++
+     /// Holding the table stops it moving, which is what lets an operator keep
+     /// a correction learned on a clean over.
+     #[test]
+-- 
+2.43.0
+
+
+From 98605bc838e293c710fd7dd100e0d3cd8326d302 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 12:21:20 -0500
-Subject: [PATCH 6/6] TEST BUILD (#525): log where the time goes during a
+Subject: [PATCH 7/7] TEST BUILD (#525): log where the time goes during a
  PureSignal over
 
 Not for merging. Adds timing of the PureSignal work, of how long the engine
@@ -3064,7 +3240,7 @@ whenever the transmit queue is over 200 ms, to keep the loop delay bounded.
  2 files changed, 132 insertions(+), 1 deletion(-)
 
 diff --git a/crates/sdroxide-pluto/src/stream.rs b/crates/sdroxide-pluto/src/stream.rs
-index 31675d3e..a3b845e5 100644
+index 31675d3e..72b5e306 100644
 --- a/crates/sdroxide-pluto/src/stream.rs
 +++ b/crates/sdroxide-pluto/src/stream.rs
 @@ -715,6 +715,11 @@ pub(crate) fn tx_thread(mut conn: Connection, shared: Arc<Shared>, mut ring: Con
@@ -3113,7 +3289,7 @@ index 31675d3e..a3b845e5 100644
 +        if t_since.elapsed() >= Duration::from_secs(10) {
 +            let ms = |d: Duration| d.as_secs_f64() * 1e3;
 +            tracing::info!(
-+                "PS TIMING (test build 6) transmit thread: {t_bufs} buffers of {:.1} ms; \
++                "PS TIMING (test build 7) transmit thread: {t_bufs} buffers of {:.1} ms; \
 +                 sending one took max {:.1} ms, avg {:.1} ms; waiting for the engine to \
 +                 fill one took max {:.1} ms; {t_padded} buffers padded with {:.1} ms of \
 +                 silence in total",
@@ -3132,7 +3308,7 @@ index 31675d3e..a3b845e5 100644
                  stats.on_buffer(pairs);
                  stats.tick();
 diff --git a/src/pluto_source.rs b/src/pluto_source.rs
-index 62230c56..9338820d 100644
+index 62230c56..b7fb4461 100644
 --- a/src/pluto_source.rs
 +++ b/src/pluto_source.rs
 @@ -100,6 +100,22 @@ struct Aux {
@@ -3227,7 +3403,7 @@ index 62230c56..9338820d 100644
 +                ms(t.gap_max),
 +            );
 +            tracing::info!(
-+                "PS TIMING (test build 6, LO residual {:.0} Hz): waited inside tx_write up to {:.1} ms; \
++                "PS TIMING (test build 7, LO residual {:.0} Hz): waited inside tx_write up to {:.1} ms; \
 +                 transmit queue {:.0}-{:.0} ms; dropped {:.0} ms to keep it under 200 ms; table (dB, low to high amplitude): {}",
 +                ps.residual_hz(),
 +                ms(t.write_max),
