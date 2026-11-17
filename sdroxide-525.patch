@@ -1,7 +1,7 @@
 From 4729faa99f6ac92bfb971ca95b121752b7ff4bfa Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:00 -0400
-Subject: [PATCH 1/8] PlutoSDR: RX2 as a second aerial or PureSignal feedback
+Subject: [PATCH 1/9] PlutoSDR: RX2 as a second aerial or PureSignal feedback
  for the RX1 radio (#525)
 
 Adapted from the LimeSDR-USB's second-chain support: PlutoConfig gains aux,
@@ -1568,7 +1568,7 @@ index eef4db00..62230c56 100644
 From 2bb54d93ea5daac75d1b742a9ed005ba8fa32a21 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:11 -0400
-Subject: [PATCH 2/8] Two-tone test signal on TUNE, a movable TRANSMIT window,
+Subject: [PATCH 2/9] Two-tone test signal on TUNE, a movable TRANSMIT window,
  and keep up with fast receivers through a full-duplex over (#525)
 
 A 2T chip beside TUNE transmits 700 Hz and 1900 Hz together at the tune
@@ -2153,7 +2153,7 @@ index de30318d..15c71492 100644
 From 4d7402a262f73ad5e78a38ea2ea1bd36c6629693 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 06:43:20 -0500
-Subject: [PATCH 3/8] PureSignal: keep the feedback alignment cheap over a
+Subject: [PATCH 3/9] PureSignal: keep the feedback alignment cheap over a
  networked radio's long history (#525)
 
 The feedback is processed on the engine thread that feeds the
@@ -2602,7 +2602,7 @@ index 2d600bf7..56567236 100644
 From 2f5d6e8ac68877ed64f06200afd7f6c8c585de68 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 11:24:52 -0500
-Subject: [PATCH 4/8] PureSignal: take out what is left of the LO difference,
+Subject: [PATCH 4/9] PureSignal: take out what is left of the LO difference,
  and pin the table at the highest amplitude sent (#525)
 
 Two things found while chasing a table that sank to the floor on a
@@ -2876,7 +2876,7 @@ index 56567236..944152bb 100644
 From 8246caf23ec8dfa78994f490a0fa1d6433d93beb Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 12:32:01 -0500
-Subject: [PATCH 5/8] PureSignal: step each entry in proportion to its error,
+Subject: [PATCH 5/9] PureSignal: step each entry in proportion to its error,
  trusted by how clean its estimate is (#525)
 
 With its drive 10 dB down, a PlutoSky R2's feedback is 10 dB nearer
@@ -3050,7 +3050,7 @@ index 944152bb..dcb69e53 100644
 From 53e323b7891bae45578cbcfcf856c301be6662e6 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 13:58:31 -0500
-Subject: [PATCH 6/8] PureSignal: learn only from blocks that line up well, and
+Subject: [PATCH 6/9] PureSignal: learn only from blocks that line up well, and
  distrust an impossible LO residual (#525)
 
 A transmit-level sweep on a PlutoSky R2 (two-tone, RX2 at 0 dB, a 46 dB
@@ -3279,7 +3279,7 @@ index dcb69e53..9f6bbfdc 100644
 From a3ec89f9273333a16b1d1324bff0088dcd6eceb2 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 16:56:13 -0500
-Subject: [PATCH 7/8] PureSignal: measure the amplifier and work the table out
+Subject: [PATCH 7/9] PureSignal: measure the amplifier and work the table out
  from it, a cycle at a time (#525)
 
 On a PlutoSky R2 at -6 dB of TX gain the table learned a smooth -1.8 dB
@@ -3771,7 +3771,7 @@ index 9f6bbfdc..c61e715d 100644
 From 25392e84fa5e31d883eded387d6c0bfe3c1d15ef Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 14:07:43 -0500
-Subject: [PATCH 8/8] PlutoSDR: send transmit buffers of at most 32768 samples,
+Subject: [PATCH 8/9] PlutoSDR: send transmit buffers of at most 32768 samples,
  so a board streaming receive too keeps up (#525)
 
 On a PlutoSky R2 in 2R2T over Gigabit Ethernet at 2.5 Msps, with both
@@ -3868,6 +3868,76 @@ index acef7427..456d15f3 100644
          // Key-up latency is capped by the *time*, not the count, so it does not
          // grow with the rate.
          assert!(tx_buffer_samples(2_500_000.0) as f64 / 2.5e6 < 0.030);
+-- 
+2.43.0
+
+
+From e64dbd143d36b2748bf169b0f7afe5232931c4b8 Mon Sep 17 00:00:00 2001
+From: yankneck696 <yankneck696@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 14:58:19 -0500
+Subject: [PATCH 9/9] PlutoSDR PureSignal: drop transmit blocks rather than let
+ the queue grow past 200 ms (#525)
+
+When the link stalls, the engine keeps producing and the host's transmit
+ring fills. The transmit thread then drains it only at the sample rate, so
+the backlog never shrinks again: each stall lengthens the loop for the rest
+of the over. The ring holds up to 0.8 s at 2.5 Msps, and with the board's
+buffers and the network on top that passes the second of history
+PureSignal looks back over.
+
+The test builds the PureSignal hardware results came from (a steady table
+through stalls, overs of a minute and more) dropped blocks past 200 ms of
+queue, but the bound was never carried into these commits. On a PlutoSky R2
+the commits without it, in one over with no other change, went from
+1.8 dB of correction at a 0.97 match to 4.1 dB and then 15.3 dB at 0.72
+within 40 s. This adds it: while PureSignal is on, a block that would queue
+past 200 ms is dropped before predistortion, so nothing dropped enters the
+reference. A steady over queues 130-160 ms and drops nothing.
+---
+ src/pluto_source.rs | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/pluto_source.rs b/src/pluto_source.rs
+index 62230c56..c19528fb 100644
+--- a/src/pluto_source.rs
++++ b/src/pluto_source.rs
+@@ -81,6 +81,21 @@ const AUX_LOG_INTERVAL: Duration = Duration::from_secs(10);
+ /// nothing while unlocked.
+ const PS_HISTORY_S: f64 = 1.0;
+ 
++/// The most transmit audio that may wait in the host's transmit ring while
++/// PureSignal is on, in seconds.
++///
++/// When the link stalls, the engine keeps producing and the ring fills; the
++/// transmit thread then only drains it at the sample rate, so the backlog
++/// never shrinks again and each stall lengthens the loop for the rest of the
++/// over. The ring holds up to 0.8 s at 2.5 Msps, and with the board's buffers
++/// and the network on top that passes the [`PS_HISTORY_S`] PureSignal looks
++/// back. On a PlutoSky R2 an over without this bound went from 1.8 dB of
++/// correction to 15 dB, matched at 0.72, after a few stalls; with it, overs of
++/// a minute and more held a steady table through the same stalls. Blocks past
++/// the bound are dropped before predistortion, so nothing dropped enters the
++/// reference. A steady over queues 130-160 ms.
++const PS_TX_QUEUE_MAX_S: f64 = 0.2;
++
+ /// The second receive chain, borrowed by the RX1 radio (issue #525).
+ struct Aux {
+     rx: PlutoRx,
+@@ -680,6 +695,14 @@ impl IqSource for PlutoSource {
+ 
+     fn tx_write(&mut self, samples: &[Complex32]) -> Result<()> {
+         let Some(rx) = self.rx.as_mut() else { return Ok(()) };
++        // After a stall, drop rather than queue, so PureSignal's loop delay
++        // stays bounded — see PS_TX_QUEUE_MAX_S.
++        if self.aux.as_ref().is_some_and(|a| a.puresignal.is_some()) {
++            let queued_s = rx.tx_pending() as f64 / 2.0 / self.rate.max(1.0);
++            if queued_s > PS_TX_QUEUE_MAX_S {
++                return Ok(());
++            }
++        }
+         // Bent by the inverse of the amplifier's curve when PureSignal is
+         // running. The loop keeps its own copy of what was *wanted*, which is
+         // what the feedback is compared with.
 -- 
 2.43.0
 
