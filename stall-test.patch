@@ -3768,51 +3768,43 @@ index 9f6bbfdc..c61e715d 100644
 2.43.0
 
 
-From eb67c3630d0ed690c76e3f4671367b78ec9be5cf Mon Sep 17 00:00:00 2001
+From daf2d4cb3e93320c6ecdbdd463a5408668df83fc Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sat, 14 Nov 2026 12:21:20 -0500
-Subject: [PATCH 8/8] TEST BUILD (#525): log where the time goes during a
- PureSignal over, and pace transmit writes
+Subject: [PATCH 8/8] TEST BUILD 12 (#525): log where the time goes during a
+ PureSignal over, and cap transmit buffers at 32768 samples
 
-Not for merging. Adds timing of the PureSignal work, of how long the engine
-waits inside tx_write and how full the transmit queue is, of the transmit
-thread's WRITEBUF calls and padded buffers, the residual LO difference, and
-the predistortion table in dB, every 2 s instead of 10. While PureSignal is
-on, blocks are dropped whenever the transmit queue is over 200 ms, to keep
-the loop delay bounded. Each WRITEBUF's payload goes out in 16 KiB pieces
-300 us apart instead of one burst, to see whether the link's packet loss
-comes from bursts the Pluto cannot take in.
+Not for merging. Build 11's paced writes are taken out again: they did not
+help. libiio's own tools, with sdroxide closed, showed the PlutoSky R2
+dropping 1023 incoming packets and stalling at 61440 samples per WRITEBUF
+(about sdroxide's 25 ms at 2.5 Msps) against 135 and no stall at 32768, so
+this build sends at most 32768 per buffer to see whether sdroxide's stalls
+follow.
 ---
- crates/sdroxide-pluto/src/iiod.rs   | 12 +++-
+ crates/sdroxide-pluto/src/net.rs    |  6 +-
  crates/sdroxide-pluto/src/stream.rs | 36 ++++++++++-
  src/pluto_source.rs                 | 99 ++++++++++++++++++++++++++++-
- 3 files changed, 143 insertions(+), 4 deletions(-)
+ 3 files changed, 138 insertions(+), 3 deletions(-)
 
-diff --git a/crates/sdroxide-pluto/src/iiod.rs b/crates/sdroxide-pluto/src/iiod.rs
-index f994129c..ecc9be56 100644
---- a/crates/sdroxide-pluto/src/iiod.rs
-+++ b/crates/sdroxide-pluto/src/iiod.rs
-@@ -658,8 +658,16 @@ impl Connection {
-         let cmd = format!("WRITEBUF {dev} {}", data.len());
-         self.send(&cmd)?;
-         self.read_code(&cmd)?;
--        self.writer.write_all(data).map_err(|e| Error::io("write buffer", e))?;
--        self.writer.flush().map_err(|e| Error::io("flush", e))?;
-+        // TEST BUILD (#525): paced, in 16 KiB pieces a fraction of a
-+        // millisecond apart, instead of the whole buffer in one burst at the
-+        // link's full speed. A 25 ms buffer at 2.5 Msps is 250 KB; sent at
-+        // gigabit speed it arrives in 2 ms, which a Pluto also streaming two
-+        // receive chains back may not take in without dropping packets.
-+        for piece in data.chunks(16 * 1024) {
-+            self.writer.write_all(piece).map_err(|e| Error::io("write buffer", e))?;
-+            self.writer.flush().map_err(|e| Error::io("flush", e))?;
-+            std::thread::sleep(std::time::Duration::from_micros(300));
-+        }
-         let n = self.read_code(&cmd)?;
-         Ok(n as usize)
-     }
+diff --git a/crates/sdroxide-pluto/src/net.rs b/crates/sdroxide-pluto/src/net.rs
+index acef7427..410f1025 100644
+--- a/crates/sdroxide-pluto/src/net.rs
++++ b/crates/sdroxide-pluto/src/net.rs
+@@ -110,7 +110,11 @@ const TX_BUFFER_BOUNDS: (usize, usize) = (4096, 1 << 17);
+ /// comfortably aligned for the device's DMA.
+ pub(crate) fn tx_buffer_samples(rate_hz: f64) -> usize {
+     let want = (rate_hz * TX_BUFFER_MS / 1000.0) as usize;
+-    let want = want.clamp(TX_BUFFER_BOUNDS.0, TX_BUFFER_BOUNDS.1);
++    // TEST BUILD 12 (#525): at most 32768 samples (128 KB) per WRITEBUF. With
++    // both receive chains streaming, libiio's own iio_writedev dropped 1023
++    // incoming packets on a PlutoSky R2 at 61440 samples per buffer and 135 at
++    // 32768, and only the larger size stalled.
++    let want = want.clamp(TX_BUFFER_BOUNDS.0, TX_BUFFER_BOUNDS.1).min(32768);
+     (want / 1024 * 1024).max(TX_BUFFER_BOUNDS.0)
+ }
+ 
 diff --git a/crates/sdroxide-pluto/src/stream.rs b/crates/sdroxide-pluto/src/stream.rs
-index 31675d3e..d26df733 100644
+index 31675d3e..68098726 100644
 --- a/crates/sdroxide-pluto/src/stream.rs
 +++ b/crates/sdroxide-pluto/src/stream.rs
 @@ -715,6 +715,11 @@ pub(crate) fn tx_thread(mut conn: Connection, shared: Arc<Shared>, mut ring: Con
@@ -3861,7 +3853,7 @@ index 31675d3e..d26df733 100644
 +        if t_since.elapsed() >= Duration::from_secs(10) {
 +            let ms = |d: Duration| d.as_secs_f64() * 1e3;
 +            tracing::info!(
-+                "PS TIMING (test build 11) transmit thread: {t_bufs} buffers of {:.1} ms; \
++                "PS TIMING (test build 12) transmit thread: {t_bufs} buffers of {:.1} ms; \
 +                 sending one took max {:.1} ms, avg {:.1} ms; waiting for the engine to \
 +                 fill one took max {:.1} ms; {t_padded} buffers padded with {:.1} ms of \
 +                 silence in total",
@@ -3880,7 +3872,7 @@ index 31675d3e..d26df733 100644
                  stats.on_buffer(pairs);
                  stats.tick();
 diff --git a/src/pluto_source.rs b/src/pluto_source.rs
-index 62230c56..28c67c56 100644
+index 62230c56..ae5bd25e 100644
 --- a/src/pluto_source.rs
 +++ b/src/pluto_source.rs
 @@ -68,7 +68,7 @@ const SILENCE_BEFORE_REOPEN: Duration = Duration::from_secs(10);
@@ -3984,7 +3976,7 @@ index 62230c56..28c67c56 100644
 +                ms(t.gap_max),
 +            );
 +            tracing::info!(
-+                "PS TIMING (test build 11, LO residual {:.0} Hz): waited inside tx_write up to {:.1} ms; \
++                "PS TIMING (test build 12, LO residual {:.0} Hz): waited inside tx_write up to {:.1} ms; \
 +                 transmit queue {:.0}-{:.0} ms; dropped {:.0} ms to keep it under 200 ms; table (dB, low to high amplitude): {}",
 +                ps.residual_hz(),
 +                ms(t.write_max),
