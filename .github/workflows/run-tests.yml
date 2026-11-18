@@ -48,11 +48,12 @@ jobs:
       - name: Protocol, types, DSP and PlutoSDR
         run: cargo test --no-fail-fast -p sdroxide-proto -p sdroxide-types -p sdroxide-dsp -p sdroxide-pluto
       - name: Engine (radio crate, without SoapySDR)
+        # Also after a failure above, so every suite reports.
+        if: ${{ !cancelled() }}
         run: |
           df -h /
           cargo test --no-fail-fast --no-default-features -p sdroxide-radio
       - name: Translations
-        # Run even when an engine test failed, so one failure does not hide
-        # this result.
+        # Also after a failure above, so every suite reports.
         if: ${{ !cancelled() }}
         run: cargo test -p sdroxide-ui i18n
