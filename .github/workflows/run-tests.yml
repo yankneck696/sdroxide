@@ -11,6 +11,10 @@ on:
         description: Branch to test
         required: true
         default: pr-525
+      repository:
+        description: Repository the branch is in (dividebysandwich/sdroxide to test upstream main for comparison)
+        required: true
+        default: yankneck696/sdroxide
 
 jobs:
   test:
@@ -32,6 +36,7 @@ jobs:
           df -h /
       - uses: actions/checkout@v4
         with:
+          repository: ${{ inputs.repository }}
           ref: ${{ inputs.branch }}
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
@@ -41,10 +46,10 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libasound2-dev pkg-config cmake autoconf automake libtool libclang-dev
       - name: Protocol, types, DSP and PlutoSDR
-        run: cargo test -p sdroxide-proto -p sdroxide-types -p sdroxide-dsp -p sdroxide-pluto
+        run: cargo test --no-fail-fast -p sdroxide-proto -p sdroxide-types -p sdroxide-dsp -p sdroxide-pluto
       - name: Engine (radio crate, without SoapySDR)
         run: |
           df -h /
-          cargo test --no-default-features -p sdroxide-radio
+          cargo test --no-fail-fast --no-default-features -p sdroxide-radio
       - name: Translations
         run: cargo test -p sdroxide-ui i18n
