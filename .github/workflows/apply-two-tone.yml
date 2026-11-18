@@ -1,0 +1,37 @@
+name: Apply two-tone patch and run its tests
+
+# Helper for the two-tone / TRANSMIT window PR (split out of #743). When
+# two-tone.patch is uploaded to main, this applies it on top of the current
+# upstream sdroxide (dividebysandwich/main) and pushes the result to the
+# branch two-tone-tx-window, without these helper files. Then it starts the
+# "Run tests" workflow on that branch.
+on:
+  push:
+    branches: [main]
+    paths: ['two-tone.patch']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Apply the patch on current upstream main
+        run: |
+          git config user.name "yankneck696"
+          git config user.email "yankneck696@users.noreply.github.com"
+          cp two-tone.patch "$RUNNER_TEMP/p.patch"
+          git fetch https://github.com/dividebysandwich/sdroxide.git main
+          git checkout -B two-tone-tx-window FETCH_HEAD
+          git am "$RUNNER_TEMP/p.patch"
+          git push -f origin two-tone-tx-window
+      - name: Start the tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run run-tests.yml --ref main -f branch=two-tone-tx-window
