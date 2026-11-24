@@ -1,4 +1,4 @@
-From 674bfac06af1ad6b8fb5207c1e4bc69456f2c4d5 Mon Sep 17 00:00:00 2001
+From 9b9de5d7806abefe51f0227f5bd9b33737b2f1e4 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 25 Oct 2026 06:40:00 -0400
 Subject: [PATCH 01/13] PlutoSDR: RX2 as a second aerial or PureSignal feedback
@@ -10,7 +10,7 @@ LimeAuxConfig), and src/pluto_source.rs follows src/lime_source.rs, borrowing
 RX2 into the RX1 radio and feeding it to the shared sdroxide_dsp::Diversity
 (Cancel/Combine, driven from the main window's DIV strip) or
 sdroxide_dsp::PureSignal. PureSignal needs full duplex, since the coupler is
-only heard while receive keeps running through the over. Wire protocol v212,
+only heard while receive keeps running through the over. Wire protocol v222,
 because the radio configuration crosses whole.
 
 Both chains arrive in one 2R2T device buffer. The receive thread commits each
@@ -619,30 +619,30 @@ index 774e38ab..34c4b790 100644
 +    rig.release();
 +}
 diff --git a/crates/sdroxide-proto/src/lib.rs b/crates/sdroxide-proto/src/lib.rs
-index 29e957b0..a55c4147 100644
+index b1d99e2a..bc22fe37 100644
 --- a/crates/sdroxide-proto/src/lib.rs
 +++ b/crates/sdroxide-proto/src/lib.rs
-@@ -1721,7 +1721,14 @@ use sdroxide_types::{
- ///
- /// v211: ELAD monitoring. `CatConfig` gains `elad_mute_on_radio_ptt` and
- /// `EladConfig` gains `hear_own_tx`, which changes every `RadioConfig`.
--pub const PROTO_VERSION: u16 = 211;
+@@ -1765,7 +1765,14 @@ use sdroxide_types::{
+ /// `two_tone` on its tail and `Command` gains a trailing `SetTuneTwoTone`;
+ /// `TxState` rides whole inside `RadioState`, so a v211 peer reads the extra
+ /// byte as the start of the next field and fails to decode every state.
+-pub const PROTO_VERSION: u16 = 221;
 +///
-+/// v212: the PlutoSDR's second receive chain can serve the RX1 radio as a
++/// v222: the PlutoSDR's second receive chain can serve the RX1 radio as a
 +/// second aerial or as PureSignal feedback (issue #525). `PlutoConfig` gains
 +/// `aux` (`PlutoAuxConfig`, the same block a LimeSDR's second chain uses) on
 +/// its tail, and the radio configuration rides whole in both a command and an
-+/// event, so a v211 peer reads the extra bytes as the start of the next field
++/// event, so a v221 peer reads the extra bytes as the start of the next field
 +/// and fails to decode either.
-+pub const PROTO_VERSION: u16 = 212;
++pub const PROTO_VERSION: u16 = 222;
  const VERSION_BYTE: u8 = 0x12;
  
  #[derive(Debug, thiserror::Error)]
 diff --git a/crates/sdroxide-types/src/lib.rs b/crates/sdroxide-types/src/lib.rs
-index 007cbfda..c1b75ef6 100644
+index 253565f1..d777ecdb 100644
 --- a/crates/sdroxide-types/src/lib.rs
 +++ b/crates/sdroxide-types/src/lib.rs
-@@ -249,14 +249,15 @@ pub use radio::{
+@@ -257,14 +257,15 @@ pub use radio::{
      IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, KiwiConfig,
      LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState, MAX_TRANSVERTERS, ModeControl,
      PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc,
@@ -667,10 +667,10 @@ index 007cbfda..c1b75ef6 100644
  pub use rds::{
      RdsClock, RdsData, RdsGroupLog, RdsStandard, RdsStats, RtPlus, af_code_hz, pi_callsign,
 diff --git a/crates/sdroxide-types/src/radio.rs b/crates/sdroxide-types/src/radio.rs
-index f7031eb2..eeef0940 100644
+index 4787ee27..d4d99d6c 100644
 --- a/crates/sdroxide-types/src/radio.rs
 +++ b/crates/sdroxide-types/src/radio.rs
-@@ -5358,6 +5358,18 @@ impl PlutoPtt {
+@@ -5374,6 +5374,18 @@ impl PlutoPtt {
      }
  }
  
@@ -689,7 +689,7 @@ index f7031eb2..eeef0940 100644
  /// ADALM-Pluto (PlutoSDR) backend configuration.
  ///
  /// The device is reached over the network — which the USB cable already
-@@ -5436,6 +5448,16 @@ pub struct PlutoConfig {
+@@ -5452,6 +5464,16 @@ pub struct PlutoConfig {
      /// whole time in FDD, so nothing would ever toggle.
      #[serde(default)]
      pub ptt_gpo: PlutoPtt,
@@ -706,7 +706,7 @@ index f7031eb2..eeef0940 100644
  }
  
  impl Default for PlutoConfig {
-@@ -5459,6 +5481,7 @@ impl Default for PlutoConfig {
+@@ -5475,6 +5497,7 @@ impl Default for PlutoConfig {
              full_duplex: false,
              duplex: PlutoDuplex::default(),
              ptt_gpo: PlutoPtt::default(),
@@ -714,7 +714,7 @@ index f7031eb2..eeef0940 100644
          }
      }
  }
-@@ -5480,6 +5503,19 @@ impl PlutoConfig {
+@@ -5496,6 +5519,19 @@ impl PlutoConfig {
      /// renders them as sliders — the Pluto settings panel drives them directly.
      pub const AGC_ELEMENT: &'static str = "AGC";
      pub const PPM_ELEMENT: &'static str = "PPM";
@@ -735,10 +735,10 @@ index f7031eb2..eeef0940 100644
      /// Sample rates offered in the UI.
      ///
 diff --git a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
-index 800227ab..4f2051db 100644
+index 662a3bdc..babc7bd7 100644
 --- a/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/en-US/sdroxide.ftl
-@@ -2010,6 +2010,14 @@ settings-radio-automatic-board-receives-switched-transmit = On Automatic the boa
+@@ -2054,6 +2054,14 @@ settings-radio-automatic-board-receives-switched-transmit = On Automatic the boa
  settings-radio-limesdr-support-has-not-been = LimeSDR support has not been verified against hardware. This is the last session's trace, for an issue report.
  settings-radio-gains-filters-corrections-antenna-sockets = Gains, filters, corrections, the antenna sockets and every LimeRFE control — its connectors, band, relays, attenuator, notch and fan — apply immediately. The board, the receive chain, the sample rate, arming transmit and the LimeRFE's connection take effect on Apply.
  
@@ -754,10 +754,10 @@ index 800227ab..4f2051db 100644
  
  settings-radio-fill-from = FILL FROM { $name }
 diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index ecbab918..3d521cbe 100644
+index 2acbcccc..c3bd4efe 100644
 --- a/crates/sdroxide-ui/src/app/settings/radio.rs
 +++ b/crates/sdroxide-ui/src/app/settings/radio.rs
-@@ -2446,7 +2446,9 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2448,7 +2448,9 @@ pub(in crate::app) fn settings_pluto_tab(
      can_probe: bool,
      cmds: &mut Vec<Command>,
  ) {
@@ -768,7 +768,7 @@ index ecbab918..3d521cbe 100644
      let Some(cfg) = radio_edit.as_mut() else {
          ui.label(tr!("settings-radio-waiting-configuration-machine-radio-attached"));
          return;
-@@ -2732,6 +2734,192 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2734,6 +2736,192 @@ pub(in crate::app) fn settings_pluto_tab(
  
      test_result_line(ui, test_result);
  
@@ -962,10 +962,10 @@ index ecbab918..3d521cbe 100644
      ui.label(RichText::new(tr!("settings-radio-wideband-iq-receive-transmit-half")).weak());
      ui.label(
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index da5a5c97..de30318d 100644
+index 583892a8..d7887c9c 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -10538,6 +10538,31 @@ configured in exactly the same way as one on your desk.
+@@ -11079,6 +11079,31 @@ configured in exactly the same way as one on your desk.
    the AD9361 ignores a gain written then; set the AGC to *Manual* to use it
    (issue #417).
  
@@ -998,10 +998,10 @@ index da5a5c97..de30318d 100644
  a great many have had the well-known firmware change applied, which turns them
  into an AD9364 covering **70 MHz–6 GHz** with a 56 MHz filter. sdroxide does not
 diff --git a/src/main.rs b/src/main.rs
-index b9dc9f76..5184e5ff 100644
+index a7346006..807e4648 100644
 --- a/src/main.rs
 +++ b/src/main.rs
-@@ -2463,6 +2463,9 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
+@@ -2477,6 +2477,9 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
          // sibling radio's retune moves this radio's centre too (and vice
          // versa). Stated only when a sibling is possible.
          shared_lo_rx: src.rx_chains() > 1,
@@ -1565,7 +1565,7 @@ index eef4db00..62230c56 100644
 2.43.0
 
 
-From 3c68066883107fe85fa96e12eaf4c736383d2d64 Mon Sep 17 00:00:00 2001
+From 815c486ad236c09949bea06972743959ab3b7ac7 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 06:33:59 -0500
 Subject: [PATCH 02/13] PlutoSDR: read up to four waiting receive blocks per
@@ -1590,10 +1590,10 @@ goes out late is heard as chirps.
  3 files changed, 37 insertions(+), 1 deletion(-)
 
 diff --git a/crates/sdroxide-radio/src/engine.rs b/crates/sdroxide-radio/src/engine.rs
-index 6c9e66c0..b445445e 100644
+index 69d3707b..91f77570 100644
 --- a/crates/sdroxide-radio/src/engine.rs
 +++ b/crates/sdroxide-radio/src/engine.rs
-@@ -5234,8 +5234,14 @@ fn engine_thread(
+@@ -5342,8 +5342,14 @@ fn engine_thread(
              // spends that budget: the transmit ring empties, and hardware that
              // answers an underrun by skipping ahead (SoapySX does) puts the
              // over on the air as chirps. See `IqSource::read_available`.
@@ -1609,7 +1609,7 @@ index 6c9e66c0..b445445e 100644
                      lane_samples += n as u64;
                      engine.samples_read += n as u64;
                      engine.last_block = n as u64;
-@@ -5248,6 +5254,9 @@ fn engine_thread(
+@@ -5357,6 +5363,9 @@ fn engine_thread(
                      // QO-100 station watches its own downlink through the over
                      // (#652).
                      engine.process_block(iq, pool.as_ref());
@@ -1620,7 +1620,7 @@ index 6c9e66c0..b445445e 100644
              }
          } else {
 diff --git a/crates/sdroxide-radio/src/source.rs b/crates/sdroxide-radio/src/source.rs
-index 002b2422..93584315 100644
+index f552c961..f99e9cdf 100644
 --- a/crates/sdroxide-radio/src/source.rs
 +++ b/crates/sdroxide-radio/src/source.rs
 @@ -182,6 +182,19 @@ pub trait IqSource: Send {
@@ -1643,7 +1643,7 @@ index 002b2422..93584315 100644
      /// Human-readable description for logs/UI.
      fn describe(&self) -> String;
  
-@@ -1536,6 +1549,10 @@ impl IqSource for ConvertedSource {
+@@ -1564,6 +1577,10 @@ impl IqSource for ConvertedSource {
          self.inner.read_available(buf)
      }
  
@@ -1679,7 +1679,7 @@ index 62230c56..7eaae5fb 100644
 2.43.0
 
 
-From ba6f302193d48c998af744b25d5f4e93c9ad1deb Mon Sep 17 00:00:00 2001
+From 7f9c740398844b2ddaf2fb5b9803d93494411413 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 06:43:20 -0500
 Subject: [PATCH 03/13] PureSignal: keep the feedback alignment cheap over a
@@ -2128,7 +2128,7 @@ index 2d600bf7..56567236 100644
 2.43.0
 
 
-From 1b804c56ae2a82c1f3f8d5ec35bf729aa20dfdd9 Mon Sep 17 00:00:00 2001
+From be6dd4bf097a2b958d43ba449a0bbdad25975586 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 11:24:52 -0500
 Subject: [PATCH 04/13] PureSignal: take out what is left of the LO difference,
@@ -2402,7 +2402,7 @@ index 56567236..944152bb 100644
 2.43.0
 
 
-From 6ceb51d7a334d8d40b3051fadfdaadc69eab9899 Mon Sep 17 00:00:00 2001
+From 038a26ad7165a8cf43e22217db7d4eb65911c508 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 12:32:01 -0500
 Subject: [PATCH 05/13] PureSignal: step each entry in proportion to its error,
@@ -2576,7 +2576,7 @@ index 944152bb..dcb69e53 100644
 2.43.0
 
 
-From 6ec5a738fce4ffcf051c39006635e106c72c074b Mon Sep 17 00:00:00 2001
+From f3a4fa76268db9920de4ee956857521885839868 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Sun, 15 Nov 2026 13:58:31 -0500
 Subject: [PATCH 06/13] PureSignal: learn only from blocks that line up well,
@@ -2805,7 +2805,7 @@ index dcb69e53..9f6bbfdc 100644
 2.43.0
 
 
-From 33d29b60fb15a2cbc612a9393f9c70fbf4ef3559 Mon Sep 17 00:00:00 2001
+From b2a94973f328883d9c363f240c98735475b51cea Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Mon, 16 Nov 2026 16:56:13 -0500
 Subject: [PATCH 07/13] PureSignal: measure the amplifier and work the table
@@ -3297,7 +3297,7 @@ index 9f6bbfdc..c61e715d 100644
 2.43.0
 
 
-From 9ae6aed37023500fe455d0be71c239b8ad2aa19f Mon Sep 17 00:00:00 2001
+From e22346007269664c6b18987d875a4a85db3cff28 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 14:07:43 -0500
 Subject: [PATCH 08/13] PlutoSDR: send transmit buffers of at most 32768
@@ -3401,7 +3401,7 @@ index acef7427..456d15f3 100644
 2.43.0
 
 
-From 3ae54ed651d90857d365f661699749e316abb137 Mon Sep 17 00:00:00 2001
+From d7022625d98311d417db19830440c3f91ade874d Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Tue, 17 Nov 2026 14:58:19 -0500
 Subject: [PATCH 09/13] PlutoSDR PureSignal: drop transmit blocks rather than
@@ -3471,7 +3471,7 @@ index 7eaae5fb..9061495d 100644
 2.43.0
 
 
-From 4e55f95b3ab59f4e656d6bc0075be77442f85792 Mon Sep 17 00:00:00 2001
+From e3c3486ae3c1f3cf8e836691f653f0ab4af44e25 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 06:38:03 -0500
 Subject: [PATCH 10/13] PlutoSDR RX2: never take a pair's first half as
@@ -3749,7 +3749,7 @@ index 34c4b790..e4b823f6 100644
 2.43.0
 
 
-From 3832bb8c6da17d12d67341c59497ba772af9a120 Mon Sep 17 00:00:00 2001
+From 0817c7e26b5ad4ae793bfd2eb51ac37aedfa07d1 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 06:40:30 -0500
 Subject: [PATCH 11/13] PlutoSDR RX2: fill the main window's DIV strip (#525)
@@ -3766,10 +3766,10 @@ elements live.
  1 file changed, 10 insertions(+)
 
 diff --git a/crates/sdroxide-ui/src/app/top_bar.rs b/crates/sdroxide-ui/src/app/top_bar.rs
-index 944350eb..0d6c40df 100644
+index aaf4c586..a25e80c8 100644
 --- a/crates/sdroxide-ui/src/app/top_bar.rs
 +++ b/crates/sdroxide-ui/src/app/top_bar.rs
-@@ -8862,6 +8862,12 @@ fn div_settings(cfg: &sdroxide_types::RadioConfig) -> Option<(DiversityMode, f32
+@@ -9531,6 +9531,12 @@ fn div_settings(cfg: &sdroxide_types::RadioConfig) -> Option<(DiversityMode, f32
          sdroxide_types::Backend::Lime => {
              Some((cfg.lime.aux.mode, cfg.lime.aux.rate, cfg.lime.aux.frozen))
          }
@@ -3782,7 +3782,7 @@ index 944350eb..0d6c40df 100644
          sdroxide_types::Backend::SdrPlay => {
              Some((cfg.sdrplay.duo.mode, cfg.sdrplay.duo.rate, cfg.sdrplay.duo.frozen))
          }
-@@ -8885,6 +8891,10 @@ fn set_div_setting(cfg: &mut sdroxide_types::RadioConfig, element: &str, db: f64
+@@ -9554,6 +9560,10 @@ fn set_div_setting(cfg: &mut sdroxide_types::RadioConfig, element: &str, db: f64
              let a = &mut cfg.lime.aux;
              (&mut a.mode, &mut a.rate, &mut a.frozen)
          }
@@ -3797,7 +3797,7 @@ index 944350eb..0d6c40df 100644
 2.43.0
 
 
-From c1b7c82b092a3bf4a0faab0a5848f6a1a0b61664 Mon Sep 17 00:00:00 2001
+From c66683896bbe831111256bd90a232b88112a6ac0 Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 06:41:55 -0500
 Subject: [PATCH 12/13] PlutoSDR PureSignal: start RX2 at 0 dB, say at open why
@@ -3826,7 +3826,7 @@ From the review of #743.
  3 files changed, 38 insertions(+), 8 deletions(-)
 
 diff --git a/crates/sdroxide-ui/src/app/settings/radio.rs b/crates/sdroxide-ui/src/app/settings/radio.rs
-index 3d521cbe..2bc70ebb 100644
+index c3bd4efe..5d52a9a4 100644
 --- a/crates/sdroxide-ui/src/app/settings/radio.rs
 +++ b/crates/sdroxide-ui/src/app/settings/radio.rs
 @@ -28,6 +28,11 @@ const NO_ANSWER_YET: &str = "Waiting for the machine the radio is attached to: t
@@ -3841,7 +3841,7 @@ index 3d521cbe..2bc70ebb 100644
  fn probe_only<R>(ui: &mut egui::Ui, can_probe: bool, add: impl FnOnce(&mut egui::Ui) -> R) {
      let group = ui.add_enabled_ui(can_probe, add);
      if !can_probe {
-@@ -2745,6 +2750,7 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2747,6 +2752,7 @@ pub(in crate::app) fn settings_pluto_tab(
          ui.label(RichText::new(tr!("settings-radio-pluto-rx2-intro")).weak());
          egui::Grid::new("pluto-aux-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
              ui.label(tr!("settings-radio-used"));
@@ -3849,7 +3849,7 @@ index 3d521cbe..2bc70ebb 100644
              egui::ComboBox::from_id_salt("pluto-aux-role")
                  .selected_text(cfg.pluto.aux.role.tr())
                  .show_styled(ui, |ui| {
-@@ -2752,6 +2758,18 @@ pub(in crate::app) fn settings_pluto_tab(
+@@ -2754,6 +2760,18 @@ pub(in crate::app) fn settings_pluto_tab(
                          ui.selectable_value(&mut cfg.pluto.aux.role, r, r.tr());
                      }
                  });
@@ -3869,10 +3869,10 @@ index 3d521cbe..2bc70ebb 100644
  
              if cfg.pluto.aux.role != LimeAuxRole::Off {
 diff --git a/docs/USER_MANUAL.md b/docs/USER_MANUAL.md
-index de30318d..058b8809 100644
+index d7887c9c..413d4f12 100644
 --- a/docs/USER_MANUAL.md
 +++ b/docs/USER_MANUAL.md
-@@ -10556,12 +10556,17 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
+@@ -11097,12 +11097,17 @@ itself rather than leaving it to a second tab (issue #525). **Used for** offers:
    transmit, and stays at unity until the feedback lines up.
  
  **RX2 gain** is a fixed gain (RX2's AGC is turned off): for diversity, set it
@@ -3933,7 +3933,7 @@ index 9061495d..e0eaa916 100644
 2.43.0
 
 
-From f2d871ce82f6f7b735790502589373878c5ff9e6 Mon Sep 17 00:00:00 2001
+From 82308cb83ce7270563f3c9f2e8e82c0c95b9fcad Mon Sep 17 00:00:00 2001
 From: yankneck696 <yankneck696@users.noreply.github.com>
 Date: Wed, 18 Nov 2026 06:57:59 -0500
 Subject: [PATCH 13/13] PlutoSDR RX2: translate its four settings messages
@@ -3957,10 +3957,10 @@ second chain's translated messages.
  10 files changed, 40 insertions(+)
 
 diff --git a/crates/sdroxide-ui/i18n/de/sdroxide.ftl b/crates/sdroxide-ui/i18n/de/sdroxide.ftl
-index 10b05ddf..22a242a9 100644
+index 8fcca4dd..731381a2 100644
 --- a/crates/sdroxide-ui/i18n/de/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/de/sdroxide.ftl
-@@ -1964,6 +1964,10 @@ settings-radio-socket = Ihre Buchse
+@@ -1988,6 +1988,10 @@ settings-radio-socket = Ihre Buchse
  settings-radio-same-first = Wie die erste
  settings-radio-gain-2 = Ihre Verstärkung
  settings-radio-set-low-coupled-sample-your = Dies NIEDRIG einstellen. Die eingekoppelte Probe Ihres eigenen Senders ist ein starkes Signal, und eine Rückkopplungskette, die in die Kompression getrieben wird, misst die Kurve des Verstärkers falsch — sie lehrt die Korrektur die eigene Verzerrung. Unten beginnen und das Dämpfungsglied des Kopplers nutzen.
@@ -3972,10 +3972,10 @@ index 10b05ddf..22a242a9 100644
  settings-radio-table-steps-2 = Tabellenschritte
  settings-radio-how-finely-correction-follows-amplifier = Wie fein die Korrektur der Kurve des Verstärkers folgt. Mehr Schritte verfolgen eine schärfere Knickstelle, aber jeder muss aus den Abtastwerten gelernt werden, die in ihn fielen — und die Spitze eines Sprach-Amplituden-Histogramms ist dünn. Zweiunddreißig reicht für die glatte Kurve, die ein KW-Verstärker tatsächlich hat. Eine Änderung startet die Korrektur neu.
 diff --git a/crates/sdroxide-ui/i18n/es/sdroxide.ftl b/crates/sdroxide-ui/i18n/es/sdroxide.ftl
-index 5b8c8899..3f931af9 100644
+index f8ba3f06..a0a8742b 100644
 --- a/crates/sdroxide-ui/i18n/es/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/es/sdroxide.ftl
-@@ -1947,6 +1947,10 @@ settings-radio-socket = Su conector
+@@ -1955,6 +1955,10 @@ settings-radio-socket = Su conector
  settings-radio-same-first = Igual que la primera
  settings-radio-gain-2 = Su ganancia
  settings-radio-set-low-coupled-sample-your = Fíjala BAJA. La muestra acoplada de tu propio transmisor es una señal fuerte, y una cadena de realimentación llevada a compresión mide mal la curva del amplificador — enseña a la corrección su propia distorsión. Empieza por abajo y usa el atenuador del acoplador.
@@ -3987,10 +3987,10 @@ index 5b8c8899..3f931af9 100644
  settings-radio-table-steps-2 = Pasos de la tabla
  settings-radio-how-finely-correction-follows-amplifier = Con qué finura sigue la corrección la curva del amplificador. Más pasos siguen un codo más agudo, pero cada uno tiene que aprenderse de las muestras que cayeron en él — y la parte alta del histograma de amplitud de la voz es escasa. Treinta y dos bastan para la curva suave que realmente tiene un amplificador de HF. Cambiarlo reinicia la corrección.
 diff --git a/crates/sdroxide-ui/i18n/fr/sdroxide.ftl b/crates/sdroxide-ui/i18n/fr/sdroxide.ftl
-index 4ff07775..cc49c7f7 100644
+index fe9182ac..b42bc03a 100644
 --- a/crates/sdroxide-ui/i18n/fr/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/fr/sdroxide.ftl
-@@ -1952,6 +1952,10 @@ settings-radio-socket = Sa prise
+@@ -1960,6 +1960,10 @@ settings-radio-socket = Sa prise
  settings-radio-same-first = Identique à la première
  settings-radio-gain-2 = Son gain
  settings-radio-set-low-coupled-sample-your = À régler BAS. L'échantillon couplé de votre propre émetteur est un signal fort, et une chaîne de rétroaction poussée en compression mesure mal la courbe de l'amplificateur — elle enseigne à la correction sa propre distorsion. Partez du bas et utilisez l'atténuateur du coupleur.
@@ -4002,10 +4002,10 @@ index 4ff07775..cc49c7f7 100644
  settings-radio-table-steps-2 = Pas du tableau
  settings-radio-how-finely-correction-follows-amplifier = La finesse avec laquelle la correction suit la courbe de l'amplificateur. Davantage de pas suivent un coude plus net, mais chacun doit être appris à partir des échantillons qui y sont tombés — et le haut d'un histogramme d'amplitude de parole est mince. Trente-deux suffisent pour la courbe lisse qu'a réellement un amplificateur HF. Modifier ce réglage recommence la correction.
 diff --git a/crates/sdroxide-ui/i18n/it/sdroxide.ftl b/crates/sdroxide-ui/i18n/it/sdroxide.ftl
-index b55848d2..0c26a283 100644
+index 7e70ad3b..90e6fb6d 100644
 --- a/crates/sdroxide-ui/i18n/it/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/it/sdroxide.ftl
-@@ -1958,6 +1958,10 @@ settings-radio-socket = La sua presa
+@@ -1966,6 +1966,10 @@ settings-radio-socket = La sua presa
  settings-radio-same-first = Uguale alla prima
  settings-radio-gain-2 = Il suo guadagno
  settings-radio-set-low-coupled-sample-your = Impostalo BASSO. Il campione accoppiato del tuo stesso trasmettitore è un segnale forte, e una catena di retroazione portata in compressione misura male la curva dell'amplificatore — insegna alla correzione la propria distorsione. Parti dal fondo e usa l'attenuatore dell'accoppiatore.
@@ -4017,10 +4017,10 @@ index b55848d2..0c26a283 100644
  settings-radio-table-steps-2 = Passi della tabella
  settings-radio-how-finely-correction-follows-amplifier = Quanto finemente la correzione segue la curva dell'amplificatore. Più passi seguono un ginocchio più netto, ma ciascuno va appreso dai campioni che vi sono finiti — e la parte alta di un istogramma di ampiezza vocale è rada. Trentadue bastano per la curva liscia che un amplificatore HF ha davvero. Cambiarlo fa ricominciare la correzione.
 diff --git a/crates/sdroxide-ui/i18n/ja/sdroxide.ftl b/crates/sdroxide-ui/i18n/ja/sdroxide.ftl
-index 2f764197..19387fdd 100644
+index bba96730..314bf40f 100644
 --- a/crates/sdroxide-ui/i18n/ja/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/ja/sdroxide.ftl
-@@ -1935,6 +1935,10 @@ settings-radio-socket = ソケット
+@@ -1936,6 +1936,10 @@ settings-radio-socket = ソケット
  settings-radio-same-first = 1 本目と同じ
  settings-radio-gain-2 = ゲイン
  settings-radio-set-low-coupled-sample-your = これは低く設定してください。自分の送信機の結合されたサンプルは強い信号であり、圧縮に駆動されたフィードバックのチェーンは、アンプの曲線を誤って測定します。補正が自分の歪みを学習してしまうためです。下から始めて、カプラーの減衰器を使ってください。
@@ -4032,10 +4032,10 @@ index 2f764197..19387fdd 100644
  settings-radio-table-steps-2 = テーブルのステップ
  settings-radio-how-finely-correction-follows-amplifier = 補正がアンプの曲線にどれだけ細かく従うかです。ステップが多いほど鋭い屈曲を追いますが、それぞれが、そこに落ちたサンプルから学習されなければなりません。また、音声の振幅ヒストグラムの頂点は薄いものです。HF アンプが実際に持つ滑らかな曲線には、32 で十分です。値を変えると、補正は最初からやり直されます。
 diff --git a/crates/sdroxide-ui/i18n/nl/sdroxide.ftl b/crates/sdroxide-ui/i18n/nl/sdroxide.ftl
-index 41b2cf97..bf1c8087 100644
+index 802e2ae8..ab426c18 100644
 --- a/crates/sdroxide-ui/i18n/nl/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/nl/sdroxide.ftl
-@@ -1948,6 +1948,10 @@ settings-radio-socket = Zijn aansluiting
+@@ -1956,6 +1956,10 @@ settings-radio-socket = Zijn aansluiting
  settings-radio-same-first = Hetzelfde als de eerste
  settings-radio-gain-2 = Zijn gain
  settings-radio-set-low-coupled-sample-your = Zet dit LAAG. Het gekoppelde monster van je eigen zender is een sterk signaal, en een terugkoppelketen die in compressie gedreven wordt, meet de curve van de versterker verkeerd — het leert de correctie zijn eigen vervorming. Begin onderaan en gebruik de verzwakker van de koppeler.
@@ -4047,10 +4047,10 @@ index 41b2cf97..bf1c8087 100644
  settings-radio-table-steps-2 = Tabelstappen
  settings-radio-how-finely-correction-follows-amplifier = Hoe fijn de correctie de curve van de versterker volgt. Meer stappen volgen een scherpere knik, maar elk moet geleerd worden uit de samples die erin vielen — en de top van een histogram van spraakamplitude is dun. Tweeëndertig is genoeg voor de gladde curve die een HF-versterker werkelijk heeft. De waarde wijzigen start de correctie opnieuw.
 diff --git a/crates/sdroxide-ui/i18n/pt-BR/sdroxide.ftl b/crates/sdroxide-ui/i18n/pt-BR/sdroxide.ftl
-index 0806cde1..c6fb5e69 100644
+index 6349e924..48696f00 100644
 --- a/crates/sdroxide-ui/i18n/pt-BR/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/pt-BR/sdroxide.ftl
-@@ -1954,6 +1954,10 @@ settings-radio-socket = Seu conector
+@@ -1962,6 +1962,10 @@ settings-radio-socket = Seu conector
  settings-radio-same-first = Igual à primeira
  settings-radio-gain-2 = Seu ganho
  settings-radio-set-low-coupled-sample-your = Ajuste BAIXO. A amostra acoplada do seu próprio transmissor é um sinal forte, e uma cadeia de realimentação levada à compressão mede mal a curva do amplificador — ela ensina à correção a própria distorção. Comece no fundo e use o atenuador do acoplador.
@@ -4062,10 +4062,10 @@ index 0806cde1..c6fb5e69 100644
  settings-radio-table-steps-2 = Passos da tabela
  settings-radio-how-finely-correction-follows-amplifier = Com que precisão a correção segue a curva do amplificador. Mais passos acompanham um joelho mais agudo, mas cada um precisa ser aprendido a partir das amostras que caíram nele — e o topo de um histograma de amplitude de voz é fino. Trinta e dois basta para a curva suave que um amplificador de HF de fato tem. Alterá-lo reinicia a correção.
 diff --git a/crates/sdroxide-ui/i18n/ru/sdroxide.ftl b/crates/sdroxide-ui/i18n/ru/sdroxide.ftl
-index 3c2c2d39..8d28c707 100644
+index 9f5e8b37..efe780fa 100644
 --- a/crates/sdroxide-ui/i18n/ru/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/ru/sdroxide.ftl
-@@ -1960,6 +1960,10 @@ settings-radio-socket = Её разъём
+@@ -1961,6 +1961,10 @@ settings-radio-socket = Её разъём
  settings-radio-same-first = То же, что первая
  settings-radio-gain-2 = Её усиление
  settings-radio-set-low-coupled-sample-your = Задайте НИЗКО. Связанный образец вашего собственного передатчика — сильный сигнал, а цепочка обратной связи, загнанная в компрессию, неверно измеряет кривую усилителя — она учит коррекцию собственным искажениям. Начните с низа и используйте аттенюатор ответвителя.
@@ -4077,10 +4077,10 @@ index 3c2c2d39..8d28c707 100644
  settings-radio-table-steps-2 = Шаги таблицы
  settings-radio-how-finely-correction-follows-amplifier = Насколько точно коррекция следует за кривой усилителя. Больше шагов повторяют более резкое колено, но каждый нужно выучить по отсчётам, попавшим в него, — а верх гистограммы амплитуд речи тонкий. Тридцать два достаточно для плавной кривой, которая у ВЧ-усилителя действительно есть. Изменение начинает коррекцию заново.
 diff --git a/crates/sdroxide-ui/i18n/tr/sdroxide.ftl b/crates/sdroxide-ui/i18n/tr/sdroxide.ftl
-index 79a8f5a0..7f857860 100644
+index a12a7a89..be7a50a8 100644
 --- a/crates/sdroxide-ui/i18n/tr/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/tr/sdroxide.ftl
-@@ -1954,6 +1954,10 @@ settings-radio-socket = Soketi
+@@ -1955,6 +1955,10 @@ settings-radio-socket = Soketi
  settings-radio-same-first = Birincisiyle aynı
  settings-radio-gain-2 = Kazancı
  settings-radio-set-low-coupled-sample-your = Bunu DÜŞÜK ayarlayın. Kendi vericinizin kuplajlı örneği güçlü bir sinyaldir ve sıkıştırmaya sürülen bir geri besleme zinciri amplifikatörün eğrisini yanlış ölçer — düzeltmeye kendi bozulmasını öğretir. Alttan başlayın ve kuplajın zayıflatıcısını kullanın.
@@ -4092,10 +4092,10 @@ index 79a8f5a0..7f857860 100644
  settings-radio-table-steps-2 = Tablo adımları
  settings-radio-how-finely-correction-follows-amplifier = Düzeltmenin amplifikatörün eğrisini ne kadar ince izlediği. Daha fazla adım daha keskin bir dirseği izler, ama her biri içine düşen örneklerden öğrenilmelidir — ve bir konuşma genliği histogramının tepesi incedir. Otuz iki, bir HF amplifikatörünün gerçekte sahip olduğu düzgün eğri için yeterlidir. Değiştirmek düzeltmeyi yeniden başlatır.
 diff --git a/crates/sdroxide-ui/i18n/zh-CN/sdroxide.ftl b/crates/sdroxide-ui/i18n/zh-CN/sdroxide.ftl
-index 10e68971..5dbb1a60 100644
+index 01066b53..ae696f23 100644
 --- a/crates/sdroxide-ui/i18n/zh-CN/sdroxide.ftl
 +++ b/crates/sdroxide-ui/i18n/zh-CN/sdroxide.ftl
-@@ -1932,6 +1932,10 @@ settings-radio-socket = 其插座
+@@ -1933,6 +1933,10 @@ settings-radio-socket = 其插座
  settings-radio-same-first = 与第一个相同
  settings-radio-gain-2 = 其增益
  settings-radio-set-low-coupled-sample-your = 请将此项设为低。你自己发射机的耦合采样是一个强信号，而被驱动至压缩的反馈通道会错误地测量功放曲线——它会让校正学习到它自己的失真。请从最低处开始，并使用耦合器的衰减器。
